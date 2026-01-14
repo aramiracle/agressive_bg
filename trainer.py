@@ -28,7 +28,7 @@ def print_banner(elo, checkpoint_dir, model):
     print("-" * 70)
     print(f"🧠 Model Params: {param_str}")
     print("=" * 70)
-    print(f"🏁 Initial ELO: {elo}")
+    print(f"📊 Initial ELO: {elo}")
     print("=" * 70)
     print()
 
@@ -81,16 +81,16 @@ def run_elo_evaluation(step, model, older_model, eval_game, elo, older_elo, avg_
     tqdm.write(f"🎯 ELO EVALUATION @ Step {step} | Loss: {avg_loss:.4f}")
     
     model.eval()
-    # evaluate_vs_opponent handles the MCTS creation internally if not passed, 
-    # but our optimized elo.py (implied) might need the model instance.
-    win_rate = evaluate_vs_opponent(eval_game, model, older_model, show_progress=True)
+    win_rate, num_games = evaluate_vs_opponent(eval_game, model, older_model, show_progress=True)
     model.train()
     
-    new_elo = update_elo(elo, older_elo, win_rate)
+    # Update ELO using game-level statistics
+    new_elo = update_elo(elo, older_elo, win_rate, num_games)
     elo_change = new_elo - elo
     
-    wins = int(win_rate * Config.ELO_EVAL_GAMES)
-    tqdm.write(f"   Result: {wins}/{Config.ELO_EVAL_GAMES} wins ({win_rate*100:.0f}%)")
+    # Calculate match-level stats for display
+    wins = int(win_rate * num_games)
+    tqdm.write(f"   Games: {wins}/{num_games} wins ({win_rate*100:.1f}%)")
     tqdm.write(f"   ELO: {elo:.0f} → {new_elo:.0f} ({elo_change:+.0f})")
     
     return new_elo

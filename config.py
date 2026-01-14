@@ -22,7 +22,7 @@ class Config:
     }
     
     # --- Game Rules ---
-    MATCH_TARGET = 15
+    MATCH_TARGET = 10
     MAX_TURNS = 400  # Reduced from 500 to prune stalled games faster
     
     # --- Rewards ---
@@ -58,11 +58,11 @@ class Config:
     INITIAL_ELO = 800
     ELO_K = 32
     ELO_SCALE = 400.0
-    ELO_EVAL_INTERVAL = 50   # Evaluate less often to focus on training
-    ELO_EVAL_GAMES = 10
+    ELO_EVAL_INTERVAL = 100   # Evaluate less often to focus on training
+    ELO_EVAL_GAMES = 20
     
     # --- Training (OPTIMIZED) ---
-    NUM_WORKERS = 12         # Keep high
+    NUM_WORKERS = 8         # Keep high
     BATCH_SIZE = 256         # Increased from 64 (Better GPU utilization)
     BUFFER_SIZE = 5000      # Larger buffer for stable training
     LR = 3e-4
