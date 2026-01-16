@@ -5,62 +5,73 @@ from config import Config
 
 def move_to_indices(start, end):
     """
-    Convert logical move (start, end) to action indices.
+    Convert a move (start, end) to policy head indices.
     
     Args:
-        start: Board position (0-23), or 'bar'
-        end: Board position (0-23), or 'off'
-        
+        start: Starting position ('bar' or 0-23)
+        end: Ending position ('off' or 0-23)
+    
     Returns:
-        (start_idx, end_idx) where bar=24, off=25
+        Tuple of (start_idx, end_idx) for policy heads
     """
-    s = Config.BAR_IDX if start == 'bar' else start
-    e = Config.OFF_IDX if end == 'off' else end
-    return s, e
+    if start == 'bar':
+        start_idx = Config.BAR_IDX
+    else:
+        start_idx = start
+    
+    if end == 'off':
+        end_idx = Config.OFF_IDX
+    else:
+        end_idx = end
+    
+    return start_idx, end_idx
 
 
-def indices_to_move(s, e):
+def indices_to_move(start_idx, end_idx):
     """
-    Convert action indices back to logical move.
+    Convert policy head indices back to a move tuple.
     
     Args:
-        s: Start index (0-24, where 24=bar)
-        e: End index (0-25, where 25=off)
-        
+        start_idx: Start index from policy head
+        end_idx: End index from policy head
+    
     Returns:
-        (start, end) as board positions or 'bar'/'off'
+        Tuple of (start, end) where start/end can be 'bar'/'off' or int
     """
-    start = 'bar' if s == Config.BAR_IDX else s
-    end = 'off' if e == Config.OFF_IDX else e
+    if start_idx == Config.BAR_IDX:
+        start = 'bar'
+    else:
+        start = start_idx
+    
+    if end_idx == Config.OFF_IDX:
+        end = 'off'
+    else:
+        end = end_idx
+    
     return start, end
 
 
-def flip_position(pos):
-    """
-    Flip a board position for canonical view (P-1 perspective).
-    Position 0 becomes 23, position 23 becomes 0.
+def format_move(move):
+    """Format a move for display."""
+    start, end = move
+    start_str = "BAR" if start == 'bar' else str(start + 1)
+    end_str = "OFF" if end == 'off' else str(end + 1)
+    return f"{start_str}->{end_str}"
+
+
+def format_board(board, bar, off):
+    """Format board state for display."""
+    lines = []
     
-    Args:
-        pos: Board position (0-23), 'bar', or 'off'
-        
-    Returns:
-        Flipped position
-    """
-    if pos == 'bar' or pos == 'off':
-        return pos
-    return Config.NUM_POINTS - 1 - pos
-
-
-def flip_action(action):
-    """
-    Flip an action for canonical view.
+    # Top half (points 13-24)
+    top = " ".join(f"{board[i]:+3d}" for i in range(12, 24))
+    lines.append(f"13-24: {top}")
     
-    Args:
-        action: (start, end) tuple
-        
-    Returns:
-        Flipped (start, end) tuple
-    """
-    start, end = action
-    return (flip_position(start), flip_position(end))
-
+    # Bottom half (points 1-12, reversed for display)
+    bot = " ".join(f"{board[i]:+3d}" for i in range(11, -1, -1))
+    lines.append(f" 1-12: {bot}")
+    
+    # Bar and off
+    lines.append(f"Bar: W={bar[0]} B={bar[1]} | Off: W={off[0]} B={off[1]}")
+    
+    return "\n".join(lines)

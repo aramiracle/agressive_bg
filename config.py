@@ -1,77 +1,79 @@
 import torch
 
 class Config:
-    # --- Board / Game Constants ---
+    # Board / Game
     NUM_POINTS = 24
     CHECKERS_PER_PLAYER = 15
     HOME_SIZE = 6
     DICE_SIDES = 6
-    
+
     BAR_IDX = 24
     OFF_IDX = 25
     NUM_ACTIONS = 26
-    
+
     BOARD_SEQ_LEN = 28
     EMBED_VOCAB_SIZE = 31
     EMBED_OFFSET = 15
     CONTEXT_SIZE = 4
-    
+
     INITIAL_SETUP = {
         0: -2, 5: 5, 7: 3, 11: -5,
         12: 5, 16: -3, 18: -5, 23: 2,
     }
-    
-    # --- Game Rules ---
+
+    # Game
     MATCH_TARGET = 10
-    MAX_TURNS = 400  # Reduced from 500 to prune stalled games faster
-    
-    # --- Rewards ---
+    MAX_TURNS = 5000
+
+    # Rewards
     R_WIN = 1.0
     R_GAMMON = 3.0
     R_BACKGAMMON = 5.0
-    
-    # --- Model Selection ---
-    MODEL_TYPE = "transformer"
-    
-    # --- Model Params ---
+
+    # Model
+    MODEL_TYPE = "transformer"  # "transformer" or "cnn"
     D_MODEL = 64
     DROPOUT = 0.1
     VALUE_HIDDEN = 32
     MAX_SEQ_LEN = BOARD_SEQ_LEN + 1
     
-    # Transformer
+    # Transformer specific
     N_HEAD = 4
-    N_LAYERS = 2  # Increased layers slightly for stability, decreased MCTS
+    N_LAYERS = 3
     DIM_FEEDFORWARD = 128
     
-    # CNN
-    CNN_BLOCKS = 3
+    # CNN specific
+    CNN_BLOCKS = 4
     CNN_KERNEL = 3
-    
-    # --- MCTS / Search (OPTIMIZED) ---
-    NUM_SIMULATIONS = 10     # Reduced from 20 (Speed up generation 2x)
+
+    # MCTS
+    NUM_SIMULATIONS = 64
+    MCTS_BATCH = 8
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
-    
-    # --- ELO Rating ---
-    INITIAL_ELO = 800
+
+    # ELO
+    INITIAL_ELO = 400
     ELO_K = 32
     ELO_SCALE = 400.0
-    ELO_EVAL_INTERVAL = 100   # Evaluate less often to focus on training
-    ELO_EVAL_GAMES = 20
-    
-    # --- Training (OPTIMIZED) ---
-    NUM_WORKERS = 8         # Keep high
-    BATCH_SIZE = 256         # Increased from 64 (Better GPU utilization)
-    BUFFER_SIZE = 5000      # Larger buffer for stable training
-    LR = 3e-4
-    TRAIN_STEPS = 2000       # More steps, but they will happen faster
+    ELO_EVAL_INTERVAL = 2000
+    ELO_EVAL_GAMES = 30
+
+    # Training
+    GAMES_PER_ITERATION = 5
+    STEPS_PER_ITERATION = 250
+    BATCH_SIZE = 1024 if torch.cuda.is_available() else 128
+    BUFFER_SIZE = 8192
+    LR = 1e-6
+    GRAD_CLIP = 1.0
+    WEIGHT_DECAY = 1e-4
+    TRAIN_STEPS = 300000
     LOSS_AVG_WINDOW = 100
-    
-    # Device Logic: Trainer uses CUDA, Workers use CPU
+    MAX_GAME_MOVES = 500
+
+    # Device
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    WORKER_DEVICE = "cpu"    # Force workers to CPU to avoid CUDA context switch overhead
-    
+
+    # Checkpoints
     CHECKPOINT_DIR = "checkpoints"
-    SAVE_INTERVAL = 100

@@ -1,189 +1,135 @@
-"""ELO rating system and model evaluation with proper game-level tracking."""
+"""ELO rating system for model evaluation."""
 
+import math
 from tqdm import tqdm
 from config import Config
 from mcts import MCTS
 
 
 def calculate_expected_score(player_elo, opponent_elo):
-    """
-    Calculate expected score using ELO formula.
-    
-    Args:
-        player_elo: Player's current ELO rating
-        opponent_elo: Opponent's current ELO rating
-        
-    Returns:
-        Expected score (0-1)
-    """
+    """Calculate expected score using standard ELO formula."""
     return 1.0 / (1.0 + 10 ** ((opponent_elo - player_elo) / Config.ELO_SCALE))
 
 
-def update_elo(current_elo, opponent_elo, actual_score, num_games=1):
+def update_elo(current_elo, opponent_elo, wins, total_games):
     """
-    Update ELO rating based on game results.
+    Update ELO rating based on match results.
     
     Args:
-        current_elo: Player's current ELO rating
-        opponent_elo: Opponent's current ELO rating
-        actual_score: Actual win rate (0-1) across all games
-        num_games: Number of games played
-        
+        current_elo: Current player's ELO
+        opponent_elo: Opponent's ELO  
+        wins: Number of wins (can be float for draws)
+        total_games: Total games played
+    
     Returns:
         New ELO rating
     """
+    if total_games == 0:
+        return current_elo
+
+    actual = wins / total_games
     expected = calculate_expected_score(current_elo, opponent_elo)
-    # Scale K-factor by number of games for more stable updates
-    effective_k = Config.ELO_K * num_games
-    return current_elo + effective_k * (actual_score - expected)
+    delta = Config.ELO_K * total_games * (actual - expected)
+    
+    # Clamp delta to prevent extreme swings
+    delta = max(-400, min(400, delta))
+    return current_elo + delta
 
 
-def play_single_game(game, current_mcts, opponent_mcts, current_plays_white, current_score, opponent_score):
+def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=500):
     """
-    Play a single game between two models.
+    Play a single game between two MCTS agents.
     
     Args:
         game: BackgammonGame instance
-        current_mcts: MCTS for current model
-        opponent_mcts: MCTS for opponent model
-        current_plays_white: True if current model plays as P1 (white)
-        current_score: Current model's match score
-        opponent_score: Opponent model's match score
-        
+        mcts_a: MCTS for model A
+        mcts_b: MCTS for model B
+        a_is_white: True if model A plays as white (turn=1)
+        max_moves: Maximum moves before timeout
+    
     Returns:
-        Points scored (positive for current model win, negative for opponent win)
+        1.0 if model_a wins, 0.0 if model_b wins, 0.5 for timeout/draw
     """
     game.reset()
-    
-    while True:
-        winner, win_type = game.check_win()
+    move_count = 0
+
+    while move_count < max_moves:
+        # Check for winner first
+        winner, mult = game.check_win()
         if winner != 0:
-            pts = 1
-            if win_type == 2:
-                pts = int(Config.R_GAMMON)
-            if win_type == 3:
-                pts = int(Config.R_BACKGAMMON)
-            pts = int(pts * game.cube)
-            
-            # Determine who won
-            if current_plays_white:
-                return pts if winner == 1 else -pts
+            if a_is_white:
+                return 1.0 if winner == 1 else 0.0
             else:
-                return pts if winner == -1 else -pts
-        
+                return 1.0 if winner == -1 else 0.0
+
+        # Roll dice for current turn
         game.roll_dice()
-        
+
+        # Execute all moves for this roll
         while game.dice:
-            legal_moves = game.get_legal_moves()
-            if not legal_moves:
-                game.dice = []
+            legal = game.get_legal_moves()
+            if not legal:
                 break
+
+            # Determine whose turn it is
+            a_turn = (game.turn == 1 and a_is_white) or (game.turn == -1 and not a_is_white)
+            mcts = mcts_a if a_turn else mcts_b
             
-            # Determine which model plays
-            current_model_turn = (game.turn == 1 and current_plays_white) or \
-                                (game.turn == -1 and not current_plays_white)
-            
-            if current_model_turn:
-                root = current_mcts.search(None, game, current_score, opponent_score)
+            # Run MCTS search
+            root = mcts.search(game, 0, 0)
+
+            # Select best action by visit count
+            if root.children:
+                action = max(root.children.items(), key=lambda x: x[1].visits)[0]
             else:
-                root = opponent_mcts.search(None, game, opponent_score, current_score)
-            
-            visits = {act: child.visits for act, child in root.children.items()}
-            total = sum(visits.values())
-            if total == 0:
-                chosen_act = legal_moves[0]
-            else:
-                chosen_act = max(visits, key=visits.get)
-            
-            w, _ = game.step_atomic(chosen_act)
-            if w != 0:
-                break
-        
-        if game.check_win()[0] != 0:
-            continue
-        game.switch_turn()
+                action = legal[0]
+
+            game.step_atomic(action)
+            move_count += 1
+
+        # Switch turn if game not over
+        if game.check_win()[0] == 0:
+            game.switch_turn()
+
+    # Timeout reached - treat as draw
+    return 0.5
 
 
-def play_match(game, current_mcts, opponent_mcts):
+def evaluate_vs_opponent(game, model_a, model_b, num_games, device, show_progress=False):
     """
-    Play a full match (to MATCH_TARGET points) between two models.
-    Players alternate colors each game within the match.
+    Evaluate model_a against model_b over multiple games.
+    
+    Alternates colors to ensure fairness.
     
     Args:
-        game: BackgammonGame instance
-        current_mcts: MCTS for current model
-        opponent_mcts: MCTS for opponent model
-        
+        game: BackgammonGame instance (will be reset each game)
+        model_a: First model to evaluate
+        model_b: Second model (typically best known model)
+        num_games: Number of games to play
+        device: Device for inference
+        show_progress: Whether to show tqdm progress bar
+    
     Returns:
-        Tuple of (match_won, games_won, total_games)
+        Tuple of (wins_for_model_a, total_games_played)
     """
-    current_score = 0
-    opponent_score = 0
-    game_count = 0
-    games_won = 0
-    
-    while current_score < Config.MATCH_TARGET and opponent_score < Config.MATCH_TARGET:
-        # Alternate colors each game
-        current_plays_white = (game_count % 2 == 0)
-        game_count += 1
-        
-        result = play_single_game(
-            game, current_mcts, opponent_mcts,
-            current_plays_white, current_score, opponent_score
-        )
-        
-        if result > 0:
-            current_score += result
-            games_won += 1
-        else:
-            opponent_score += abs(result)
-    
-    match_won = current_score >= Config.MATCH_TARGET
-    return match_won, games_won, game_count
+    mcts_a = MCTS(model_a, device)
+    mcts_b = MCTS(model_b, device)
 
+    wins = 0.0
+    games_played = 0
+    
+    iterable = range(num_games)
+    if show_progress:
+        iterable = tqdm(iterable, desc="ELO Evaluation", dynamic_ncols=True, leave=False)
 
-def evaluate_vs_opponent(game, current_model, opponent_model, num_matches=None, show_progress=True):
-    """
-    Evaluate current model against opponent model using game-level statistics.
-    
-    Args:
-        game: BackgammonGame instance
-        current_model: Current neural network model
-        opponent_model: Opponent neural network model
-        num_matches: Number of matches to play (default: Config.ELO_EVAL_GAMES)
-        show_progress: Whether to show progress bar
+    for i in iterable:
+        # Alternate who plays white for fairness
+        a_is_white = (i % 2 == 0)
+        result = play_single_game(game, mcts_a, mcts_b, a_is_white)
+        wins += result
+        games_played += 1
         
-    Returns:
-        Tuple of (win_rate, total_games_played)
-    """
-    if num_matches is None:
-        num_matches = Config.ELO_EVAL_GAMES
-    
-    current_mcts = MCTS(current_model, Config.DEVICE)
-    opponent_mcts = MCTS(opponent_model, Config.DEVICE)
-    
-    total_games_won = 0
-    total_games_played = 0
-    matches_won = 0
-    
-    game_iter = tqdm(range(num_matches), desc="  ⚔️  ELO Eval", leave=False) if show_progress else range(num_matches)
-    
-    for _ in game_iter:
-        match_won, games_won, games_played = play_match(game, current_mcts, opponent_mcts)
-        
-        if match_won:
-            matches_won += 1
-        
-        total_games_won += games_won
-        total_games_played += games_played
-        
-        # Update progress bar with current stats
         if show_progress:
-            game_iter.set_postfix({
-                'Matches': f'{matches_won}/{_+1}',
-                'Games': f'{total_games_won}/{total_games_played}'
-            })
-    
-    game_win_rate = total_games_won / total_games_played if total_games_played > 0 else 0.5
-    
-    return game_win_rate, total_games_played
+            iterable.set_postfix({'Wins': f'{wins:.1f}/{games_played}'})
+
+    return wins, games_played

@@ -1,198 +1,266 @@
-import ray
+"""
+Trainer for Backgammon RL with Self-Taught Cubing and ELO tracking.
+Includes tqdm progress bars for both training and evaluation.
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
-import numpy as np
 from collections import deque
 from tqdm import tqdm
 
 from config import Config
 from bg_engine import BackgammonGame
 from model import get_model
-from checkpoint import save_checkpoint, setup_checkpoint_dir
-from elo import update_elo, evaluate_vs_opponent
-from worker import SelfPlayWorker
+from mcts import MCTS
+from checkpoint import (
+    setup_checkpoint_dir, save_checkpoint, load_checkpoint,
+    get_model_state_dict, load_model_state_dict
+)
+from elo import evaluate_vs_opponent, update_elo
+from utils import move_to_indices
 
-def print_banner(elo, checkpoint_dir, model):
-    """Print training configuration banner."""
-    param_count = model.count_parameters() if hasattr(model, 'count_parameters') else 0
-    param_str = f"{param_count:,}" if param_count < 1_000_000 else f"{param_count/1_000_000:.2f}M"
-    
-    print("=" * 70)
-    print("🎲 BACKGAMMON AI TRAINER")
-    print("=" * 70)
-    print(f"   • Device: {Config.DEVICE}")
-    print(f"   • Workers: {Config.NUM_WORKERS} (on {Config.WORKER_DEVICE})")
-    print(f"   • Batch Size: {Config.BATCH_SIZE}")
-    print("-" * 70)
-    print(f"🧠 Model Params: {param_str}")
-    print("=" * 70)
-    print(f"📊 Initial ELO: {elo}")
-    print("=" * 70)
-    print()
+def get_cube_decision(model, game, device):
+    """Queries the model's cube head. returns 1 for Yes (Double/Take), 0 for No."""
+    board_t, ctx_t = game.get_vector(device=device, canonical=True)
+    with torch.no_grad():
+        _, _, _, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
+    return torch.argmax(cube_logits, dim=1).item()
 
-def prepare_batch(replay_buffer, batch_size):
-    # Random sampling
-    batch = random.sample(replay_buffer, batch_size)
+def play_one_game(game, mcts, model, device, is_eval=False):
+    """
+    Plays a complete game. 
+    Maintains local match scores to satisfy MCTS and Model requirements.
+    """
+    game.reset()
+    history = []
     
-    # Batch is list of tuples: (b_t, c_t, (s, e), reward)
-    # b_t and c_t are already Tensors on CPU.
+    # Local match score tracking (Internal to this function session)
+    # Typically 0-0 at the start of a training game
+    match_scores = {1: 0, -1: 0} 
     
-    # 1. Stack Tensors (Fastest way to combine existing tensors)
-    b_states = torch.stack([x[0] for x in batch]).to(Config.DEVICE)
-    contexts = torch.stack([x[1] for x in batch]).to(Config.DEVICE)
+    max_moves = getattr(Config, 'MAX_GAME_MOVES', 2000)
     
-    # 2. Process Actions (Integers -> Tensor)
-    actions = [x[2] for x in batch]
-    target_from = torch.tensor([a[0] for a in actions], dtype=torch.long, device=Config.DEVICE)
-    target_to = torch.tensor([a[1] for a in actions], dtype=torch.long, device=Config.DEVICE)
-    
-    # 3. Rewards
-    rewards = torch.tensor([x[3] for x in batch], dtype=torch.float, device=Config.DEVICE)
-    
-    return b_states, contexts, target_from, target_to, rewards
+    for _ in range(max_moves):
+        winner, _ = game.check_win()
+        if winner != 0: break
 
-def train_step(model, optimizer, b_states, contexts, target_from, target_to, rewards):
-    # Automatic Mixed Precision for speed if on CUDA
-    use_amp = (Config.DEVICE == 'cuda')
-    
-    with torch.amp.autocast('cuda', enabled=use_amp):
-        p_from, p_to, v, _ = model(b_states, contexts)
+        # Current player's score context
+        my_s = match_scores[game.turn]
+        opp_s = match_scores[-game.turn]
+
+        # --- CUBING PHASE ---
+        if game.can_double() and game.cube < Config.MATCH_TARGET:
+            # Note: get_vector now receives the local match scores
+            double_choice = get_cube_decision(model, game, device)
+            
+            if double_choice == 1:
+                # Opponent's decision (canonical view)
+                game.switch_turn()
+                take_choice = get_cube_decision(model, game, device)
+                game.switch_turn() 
+
+                if not is_eval:
+                    board_t, ctx_t = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
+                    history.append((board_t, ctx_t, 1, game.turn, True))
+
+                if take_choice == 1:
+                    game.apply_double()
+                else:
+                    # Pass: Opponent refuses, player wins current cube value
+                    final_winner, points = game.handle_cube_refusal()
+                    if is_eval: return final_winner, points
+                    return finalize_history(history, final_winner, points), final_winner
+
+        # --- MOVEMENT PHASE ---
+        game.roll_dice()
         
-        loss_v = nn.MSELoss()(v.squeeze(), rewards)
-        loss_p = nn.CrossEntropyLoss()(p_from, target_from) + nn.CrossEntropyLoss()(p_to, target_to)
-        total_loss = loss_v + loss_p
-    
-    optimizer.zero_grad()
-    total_loss.backward()
-    optimizer.step()
-    
-    return total_loss.item()
+        while game.dice:
+            legal = game.get_legal_moves()
+            if not legal: 
+                game.dice = [] 
+                break
+            
+            # Pass local scores to MCTS
+            root = mcts.search(game, my_s, opp_s)
+            
+            if root.children:
+                actions = list(root.children.keys())
+                visits = torch.tensor([child.visits for child in root.children.values()], dtype=torch.float)
+                
+                if visits.sum() > 0:
+                    probs = visits / visits.sum()
+                    idx = torch.multinomial(probs, 1).item()
+                    chosen_action = actions[idx]
+                else:
+                    priors = torch.tensor([child.prior for child in root.children.values()], dtype=torch.float)
+                    idx = torch.multinomial(priors, 1).item()
+                    chosen_action = actions[idx]
+            else:
+                chosen_action = random.choice(legal)
 
-def sync_workers(model, workers):
-    # Move state dict to CPU for serialization to workers
-    state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-    # Fire and forget update
-    [w.update_model.remote(state_dict) for w in workers]
+            if not is_eval:
+                board_t, ctx_t = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
+                canon_act = game.real_action_to_canonical(chosen_action)
+                s_idx, e_idx = move_to_indices(canon_act[0], canon_act[1])
+                history.append((board_t, ctx_t, (s_idx, e_idx), game.turn, False))
+            
+            game.step_atomic(chosen_action)
+            if game.check_win()[0] != 0: break
+        
+        if game.check_win()[0] == 0:
+            game.switch_turn()
 
-def run_elo_evaluation(step, model, older_model, eval_game, elo, older_elo, avg_loss):
-    tqdm.write("")
-    tqdm.write(f"🎯 ELO EVALUATION @ Step {step} | Loss: {avg_loss:.4f}")
+    # --- FINALIZATION ---
+    winner, mult = game.check_win()
+    total_points = mult * game.cube
     
-    model.eval()
-    win_rate, num_games = evaluate_vs_opponent(eval_game, model, older_model, show_progress=True)
-    model.train()
+    if is_eval: 
+        return winner, total_points
+        
+    return finalize_history(history, winner, total_points), winner
+
+def finalize_history(history, winner, total_points):
+    data = []
+    for board, ctx, act, turn, is_cube in history:
+        reward = float(total_points) if turn == winner else -float(total_points)
+        data.append((board, ctx, act, reward, is_cube))
+    return data
+
+def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
+    if len(replay_buffer) < batch_size: return 0.0
+    batch = random.sample(list(replay_buffer), batch_size)
     
-    # Update ELO using game-level statistics
-    new_elo = update_elo(elo, older_elo, win_rate, num_games)
-    elo_change = new_elo - elo
+    boards = torch.stack([x[0] for x in batch]).to(device)
+    contexts = torch.stack([x[1] for x in batch]).to(device)
+    rewards = torch.tensor([x[3] for x in batch], dtype=torch.float, device=device)
+
+    # In train_batch
+    with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+        p_from, p_to, v, cube_logits = model(boards, contexts)
+        
+        # Normalize rewards to a reasonable range
+        normalized_rewards = rewards / Config.MATCH_TARGET 
+        
+        # --- CHANGED FROM HUBER TO MSE ---
+        v_loss = nn.functional.mse_loss(v.squeeze(-1), normalized_rewards)
+        
+        p_loss, c_loss = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+        p_count, c_count = 0, 0
+
+        for i, (_, _, action, _, is_cube) in enumerate(batch):
+            if is_cube:
+                target = torch.tensor([1 if rewards[i] > 0 else 0], device=device)
+                c_loss += nn.functional.cross_entropy(cube_logits[i:i+1], target)
+                c_count += 1
+            else:
+                t_f, t_t = torch.tensor([action[0]], device=device), torch.tensor([action[1]], device=device)
+                p_loss += (nn.functional.cross_entropy(p_from[i:i+1], t_f) + nn.functional.cross_entropy(p_to[i:i+1], t_t)) * 0.5
+                p_count += 1
+        
+        loss = v_loss + (p_loss / max(1, p_count)) + (c_loss / max(1, c_count))
+
+    optimizer.zero_grad(set_to_none=True)
     
-    # Calculate match-level stats for display
-    wins = int(win_rate * num_games)
-    tqdm.write(f"   Games: {wins}/{num_games} wins ({win_rate*100:.1f}%)")
-    tqdm.write(f"   ELO: {elo:.0f} → {new_elo:.0f} ({elo_change:+.0f})")
+    # 1. Scale loss and backward
+    scaler.scale(loss).backward()
     
-    return new_elo
+    # 2. Unscale for Gradient Clipping
+    scaler.unscale_(optimizer)
+    
+    # 3. Clip Gradients (Max norm of 1.0 is standard)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.GRAD_CLIP)
+    
+    # 4. Step and Update
+    scaler.step(optimizer)
+    scaler.update()
+    
+    return loss.item(), grad_norm.item()
 
 def train():
-    ray.init(include_dashboard=False, logging_level="ERROR")
-    checkpoint_dir, best_model_path, latest_model_path = setup_checkpoint_dir()
+    checkpoint_dir, best_path, latest_path = setup_checkpoint_dir()
+    device = torch.device(Config.DEVICE)
+    model = get_model().to(device)
+    best_model = get_model().to(device)
     
-    # Setup Model
-    raw_model = get_model().to(Config.DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
-    # Optimization: Compile model (PyTorch 2.0+)
-    try:
-        # Note: 'reduce-overhead' is good for small batches/RL loops
-        model = torch.compile(raw_model) 
-        print("✅ Model compiled with torch.compile")
-    except Exception as e:
-        model = raw_model
-        print(f"⚠️ torch.compile not available/failed, using eager mode. ({e})")
+    cp = load_checkpoint(latest_path, model, optimizer, device)
+    train_step = cp['step'] if cp else 0
+    current_elo = cp['elo'] if cp else Config.INITIAL_ELO
+    best_elo = current_elo
+    load_model_state_dict(best_model, get_model_state_dict(model))
 
-    optimizer = optim.Adam(model.parameters(), lr=Config.LR)
-    
-    # Initial State for Workers (Send CPU state)
-    cpu_state = {k: v.cpu() for k, v in raw_model.state_dict().items()}
-    workers = [SelfPlayWorker.remote(cpu_state) for _ in range(Config.NUM_WORKERS)]
-    
     replay_buffer = deque(maxlen=Config.BUFFER_SIZE)
-    elo = Config.INITIAL_ELO
-    best_elo = Config.INITIAL_ELO
+    game = BackgammonGame()
     
-    # For Eval (Comparison against previous version)
-    eval_game = BackgammonGame()
-    older_model = get_model().to(Config.DEVICE)
-    older_model.load_state_dict(raw_model.state_dict())
-    older_model.eval()
-    older_elo = Config.INITIAL_ELO
+    # Outer Progress Bar for total training steps
+    pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Overall Training")
     
-    total_matches_played = 0
-    total_samples_collected = 0
-    loss_history = []
-    
-    print_banner(elo, checkpoint_dir, raw_model)
-    
-    pbar = tqdm(range(Config.TRAIN_STEPS), desc="Training")
-    
-    for step in pbar:
-        # Collect Data from Workers
-        results = ray.get([w.play_match.remote() for w in workers])
+    while train_step < Config.TRAIN_STEPS:
+        # 1. DATA COLLECTION PHASE
+        model.eval()
+        mcts = MCTS(model, device)
+        # Detailed log for self-play
+        print(f"\n[Step {train_step}] Collecting self-play games...")
+        for _ in range(Config.GAMES_PER_ITERATION):
+            data, _ = play_one_game(game, mcts, model, device)
+            replay_buffer.extend(data)
+
+        if len(replay_buffer) < Config.BATCH_SIZE:
+            print(f"Buffer warming up: {len(replay_buffer)}/{Config.BATCH_SIZE}")
+            continue
+
+        # 2. OPTIMIZATION PHASE
+        model.train()
+        total_iter_loss = 0
         
-        step_samples = 0
-        for game_data, scores in results:
-            replay_buffer.extend(game_data)
-            step_samples += len(game_data)
-        
-        total_matches_played += len(results)
-        total_samples_collected += step_samples
-        
-        # Train
-        if len(replay_buffer) > Config.BATCH_SIZE:
-            batch_data = prepare_batch(replay_buffer, Config.BATCH_SIZE)
-            loss = train_step(model, optimizer, *batch_data)
-            
-            loss_history.append(loss)
-            avg_loss = sum(loss_history[-Config.LOSS_AVG_WINDOW:]) / min(len(loss_history), Config.LOSS_AVG_WINDOW)
-            
-            # Sync workers periodically (every 10 steps to save overhead)
-            if step % 10 == 0:
-                sync_workers(raw_model, workers)
-            
-            pbar.set_postfix({'Loss': f'{avg_loss:.3f}', 'ELO': f'{elo:.0f}'})
-            
-            # --- ELO EVALUATION & SAVING LOGIC ---
-            if step > 0 and step % Config.ELO_EVAL_INTERVAL == 0:
-                elo = run_elo_evaluation(
-                    step, raw_model, older_model, eval_game,
-                    elo, older_elo, avg_loss
+        # Inner loop for optimization steps per data collection
+        for i in range(Config.STEPS_PER_ITERATION):
+            loss, gnorm = train_batch(model, optimizer, replay_buffer, Config.BATCH_SIZE, device, scaler)
+            total_iter_loss += loss
+            train_step += 1
+            pbar.update(1)
+
+            buf_fill = (len(replay_buffer) / Config.BUFFER_SIZE) * 100
+            pbar.set_postfix({
+                'loss': f'{loss:.4f}', 
+                'gnorm': f'{gnorm:.2f}', # Track gradient stability
+                'elo': f'{current_elo:.0f}', 
+                'buffer': f'{buf_fill:.1f}%'
+            })
+
+            # 3. EVALUATION PHASE
+            if train_step % Config.ELO_EVAL_INTERVAL == 0:
+                print(f"\n--- Starting ELO Evaluation at Step {train_step} ---")
+                model.eval()
+                wins, total = evaluate_vs_opponent(
+                    game, model, best_model, 
+                    Config.ELO_EVAL_GAMES, device, 
+                    show_progress=True 
                 )
                 
-                if elo > best_elo:
-                    best_elo = elo
-                    # Save best model
-                    save_checkpoint(raw_model, optimizer, step, elo, avg_loss, best_model_path)
-                    tqdm.write(f"   💾 New best model saved!")
+                old_elo = current_elo
+                new_elo = update_elo(current_elo, best_elo, wins, total)
                 
-                # Update "older_model" to current state for next comparison
-                older_model.load_state_dict(raw_model.state_dict())
-                older_elo = elo
-            
-            if step > 0 and step % Config.SAVE_INTERVAL == 0:
-                save_checkpoint(raw_model, optimizer, step, elo, avg_loss, latest_model_path)
-    
-    # Final Save
-    final_loss = np.mean(loss_history) if loss_history else 0
-    save_checkpoint(raw_model, optimizer, Config.TRAIN_STEPS, elo, final_loss, latest_model_path)
-    
-    print()
-    print("=" * 70)
-    print("🏆 TRAINING COMPLETE")
-    print("=" * 70)
-    print(f"   📊 Final ELO: {elo:.0f}")
-    print(f"   📊 Best ELO: {best_elo:.0f}")
-    ray.shutdown()
+                status_msg = "NEW BEST MODEL" if new_elo > best_elo else "No improvement"
+                print(f"ELO Result: {old_elo:.0f} -> {new_elo:.0f} | Win Rate: {(wins/total)*100:.1f}% | {status_msg}")
+
+                if new_elo > best_elo:
+                    best_elo = new_elo
+                    load_model_state_dict(best_model, get_model_state_dict(model))
+                    save_checkpoint(model, optimizer, train_step, best_elo, loss, best_path)
+                
+                current_elo = new_elo
+                save_checkpoint(model, optimizer, train_step, current_elo, loss, latest_path)
+                model.train()
+        
+        avg_loss = total_iter_loss / Config.STEPS_PER_ITERATION
+        print(f"Iteration Complete. Avg Loss: {avg_loss:.4f} | Samples in Buffer: {len(replay_buffer)}")
+
+    pbar.close()
 
 if __name__ == "__main__":
     train()

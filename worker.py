@@ -1,106 +1,141 @@
-import ray
 import torch
 import random
+from collections import deque
 from config import Config
 from bg_engine import BackgammonGame
 from model import get_model
 from mcts import MCTS
 from utils import move_to_indices
 
-@ray.remote
 class SelfPlayWorker:
-    def __init__(self, model_state):
-        self.game = BackgammonGame()
-        
-        # Set device for this worker (Likely CPU to save GPU for training)
+    """CPU-optimized self-play worker using batched MCTS."""
+    
+    def __init__(self, model_state_dict, worker_id=0):
+        self.worker_id = worker_id
+        # Use CPU for workers to leave GPU for trainer, or as configured
         self.device = torch.device(Config.WORKER_DEVICE)
         
+        # Initialize and optimize model
         self.model = get_model().to(self.device)
-        self.model.load_state_dict(model_state)
+        self.model.load_state_dict(model_state_dict)
         self.model.eval()
         
-        # MCTS now takes device arg
+        # Optimization: Disable gradient tracking for all worker operations
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        # Initialize the optimized MCTS
         self.mcts = MCTS(self.model, self.device)
         
+        # Game instance
+        self.game = BackgammonGame()
+        
     def update_model(self, state_dict):
-        # Load state dict (CPU->CPU copy is fast)
+        """Update worker's model weights dynamically."""
         self.model.load_state_dict(state_dict)
+        self.model.eval()
 
     def play_match(self):
-        data = []
-        scores = [0, 0]
-        total_turns = 0
+        """Plays a full match up to MATCH_TARGET points."""
+        match_data = []
+        scores = [0, 0] # [Player 1, Player 2]
         
-        while max(scores) < Config.MATCH_TARGET and total_turns < Config.MAX_TURNS:
-            game_data = self._play_single_game(scores)
-            data.extend(game_data)
+        while max(scores) < Config.MATCH_TARGET:
+            game_result_data, winner_id, points = self._play_single_game(scores)
             
-            winner, win_type = self.game.check_win()
-            if winner != 0:
-                pts = self._calculate_points(win_type)
-                if winner == 1: scores[0] += pts
-                else: scores[1] += pts
-            total_turns += len(game_data)
+            # Update match scores
+            if winner_id == 1:
+                scores[0] += points
+            else:
+                scores[1] += points
             
-        return self._process_game_data(data, scores), scores
-    
-    def _play_single_game(self, scores):
+            # Collect data from this game
+            match_data.extend(game_result_data)
+            
+            # Safety break for infinite loops in early training
+            if len(match_data) > Config.MAX_TURNS: 
+                break
+                
+        return self._process_match_results(match_data, scores), scores
+
+    def _play_single_game(self, match_scores):
+        """Plays a single game and returns raw step data."""
         self.game.reset()
-        game_data = []
+        game_steps = []
         
         while True:
-            winner, _ = self.game.check_win()
-            if winner != 0: return game_data
+            winner, win_type = self.game.check_win()
+            if winner != 0:
+                return game_steps, winner, self._calculate_points(win_type)
             
             self.game.roll_dice()
             
+            # A turn can consist of multiple atomic moves
             while self.game.dice:
                 legal_moves = self.game.get_legal_moves()
                 if not legal_moves:
-                    self.game.dice = []
                     break
                 
-                root = self.mcts.search(None, self.game, scores[0], scores[1])
+                # MCTS Search
+                # Fixed: passing self.game as the engine (not None)
+                root = self.mcts.search(self.game, match_scores[0], match_scores[1])
                 
-                visits = [(act, child.visits) for act, child in root.children.items()]
-                if not visits:
-                    chosen_act = legal_moves[0]
+                # Get visit counts for policy
+                if not root.children:
+                    # Fallback if MCTS fails to expand (should not happen with legal moves)
+                    chosen_act = random.choice(legal_moves)
                 else:
-                    acts, weights = zip(*visits)
-                    # Python random.choices is fast for small lists
-                    chosen_act = random.choices(acts, weights=weights, k=1)[0]
+                    # Select action based on visit count distribution (Stochastic Play)
+                    acts, visits = zip(*[(a, c.visits) for a, c in root.children.items()])
+                    chosen_act = random.choices(acts, weights=visits, k=1)[0]
                 
-                # Get state tensors directly (On CPU)
-                b_t, c_t = self.game.get_vector(scores[0], scores[1], device=self.device, canonical=True)
+                # Record state BEFORE moving (Canonical perspective)
+                b_t, c_t = self.game.get_vector(
+                    match_scores[0], match_scores[1], 
+                    device=self.device, 
+                    canonical=True
+                )
                 
+                # Move to CPU immediately to save worker memory
+                b_t = b_t.squeeze(0).cpu()
+                c_t = c_t.squeeze(0).cpu()
+                
+                # Convert action to indices for the policy head
                 canonical_act = self.game.real_action_to_canonical(chosen_act)
-                s, e = move_to_indices(canonical_act[0], canonical_act[1])
+                s_idx, e_idx = move_to_indices(canonical_act[0], canonical_act[1])
                 
-                # Store tensors and integers. No numpy.
-                game_data.append((b_t, c_t, (s, e), self.game.turn))
+                # Store: (Board, Context, (Start, End), TurnID)
+                game_steps.append([b_t, c_t, (s_idx, e_idx), self.game.turn])
                 
-                w, _ = self.game.step_atomic(chosen_act)
-                if w != 0: break
+                # Execute move
+                self.game.step_atomic(chosen_act)
+                
+                # Check if this atomic move ended the game
+                if self.game.check_win()[0] != 0:
+                    break
             
-            if self.game.check_win()[0] != 0: continue
-            self.game.switch_turn()
-        
-        return game_data
-    
+            # Turn over
+            if self.game.check_win()[0] == 0:
+                self.game.switch_turn()
+
     def _calculate_points(self, win_type):
-        pts = 1
-        if win_type == 2: pts = int(Config.R_GAMMON)
-        if win_type == 3: pts = int(Config.R_BACKGAMMON)
-        return int(pts * self.game.cube)
-    
-    def _process_game_data(self, data, scores):
-        winner = 1 if scores[0] > scores[1] else -1
-        pts = float(abs(scores[0] - scores[1]))
-        final_reward = pts if winner == 1 else -pts
-        
+        """Calculates score based on gammon/backgammon multipliers."""
+        multiplier = 1
+        if win_type == 2: multiplier = Config.R_GAMMON
+        if win_type == 3: multiplier = Config.R_BACKGAMMON
+        return int(multiplier * self.game.cube)
+
+    def _process_match_results(self, match_data, final_scores):
+        """
+        Assigns rewards based on the final match winner.
+        Uses match-level reinforcement: Was the move helpful to win the MATCH?
+        """
+        match_winner = 1 if final_scores[0] > final_scores[1] else -1
         processed = []
-        for state, context, action, turn in data:
-            perspective_reward = final_reward * turn
-            # Returns: (Tensor, Tensor, Tuple, float)
-            processed.append((state, context, action, perspective_reward))
+        
+        for board, context, action, turn_id in match_data:
+            # Reward is 1.0 if the player who made the move eventually won the match
+            reward = 1.0 if turn_id == match_winner else -1.0
+            processed.append((board, context, action, reward))
+            
         return processed

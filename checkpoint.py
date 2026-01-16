@@ -1,67 +1,104 @@
-"""Checkpoint management for saving and loading models."""
+"""Checkpoint management for training."""
 
+import os
 import torch
-from pathlib import Path
 from config import Config
 
 
-def save_checkpoint(model, optimizer, step, elo, loss, filepath):
+def setup_checkpoint_dir():
     """
-    Save model checkpoint with training state.
+    Create checkpoint directory and return paths.
+    
+    Returns:
+        Tuple of (checkpoint_dir, best_model_path, latest_model_path)
+    """
+    checkpoint_dir = Config.CHECKPOINT_DIR
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    best_path = os.path.join(checkpoint_dir, "best_model.pt")
+    latest_path = os.path.join(checkpoint_dir, "latest_model.pt")
+    
+    return checkpoint_dir, best_path, latest_path
+
+
+def save_checkpoint(model, optimizer, step, elo, loss, path):
+    """
+    Save a training checkpoint.
     
     Args:
         model: The neural network model
         optimizer: The optimizer
         step: Current training step
         elo: Current ELO rating
-        loss: Current loss value
-        filepath: Path to save the checkpoint
+        loss: Recent average loss
+        path: File path to save to
     """
+    # Handle compiled models
+    model_to_save = model
+    if hasattr(model, '_orig_mod'):
+        model_to_save = model._orig_mod
+    
     checkpoint = {
+        'model_state_dict': model_to_save.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
         'step': step,
         'elo': elo,
         'loss': loss,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
         'config': {
-            'D_MODEL': Config.D_MODEL,
-            'N_HEAD': Config.N_HEAD,
-            'N_LAYERS': Config.N_LAYERS,
-            'NUM_ACTIONS': Config.NUM_ACTIONS,
+            'model_type': Config.MODEL_TYPE,
+            'd_model': Config.D_MODEL,
+            'n_layers': Config.N_LAYERS,
         }
     }
-    torch.save(checkpoint, filepath)
+    
+    torch.save(checkpoint, path)
 
 
-def load_checkpoint(filepath, model, optimizer=None):
+def load_checkpoint(path, model, optimizer=None, device='cpu'):
     """
-    Load model checkpoint.
+    Load a training checkpoint.
     
     Args:
-        filepath: Path to the checkpoint file
+        path: File path to load from
         model: The neural network model to load weights into
         optimizer: Optional optimizer to load state into
-        
-    Returns:
-        Tuple of (step, elo, loss)
-    """
-    checkpoint = torch.load(filepath, map_location=Config.DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return checkpoint['step'], checkpoint['elo'], checkpoint.get('loss', 0)
-
-
-def setup_checkpoint_dir():
-    """
-    Create checkpoint directory if it doesn't exist.
+        device: Device to load tensors to
     
     Returns:
-        Tuple of (checkpoint_dir, best_model_path, latest_model_path)
+        Dictionary with 'step', 'elo', 'loss' keys, or None if file doesn't exist
     """
-    checkpoint_dir = Path(Config.CHECKPOINT_DIR)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = checkpoint_dir / "best_model.pt"
-    latest_model_path = checkpoint_dir / "latest_model.pt"
-    return checkpoint_dir, best_model_path, latest_model_path
+    if not os.path.exists(path):
+        return None
+    
+    checkpoint = torch.load(path, map_location=device)
+    
+    # Handle compiled models
+    model_to_load = model
+    if hasattr(model, '_orig_mod'):
+        model_to_load = model._orig_mod
+    
+    model_to_load.load_state_dict(checkpoint['model_state_dict'])
+    
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    return {
+        'step': checkpoint.get('step', 0),
+        'elo': checkpoint.get('elo', Config.INITIAL_ELO),
+        'loss': checkpoint.get('loss', 0.0)
+    }
 
+
+def get_model_state_dict(model):
+    """Get state dict, handling compiled models."""
+    if hasattr(model, '_orig_mod'):
+        return model._orig_mod.state_dict()
+    return model.state_dict()
+
+
+def load_model_state_dict(model, state_dict):
+    """Load state dict, handling compiled models."""
+    if hasattr(model, '_orig_mod'):
+        model._orig_mod.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
