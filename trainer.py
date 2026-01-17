@@ -153,7 +153,7 @@ def play_one_game(game, mcts, model, device, is_eval=False, initial_match_scores
 def finalize_history(history, winner, total_points):
     data = []
     for board, ctx, act, turn, is_cube in history:
-        reward = float(total_points) if turn == winner else -float(total_points)
+        reward = (float(total_points) + float(Config.MATCH_TARGET)) if turn == winner else (-float(total_points) - Config.MATCH_TARGET)
         data.append((board, ctx, act, reward, is_cube))
     return data
 
