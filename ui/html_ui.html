@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Backgammon AI — Neural Client</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+<style>
+/* ======================
+   MODERN THEME
+====================== */
+:root {
+  --bg: #0a0d14;
+  --glass: rgba(255,255,255,0.08);
+  --border: rgba(255,255,255,0.15);
+  --accent: #4fd1ff;
+  --white: #f4f6fb;
+  --black: #0f172a;
+  --danger: #ff5f5f;
+  --success: #2ee59d;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #121826, #05070d);
+  color: #e8ebf0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* ======================
+   LAYOUT
+====================== */
+.app {
+  width: 1200px;
+  max-width: 96vw;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.panel {
+  backdrop-filter: blur(18px);
+  background: var(--glass);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ======================
+   CONTROLS
+====================== */
+.controls-left,
+.controls-right {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+button {
+  background: linear-gradient(180deg, #1e293b, #0f172a);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 18px;
+  color: #e8ebf0;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+button:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 12px rgba(79,209,255,0.3);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-new { border-color: var(--danger); }
+.btn-roll { border-color: var(--success); }
+
+select, input[type="range"] {
+  background: #020617;
+  color: #e8ebf0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+}
+
+/* ======================
+   INFO
+====================== */
+.info {
+  justify-content: center;
+  gap: 50px;
+}
+
+.cube {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.cube-value {
+  font-size: 28px;
+  font-weight: 800;
+  color: var(--accent);
+}
+
+.dice {
+  display: flex;
+  gap: 14px;
+}
+
+.die {
+  width: 46px;
+  height: 46px;
+  border-radius: 10px;
+  background: #f8fafc;
+  color: #020617;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 24px;
+  font-weight: 800;
+}
+
+/* ======================
+   STATUS
+====================== */
+.status {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  color: #a5b4fc;
+}
+
+/* ======================
+   BOARD
+====================== */
+.board {
+  background: linear-gradient(180deg, #020617, #030712);
+  border-radius: 20px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: 1fr 70px 1fr;
+  grid-template-rows: 1fr 1fr;
+  height: 440px;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.points {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 6px;
+}
+
+.point {
+  position: relative;
+  overflow: visible;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+
+.point.down {
+  align-items: flex-end;
+}
+
+.triangle {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(180deg, #1e293b, #020617);
+  clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
+  opacity: 0.8;
+}
+
+.down .triangle {
+  clip-path: polygon(0% 0%, 100% 0%, 50% 100%);
+}
+
+/* ======================
+   CHECKERS
+====================== */
+.stack {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 10;
+}
+
+.down .stack {
+  flex-direction: column-reverse;
+}
+
+.checker {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid #000;
+  flex-shrink: 0;
+}
+
+.white { background: #f8fafc; }
+.black { background: #020617; }
+
+/* ======================
+   BAR
+====================== */
+.bar {
+  background: rgba(255,255,255,0.04);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+/* ======================
+   ACTIONS
+====================== */
+.actions {
+  justify-content: center;
+  gap: 14px;
+}
+</style>
+</head>
+
+<body>
+<div class="app">
+
+<!-- CONTROLS -->
+<div class="panel">
+  <div class="controls-left">
+    <button class="btn-new" id="btnNew">New Match</button>
+    <button id="btnLoad">Load AI</button>
+    <input type="file" id="aiFile" hidden>
+  </div>
+
+  <div class="controls-right">
+    <label>Mode</label>
+    <select id="aiMode">
+      <option value="human_vs_ai">Human vs AI</option>
+      <option value="ai_vs_human">AI vs Human</option>
+      <option value="ai_vs_ai">AI vs AI</option>
+      <option value="human_vs_human">Human vs Human</option>
+    </select>
+
+    <label>AI Delay</label>
+    <input id="aiSpeed" type="range" min="0.2" max="2" step="0.1" value="0.6">
+  </div>
+</div>
+
+<!-- INFO -->
+<div class="panel info">
+  <div class="cube">
+    <div class="cube-value" id="cubeValue">1</div>
+    <div id="cubeOwner">(Center)</div>
+  </div>
+
+  <div class="dice">
+    <div class="die" id="die1">-</div>
+    <div class="die" id="die2">-</div>
+  </div>
+</div>
+
+<!-- STATUS -->
+<div class="panel status" id="status">Connecting to AI...</div>
+
+<!-- BOARD -->
+<div class="board">
+  <div class="points" id="topLeft"></div>
+  <div class="bar">
+    <div id="barBlack">Black Bar: 0</div>
+    <div id="barWhite">White Bar: 0</div>
+  </div>
+  <div class="points" id="topRight"></div>
+
+  <div class="points" id="bottomLeft"></div>
+  <div class="bar"></div>
+  <div class="points" id="bottomRight"></div>
+</div>
+
+<!-- ACTIONS -->
+<div class="panel actions">
+  <button class="btn-roll" id="btnRoll">Roll</button>
+  <button id="btnDouble">Double</button>
+  <button id="btnEnd">End Turn</button>
+</div>
+
+</div>
+
+<script>
+/* ============================
+   WEBSOCKET REAL AI CLIENT
+============================ */
+const WS_URL = "ws://localhost:8765";
+let socket = null;
+
+/* ============================
+   STATE
+============================ */
+let turn = 1;
+let boardState = new Array(24).fill(0);
+let bar = [0,0];
+let dice = [];
+let cubeValue = 1;
+let cubeOwner = 0;
+
+/* ============================
+   UI
+============================ */
+const status = document.getElementById("status");
+const cubeValEl = document.getElementById("cubeValue");
+const cubeOwnerEl = document.getElementById("cubeOwner");
+const die1 = document.getElementById("die1");
+const die2 = document.getElementById("die2");
+
+const topLeft = document.getElementById("topLeft");
+const topRight = document.getElementById("topRight");
+const bottomLeft = document.getElementById("bottomLeft");
+const bottomRight = document.getElementById("bottomRight");
+
+const barBlack = document.getElementById("barBlack");
+const barWhite = document.getElementById("barWhite");
+
+const btnRoll = document.getElementById("btnRoll");
+const btnDouble = document.getElementById("btnDouble");
+const btnEnd = document.getElementById("btnEnd");
+const btnNew = document.getElementById("btnNew");
+
+/* ============================
+   SOCKET
+============================ */
+function connectAI() {
+  socket = new WebSocket(WS_URL);
+
+  socket.onopen = () => {
+    status.textContent = "Connected to Neural AI";
+    send({ type: "hello" });
+  };
+
+  socket.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "state") {
+      applyState(msg.payload);
+    }
+  };
+
+  socket.onclose = () => {
+    status.textContent = "AI Disconnected";
+  };
+}
+
+function send(data) {
+  if (socket && socket.readyState === 1) {
+    socket.send(JSON.stringify(data));
+  }
+}
+
+/* ============================
+   RENDERING
+============================ */
+function makePoint(idx, down) {
+  const p = document.createElement("div");
+  p.className = "point " + (down ? "down" : "");
+
+  const tri = document.createElement("div");
+  tri.className = "triangle";
+
+  const stack = document.createElement("div");
+  stack.className = "stack";
+
+  const val = boardState[idx];
+  const count = Math.abs(val);
+  for (let i = 0; i < count; i++) {
+    const c = document.createElement("div");
+    c.className = "checker " + (val > 0 ? "white" : "black");
+    stack.appendChild(c);
+  }
+
+  p.appendChild(tri);
+  p.appendChild(stack);
+  return p;
+}
+
+function renderBoard() {
+  topLeft.innerHTML = "";
+  topRight.innerHTML = "";
+  bottomLeft.innerHTML = "";
+  bottomRight.innerHTML = "";
+
+  for (let i = 12; i < 18; i++) topLeft.appendChild(makePoint(i, false));
+  for (let i = 18; i < 24; i++) topRight.appendChild(makePoint(i, false));
+  for (let i = 11; i >= 6; i--) bottomLeft.appendChild(makePoint(i, true));
+  for (let i = 5; i >= 0; i--) bottomRight.appendChild(makePoint(i, true));
+
+  barBlack.textContent = "Black Bar: " + bar[1];
+  barWhite.textContent = "White Bar: " + bar[0];
+}
+
+/* ============================
+   STATE SYNC
+============================ */
+function applyState(s) {
+  boardState = s.board;
+  bar = s.bar;
+  turn = s.turn;
+  dice = s.dice;
+  cubeValue = s.cube_value;
+  cubeOwner = s.cube_owner;
+
+  cubeValEl.textContent = cubeValue;
+  cubeOwnerEl.textContent = cubeOwner === 0 ? "(Center)" :
+    cubeOwner === 1 ? "(White owns)" : "(Black owns)";
+
+  die1.textContent = dice[0] || "-";
+  die2.textContent = dice[1] || "-";
+
+  status.textContent = s.status || "Synced with AI";
+  renderBoard();
+}
+
+/* ============================
+   EVENTS
+============================ */
+btnNew.onclick = () => send({ type: "new_game" });
+btnRoll.onclick = () => send({ type: "roll" });
+btnEnd.onclick = () => send({ type: "end_turn" });
+btnDouble.onclick = () => send({ type: "double" });
+
+/* ============================
+   START
+============================ */
+connectAI();
+</script>
+
+</body>
+</html>
