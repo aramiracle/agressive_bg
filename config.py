@@ -68,9 +68,9 @@ class Config:
     LR = 1e-4
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-5
-    TRAIN_STEPS = 100000
+    TRAIN_STEPS = 200000
     LOSS_AVG_WINDOW = 100
-    MAX_GAME_MOVES = 1000
+    MAX_GAME_MOVES = 2000
 
     # Device
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

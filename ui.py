@@ -321,9 +321,12 @@ class BackgammonBoard(Widget):
             Color(0.2, 0.15, 0.1, 1)
             Rectangle(pos=(self.width/15 * 7, 0), size=(self.width/15, self.height))
             
-            # Border
-            Color(0.2, 0.15, 0.1, 1)
-            Line(rectangle=(self.x, self.y, self.width, self.height), width=2)
+            # Border (Double Layer)
+            Color(0.05, 0.05, 0.05, 1)
+            Line(rectangle=(self.x, self.y, self.width, self.height), width=5)
+
+            Color(0.8, 0.6, 0.3, 1)
+            Line(rectangle=(self.x+2, self.y+2, self.width-4, self.height-4), width=2)
 
         # Draw points
         for i in range(24):
@@ -340,7 +343,7 @@ class BackgammonBoard(Widget):
                 Triangle(points=[x, y, x+w, y, x + w/2, tip_y])
 
         # Draw checkers
-        radius = min(self.width/15, self.height/26) * 0.9
+        radius = min(self.width/15, self.height/26) * 1.8
         
         for i, count in enumerate(self.engine.board):
             if count == 0: continue
@@ -438,6 +441,24 @@ class BackgammonBoard(Widget):
             self.handle_click(clicked)
             return True
         return False
+    
+    def calculate_pips(self):
+        """Returns (white_pips, black_pips)"""
+        white = 0
+        black = 0
+
+        # Board pips
+        for i, count in enumerate(self.engine.board):
+            if count > 0:   # White
+                white += count * (i + 1)
+            elif count < 0:  # Black
+                black += abs(count) * (24 - i)
+
+        # Bar pips (25 pips each)
+        white += self.engine.bar[0] * 25
+        black += self.engine.bar[1] * 25
+
+        return white, black
 
     def handle_click(self, index):
         # 1. Execute move
@@ -1097,7 +1118,10 @@ class GameScreen(BoxLayout):
             self.lbl_status.text = text
             return
         p = "White" if self.board.engine.turn == 1 else "Black"
-        self.lbl_status.text = f"{p}'s Turn"
+        p = "White" if self.board.engine.turn == 1 else "Black"
+        w_pips, b_pips = self.board.calculate_pips()
+        self.lbl_status.text = f"{p}'s Turn | Pips → White: {w_pips} | Black: {b_pips}"
+
 
 
 class BackgammonApp(App):
