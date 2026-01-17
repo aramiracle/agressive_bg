@@ -28,29 +28,46 @@ def get_cube_decision(model, game, device):
         _, _, _, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
     return torch.argmax(cube_logits, dim=1).item()
 
-def play_one_game(game, mcts, model, device, is_eval=False):
+def play_one_game(game, mcts, model, device, is_eval=False, initial_match_scores=None, initial_crawford_used=False):
     """
-    Plays a complete game. 
-    Maintains local match scores to satisfy MCTS and Model requirements.
+    Plays a complete game.
+    Optional:
+        initial_match_scores: tuple (score_p1, score_p-1) to inform Crawford rule for this game.
+        initial_crawford_used: whether Crawford has already been consumed in this match.
+    Returns:
+        If is_eval: (winner, total_points)
+        Else: (history_data, winner)
     """
+    # If caller provided match scores, use them; otherwise default to zeros.
+    if initial_match_scores is not None:
+        match_scores = {1: int(initial_match_scores[0]), -1: int(initial_match_scores[1])}
+    else:
+        match_scores = {1: 0, -1: 0}
+
+    game.crawford_used = bool(initial_crawford_used)
+
     game.reset()
+    # Inform the game of match scores so it can enable Crawford when required
+    game.set_match_scores(match_scores[1], match_scores[-1])
+
     history = []
     
     # Local match score tracking (Internal to this function session)
-    # Typically 0-0 at the start of a training game
-    match_scores = {1: 0, -1: 0} 
+    # Typically 0-0 at the start of a training game, but can be passed in via initial_match_scores
+    local_match_scores = {1: match_scores[1], -1: match_scores[-1]}
     
-    max_moves = getattr(Config, 'MAX_GAME_MOVES', 2000)
+    max_moves = Config.MAX_GAME_MOVES
     
     for _ in range(max_moves):
         winner, _ = game.check_win()
         if winner != 0: break
 
         # Current player's score context
-        my_s = match_scores[game.turn]
-        opp_s = match_scores[-game.turn]
+        my_s = local_match_scores[game.turn]
+        opp_s = local_match_scores[-game.turn]
 
         # --- CUBING PHASE ---
+        # can_double now respects the Crawford flag set earlier via set_match_scores
         if game.can_double() and game.cube < Config.MATCH_TARGET:
             # Note: get_vector now receives the local match scores
             double_choice = get_cube_decision(model, game, device)
@@ -70,7 +87,12 @@ def play_one_game(game, mcts, model, device, is_eval=False):
                 else:
                     # Pass: Opponent refuses, player wins current cube value
                     final_winner, points = game.handle_cube_refusal()
-                    if is_eval: return final_winner, points
+                    if is_eval: 
+                        # After a Crawford game (if it was), mark it as used so caller can track persistent state
+                        if game.crawford:
+                            game.crawford_used = True
+                            game.crawford = False
+                        return final_winner, points
                     return finalize_history(history, final_winner, points), final_winner
 
         # --- MOVEMENT PHASE ---
@@ -115,7 +137,14 @@ def play_one_game(game, mcts, model, device, is_eval=False):
     # --- FINALIZATION ---
     winner, mult = game.check_win()
     total_points = mult * game.cube
-    
+
+    # If this game was the Crawford game, record that it has been consumed so the match driver
+    # can mark it used across subsequent games.
+    crawford_was_played = bool(game.crawford)
+    if crawford_was_played:
+        game.crawford_used = True
+        game.crawford = False  # Crawford is a single-game rule; clear for next game
+
     if is_eval: 
         return winner, total_points
         
@@ -187,11 +216,22 @@ def train():
     optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
-    cp = load_checkpoint(latest_path, model, optimizer, device)
-    train_step = cp['step'] if cp else 0
-    current_elo = cp['elo'] if cp else Config.INITIAL_ELO
-    best_elo = current_elo
-    load_model_state_dict(best_model, get_model_state_dict(model))
+    # --- Load CURRENT model + ELO ---
+    cp_latest = load_checkpoint(latest_path, model, optimizer, device)
+
+    train_step = cp_latest['step'] if cp_latest else 0
+    current_elo = cp_latest['elo'] if cp_latest else Config.INITIAL_ELO
+
+    # --- Load BEST model + ELO ---
+    cp_best = load_checkpoint(best_path, best_model, None, device)
+
+    if cp_best: 
+        best_elo = cp_best['elo']
+    else:
+        # First run: best model = current model
+        best_elo = current_elo
+        load_model_state_dict(best_model, get_model_state_dict(model))
+
 
     replay_buffer = deque(maxlen=Config.BUFFER_SIZE)
     game = BackgammonGame()
@@ -236,12 +276,14 @@ def train():
             if train_step % Config.ELO_EVAL_INTERVAL == 0:
                 print(f"\n--- Starting ELO Evaluation at Step {train_step} ---")
                 model.eval()
-                wins, total = evaluate_vs_opponent(
-                    game, model, best_model, 
-                    Config.ELO_EVAL_GAMES, device, 
-                    show_progress=True 
-                )
-                
+                best_model.eval()
+                with torch.no_grad():
+                    wins, total = evaluate_vs_opponent(
+                        game, model, best_model,
+                        Config.ELO_EVAL_GAMES, device,
+                        show_progress=True
+                    )
+
                 old_elo = current_elo
                 new_elo = update_elo(current_elo, best_elo, wins, total)
                 

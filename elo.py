@@ -13,28 +13,19 @@ def calculate_expected_score(player_elo, opponent_elo):
 
 def update_elo(current_elo, opponent_elo, wins, total_games):
     """
-    Update ELO rating based on match results.
-    
-    Args:
-        current_elo: Current player's ELO
-        opponent_elo: Opponent's ELO  
-        wins: Number of wins (can be float for draws)
-        total_games: Total games played
-    
-    Returns:
-        New ELO rating
+    Standard ELO update for the evaluated player using a batch average.
+    K is interpreted as per-batch scaling (typical default: 16 or 24).
     """
     if total_games == 0:
         return current_elo
 
     actual = wins / total_games
     expected = calculate_expected_score(current_elo, opponent_elo)
-    delta = Config.ELO_K * total_games * (actual - expected)
-    
-    # Clamp delta to prevent extreme swings
-    delta = max(-400, min(400, delta))
-    return current_elo + delta
+    delta = Config.ELO_K * (actual - expected)
 
+    # clamp delta to prevent extreme swings
+    delta = max(-Config.ELO_SCALE, min(Config.ELO_SCALE, delta))
+    return current_elo + delta * total_games
 
 def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=500):
     """

@@ -22,7 +22,7 @@ class Config:
     }
 
     # Game
-    MATCH_TARGET = 10
+    MATCH_TARGET = 5
     MAX_TURNS = 5000
 
     # Rewards
@@ -54,10 +54,10 @@ class Config:
     DIRICHLET_EPS = 0.25
 
     # ELO
-    INITIAL_ELO = 400
-    ELO_K = 32
+    INITIAL_ELO = 1000
+    ELO_K = 16
     ELO_SCALE = 400.0
-    ELO_EVAL_INTERVAL = 2000
+    ELO_EVAL_INTERVAL = 2500
     ELO_EVAL_GAMES = 30
 
     # Training
@@ -65,12 +65,12 @@ class Config:
     STEPS_PER_ITERATION = 250
     BATCH_SIZE = 1024 if torch.cuda.is_available() else 128
     BUFFER_SIZE = 8192
-    LR = 1e-6
+    LR = 1e-4
     GRAD_CLIP = 1.0
-    WEIGHT_DECAY = 1e-4
-    TRAIN_STEPS = 300000
+    WEIGHT_DECAY = 1e-5
+    TRAIN_STEPS = 100000
     LOSS_AVG_WINDOW = 100
-    MAX_GAME_MOVES = 500
+    MAX_GAME_MOVES = 1000
 
     # Device
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

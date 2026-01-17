@@ -1,8 +1,12 @@
+# Updated backgammon app with precise AI vs AI support
+# Replace your original file with this content.
+
 import threading
 import os
 import copy
 import time
 import random
+from functools import partial
 from kivy.app import App
 from kivy.uix.widget import Widget
 from kivy.uix.boxlayout import BoxLayout
@@ -12,6 +16,7 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.spinner import Spinner
+from kivy.uix.slider import Slider
 from kivy.graphics import Color, Line, Triangle, Ellipse, Rectangle, RoundedRectangle
 from kivy.clock import Clock
 from kivy.core.window import Window
@@ -64,19 +69,21 @@ except ImportError:
 
         def step_atomic(self, action):
             # Very basic move execution for mock
+            if action is None: return
             src, dst = action
-            self.board[src] -= (1 if self.turn == 1 else -1)
-            self.board[dst] += (1 if self.turn == 1 else -1)
+            if src == 'bar':
+                # mock: take from bar
+                p_idx = 0 if self.turn == 1 else 1
+                if self.bar[p_idx] > 0:
+                    self.bar[p_idx] -= 1
+                    self.board[dst] += (1 if self.turn == 1 else -1)
+            else:
+                self.board[src] -= (1 if self.turn == 1 else -1)
+                self.board[dst] += (1 if self.turn == 1 else -1)
             if self.dice: self.dice.pop(0)
 
         def check_win(self): 
             # Mock win condition: random for testing UI flow if checkers are low
-            # Returns: (winner_id, multiplier)
-            # 0 = No win, 1 = P1, -1 = P2
-            # Multiplier: 1 (Normal), 2 (Gammon), 3 (Backgammon)
-            
-            # Simple check: if someone bore off 15 (mock logic: just check if board empty-ish)
-            # For testing, let's just say if off count > 0 (this is fake logic)
             if self.off[0] >= 15: return 1, 1
             if self.off[1] >= 15: return -1, 1
             return 0, 1
@@ -90,7 +97,12 @@ except ImportError:
     def load_checkpoint(*args, **kwargs): pass
     class MCTS:
         def __init__(self, *args): pass
-        def search(self, *args): return None
+        def search(self, *args, **kwargs):
+            # Mock returns an object with children dict mapping action->node with visits
+            class Node:
+                def __init__(self, moves):
+                    self.children = {m: type("N", (), {"visits": random.randint(1, 20)}) for m in moves}
+            return Node([])
 
 
 # --- VISUAL CONSTANTS ---
@@ -161,14 +173,14 @@ class BackgammonBoard(Widget):
         self.selected_index = None
         self.legal_moves = []
         
-        # AI Components
-        self.ai_model = None
-        self.ai_device = None
-        self.ai_mcts = None
+        # AI Components: store per player so both sides can have distinct models
+        self.ai_model = {1: None, -1: None}     # models keyed by player (1 white, -1 black)
+        self.ai_device = {1: None, -1: None}
+        self.ai_mcts = {1: None, -1: None}
         self.is_ai_thinking = False
         
         # Game Settings
-        self.game_mode = 'human_vs_ai'
+        self.game_mode = 'human_vs_ai'  # options: 'human_vs_ai', 'ai_vs_human', 'ai_vs_ai', 'human_vs_human'
         
         # Match State
         self.match_target = 3  # Default match length
@@ -183,6 +195,14 @@ class BackgammonBoard(Widget):
         # Turn state for take-back
         self.turn_backup = None
         self.has_moved = False
+        
+        # AI vs AI controls
+        self.ai_auto_play = False
+        self.ai_speed = 1.0  # seconds between turns
+        self.ai_auto_event = None
+        
+        # Move/Match Logger
+        self.move_log = []  # simple list of strings
         
         self.bind(pos=self.redraw, size=self.redraw)
         self.engine.reset()
@@ -204,9 +224,9 @@ class BackgammonBoard(Widget):
         self.has_moved = False
         self.selected_index = None
         self.legal_moves = []
+        self.move_log.clear()
         
         # Check Crawford Rule
-        # If either player is n-1 points away from match, and we haven't played Crawford yet
         p1_needs = self.match_target - self.match_score[1]
         p2_needs = self.match_target - self.match_score[-1]
         
@@ -249,6 +269,8 @@ class BackgammonBoard(Widget):
             return self.engine.turn == 1
         elif self.game_mode == 'ai_vs_human':
             return self.engine.turn == -1
+        elif self.game_mode == 'human_vs_human':
+            return True
         else:  # ai_vs_ai
             return False
 
@@ -425,6 +447,9 @@ class BackgammonBoard(Widget):
             self.selected_index = None
             self.legal_moves = []
             
+            # Log move (very basic)
+            self.move_log.append(f"Player {1 if self.engine.turn==1 else -1} moved {self.selected_index}->{index}")
+            
             # Check win immediately
             winner, mult = self.engine.check_win()
             if winner != 0:
@@ -459,77 +484,94 @@ class BackgammonBoard(Widget):
             self.legal_moves = []
             self.redraw()
 
-    def load_model_thread(self, filepath, callback):
+    def load_model_thread(self, filepath, player, callback):
+        """Load a model and attach it to the given player (1 or -1)."""
         def _load():
             try:
                 device = torch.device(Config.DEVICE)
                 model = get_model().to(device)
                 load_checkpoint(filepath, model, device=device)
                 model.eval()
-                self.ai_model = model
-                self.ai_device = device
-                self.ai_mcts = MCTS(model, device)
-                Clock.schedule_once(lambda dt: callback(True, filepath))
+                mcts = MCTS(model, device)
+                self.ai_model[player] = model
+                self.ai_device[player] = device
+                self.ai_mcts[player] = mcts
+                Clock.schedule_once(lambda dt: callback(True, filepath, player))
             except Exception as e:
-                Clock.schedule_once(lambda dt: callback(False, str(e)))
+                Clock.schedule_once(lambda dt: callback(False, str(e), player))
         threading.Thread(target=_load, daemon=True).start()
 
-    def run_ai(self, finished_callback):
-        if not self.ai_model and not isinstance(self.engine, BackgammonGame): 
-            # If using mock engine without model, simulate random delay
+    def run_ai(self, finished_callback, player=None):
+        """
+        Run AI for the current player. If player is provided, run that player's AI.
+        finished_callback is called when the AI finishes its move(s) for that turn.
+        """
+        if player is None:
+            player = self.engine.turn
+
+        model = self.ai_model.get(player)
+        mcts = self.ai_mcts.get(player)
+
+        # If no model or mock engine, simulate a quick random AI
+        if not model or not mcts or isinstance(self.engine, BackgammonGame) and model is None:
+            # Simple mock AI behavior: roll if needed, then play random legal moves
             self.is_ai_thinking = True
             def _mock_ai():
-                time.sleep(1)
-                if not self.engine.dice: self.engine.roll_dice()
-                Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
-                
-                while self.engine.dice:
-                    time.sleep(0.5)
-                    moves = self.engine.get_legal_moves()
-                    if not moves: break
-                    move = random.choice(moves)
-                    self.engine.step_atomic(move)
-                    Clock.schedule_once(lambda dt: self.redraw())
-                    Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
-                    if self.engine.check_win()[0] != 0: break
-                
-                Clock.schedule_once(lambda dt: finished_callback())
+                try:
+                    if not self.engine.dice:
+                        self.engine.roll_dice()
+                        Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
+                        time.sleep(0.15)
+                    while self.engine.dice:
+                        time.sleep(max(0.05, min(0.6, self.ai_speed * 0.15)))
+                        if self.engine.check_win()[0] != 0:
+                            break
+                        legal = self.engine.get_legal_moves()
+                        if not legal: break
+                        move = random.choice(legal)
+                        self.engine.step_atomic(move)
+                        # Log
+                        self.move_log.append(f"AI({player}) {move}")
+                        Clock.schedule_once(lambda dt: self.redraw())
+                        Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
+                    Clock.schedule_once(lambda dt: finished_callback())
+                finally:
+                    self.is_ai_thinking = False
             threading.Thread(target=_mock_ai, daemon=True).start()
             return
 
-        # Real AI Logic
-        if not self.ai_model: return
+        # Real AI path using MCTS search
         self.is_ai_thinking = True
-        
         def _think():
-            # 1. Decision: Double? (Placeholder for AI doubling logic)
-            # For now, AI never doubles in this snippet, but you would check neural net value here.
-            
-            # 2. Roll
-            if not self.engine.dice:
-                self.engine.roll_dice()
-                Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
-                time.sleep(0.5)
+            try:
+                # Potential place for doubling logic per AI player
+                if not self.engine.dice:
+                    self.engine.roll_dice()
+                    Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
+                    time.sleep(0.2)
 
-            # 3. Move
-            while self.engine.dice:
-                legal = self.engine.get_legal_moves()
-                if not legal: break
-                
-                root = self.ai_mcts.search(self.engine, 0, 0)
-                if root and root.children:
-                    action = max(root.children.items(), key=lambda x: x[1].visits)[0]
-                else:
-                    action = legal[0]
-                
-                self.engine.step_atomic(action)
-                Clock.schedule_once(lambda dt: self.redraw())
-                Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
-                
-                if self.engine.check_win()[0] != 0: break
-                time.sleep(0.6)
+                while self.engine.dice:
+                    # If win state detected stop
+                    if self.engine.check_win()[0] != 0:
+                        break
 
-            Clock.schedule_once(lambda dt: finished_callback())
+                    legal = self.engine.get_legal_moves()
+                    if not legal: break
+
+                    root = mcts.search(self.engine.copy(), 0, 0)  # placeholder call; adapt to your MCTS signature
+                    if root and getattr(root, 'children', None):
+                        action = max(root.children.items(), key=lambda x: x[1].visits)[0]
+                    else:
+                        action = legal[0]
+                    self.engine.step_atomic(action)
+                    # Log
+                    self.move_log.append(f"AI({player}) {action}")
+                    Clock.schedule_once(lambda dt: self.redraw())
+                    Clock.schedule_once(lambda dt: self.game_screen.dice_widget.set_dice(self.engine.dice))
+                    time.sleep(max(0.05, min(0.8, self.ai_speed * 0.2)))
+                Clock.schedule_once(lambda dt: finished_callback())
+            finally:
+                self.is_ai_thinking = False
 
         threading.Thread(target=_think, daemon=True).start()
 
@@ -542,7 +584,7 @@ class GameScreen(BoxLayout):
         self.match_over = False
 
         # --- TOP CONTROL BAR ---
-        controls = BoxLayout(size_hint_y=None, height=dp(50), padding=dp(5), spacing=dp(5))
+        controls = BoxLayout(size_hint_y=None, height=dp(60), padding=dp(5), spacing=dp(5))
         
         btn_new = Button(text="New Match", size_hint_x=None, width=dp(90), 
                           background_color=(0.5, 0.2, 0.2, 1))
@@ -552,10 +594,27 @@ class GameScreen(BoxLayout):
                          background_color=(0.2, 0.5, 0.5, 1))
         btn_load.bind(on_press=self.show_load_dialog)
         
+        # Game mode selector (human_vs_ai, ai_vs_human, ai_vs_ai, human_vs_human)
+        self.mode_spinner = Spinner(text='human_vs_ai', values=('human_vs_ai','ai_vs_human','ai_vs_ai','human_vs_human'),
+                                   size_hint_x=None, width=dp(140))
+        self.mode_spinner.bind(text=self.on_mode_change)
+        
+        # Auto-play controls (for ai_vs_ai)
+        self.btn_auto = Button(text="Auto: OFF", size_hint_x=None, width=dp(90), background_color=(0.3,0.3,0.3,1))
+        self.btn_auto.bind(on_press=self.toggle_auto_play)
+        self.speed_spinner = Spinner(text='1.0s', values=('0.2s','0.5s','1.0s','1.5s','2.0s'), size_hint_x=None, width=dp(90))
+        self.speed_spinner.bind(text=self.on_speed_change)
+        self.btn_step = Button(text="Step", size_hint_x=None, width=dp(70))
+        self.btn_step.bind(on_press=lambda x: self.step_ai())
+
         self.lbl_score = Label(text="White: 0 | Black: 0 (Goal: 3)", font_size='16sp', bold=True)
         
         controls.add_widget(btn_new)
         controls.add_widget(btn_load)
+        controls.add_widget(self.mode_spinner)
+        controls.add_widget(self.btn_auto)
+        controls.add_widget(self.speed_spinner)
+        controls.add_widget(self.btn_step)
         controls.add_widget(self.lbl_score)
         self.add_widget(controls)
 
@@ -605,8 +664,76 @@ class GameScreen(BoxLayout):
         board_container.add_widget(self.board)
         self.add_widget(board_container)
         
+        # small log label
+        self.lbl_log = Label(text="Log: ", size_hint_y=None, height=dp(40))
+        self.add_widget(self.lbl_log)
+        
         self.update_buttons()
 
+    # --- UI callbacks and helpers for new controls ---
+    def on_mode_change(self, spinner, text):
+        self.board.game_mode = text
+        self.update_status(f"Mode set: {text}")
+        # If switching to ai_vs_ai, optionally start auto play
+        if text == 'ai_vs_ai':
+            pass
+
+    def toggle_auto_play(self, instance):
+        # Toggle autoplayer for ai_vs_ai only
+        if self.board.game_mode != 'ai_vs_ai':
+            self.update_status("Auto-play only available in ai_vs_ai mode.")
+            return
+        self.board.ai_auto_play = not self.board.ai_auto_play
+        self.btn_auto.text = f"Auto: {'ON' if self.board.ai_auto_play else 'OFF'}"
+        if self.board.ai_auto_play:
+            # schedule
+            self.start_auto_schedule()
+        else:
+            self.stop_auto_schedule()
+
+    def on_speed_change(self, spinner, text):
+        # text like "1.0s" -> parse float
+        if text.endswith('s'):
+            try:
+                v = float(text[:-1])
+                self.board.ai_speed = v
+                self.update_status(f"AI speed set to {v}s")
+            except:
+                pass
+
+    def start_auto_schedule(self):
+        # Schedule repeated triggering if AI vs AI
+        self.stop_auto_schedule()
+        interval = max(0.05, self.board.ai_speed)
+        self.board.ai_auto_event = Clock.schedule_interval(lambda dt: self.trigger_ai_once_for_autoplay(), interval)
+        self.update_status("AI Auto-play started")
+
+    def stop_auto_schedule(self):
+        ev = self.board.ai_auto_event
+        if ev:
+            ev.cancel()
+            self.board.ai_auto_event = None
+        self.update_status("AI Auto-play stopped")
+
+    def trigger_ai_once_for_autoplay(self):
+        if self.match_over: return
+        # Only act when it's an AI turn and not thinking
+        if self.board.game_mode == 'ai_vs_ai' and not self.board.is_ai_thinking:
+            # Only call trigger if it's the AI whose turn it is
+            self.trigger_ai_auto()
+        return True
+
+    def step_ai(self):
+        # one-time step for ai_vs_ai
+        if self.board.game_mode != 'ai_vs_ai':
+            self.update_status("Step only works for ai_vs_ai mode.")
+            return
+        if self.board.is_ai_thinking:
+            self.update_status("AI is busy. Wait.")
+            return
+        self.trigger_ai_auto()
+
+    # --- existing functions (slightly adapted) ---
     def show_new_match_dialog(self, instance):
         """Dialog to set match length."""
         content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
@@ -636,7 +763,7 @@ class GameScreen(BoxLayout):
         self.update_status("New Match Started!")
         self.dice_widget.set_dice([])
         self.update_buttons()
-        # If AI starts (randomize start player logic could be added here)
+        # If AI starts
         if self.board.game_mode in ['ai_vs_human', 'ai_vs_ai'] and self.board.engine.turn == -1:
             self.trigger_ai_auto()
 
@@ -689,10 +816,6 @@ class GameScreen(BoxLayout):
         self.btn_roll.disabled = not is_human or has_dice
         self.btn_takeback.disabled = not is_human or not has_moved
 
-        # Approve (End Turn) logic:
-        # - dice_exhausted: we had a roll this turn (turn_backup set) and dice_count is now 0
-        # - no_moves_left: dice exist but there are no legal moves for them
-        # We use turn_backup to ensure that approve is only possible after a roll (not at start of turn).
         had_roll_this_turn = self.board.turn_backup is not None
         dice_exhausted = had_roll_this_turn and dice_count == 0
         no_moves_left = has_dice and not has_moves and had_roll_this_turn
@@ -777,6 +900,69 @@ class GameScreen(BoxLayout):
         btn_drop.bind(on_press=drop)
         popup.open()
 
+    # --- AI trigger and orchestration ---
+    def trigger_ai_auto(self, continue_turn=False):
+        if self.match_over: return
+        
+        is_ai_turn = False
+        if self.board.game_mode == 'human_vs_ai' and self.board.engine.turn == -1: is_ai_turn = True
+        elif self.board.game_mode == 'ai_vs_human' and self.board.engine.turn == 1: is_ai_turn = True
+        elif self.board.game_mode == 'ai_vs_ai': is_ai_turn = True
+            
+        if is_ai_turn:
+            self.update_status("AI Thinking...")
+            self.update_buttons()
+            
+            # Hook for AI Double (Simple random check for demo if not continuing)
+            # In real code, check NN value here.
+            if not continue_turn and not self.board.crawford_active and self.board.cube_value < 4:
+                # Randomly offer double for testing UI
+                if random.random() < 0.03:
+                    # If human is on receiving end, open dialog; if both AI, randomly decide
+                    if self.board.game_mode == 'ai_vs_ai':
+                        # One AI offers, other AI decides randomly
+                        if random.random() < 0.5:
+                            self.perform_double_accept()
+                        else:
+                            # drop: opponent wins
+                            winner = self.board.engine.turn * -1
+                            self.handle_game_end(winner, 1, dropped=True)
+                            return
+                    else:
+                        self.offer_double_to_human()
+                        return
+
+            # Run AI for the current player
+            player = self.board.engine.turn
+            self.board.run_ai(lambda: self.on_ai_finished(), player=player)
+
+    def on_ai_finished(self):
+        self.board.is_ai_thinking = False
+        
+        winner, mult = self.board.engine.check_win()
+        if winner != 0:
+            self.handle_game_end(winner, mult)
+            return
+
+        # switch turn
+        self.board.engine.turn *= -1
+        self.board.engine.dice = []
+        self.dice_widget.set_dice([])
+        self.update_status()
+        self.board.redraw()
+        self.update_buttons()
+        
+        # Update log label to show last moves succinctly
+        if self.board.move_log:
+            last = self.board.move_log[-6:]
+            self.lbl_log.text = "Log: " + " | ".join(last[-3:])  # show recent few
+        
+        # If auto play in ai_vs_ai, schedule next
+        if self.board.game_mode == 'ai_vs_ai' and self.board.ai_auto_play:
+            # Let the scheduled Clock handle it. If not scheduled, schedule one immediate call depending on speed.
+            if not self.board.ai_auto_event:
+                Clock.schedule_once(lambda dt: self.trigger_ai_auto(), max(0.01, self.board.ai_speed))
+
     # --- END GAME LOGIC ---
     def handle_game_end(self, winner, multiplier, dropped=False):
         """
@@ -802,12 +988,19 @@ class GameScreen(BoxLayout):
         self.board.match_score[winner] += points
         self.update_score_display()
         
+        # Record to log
+        self.board.move_log.append(f"{winner_name} wins {points} ({type_str})")
+        print(self.board.move_log[-1])
+        
         # Check Match Win
         target = self.board.match_target
         if self.board.match_score[winner] >= target:
             self.match_over = True
             self.lbl_status.text = f"MATCH OVER! {winner_name} wins {self.board.match_score[winner]} to {self.board.match_score[winner*-1]}"
             self.update_buttons()
+            
+            # Stop auto-play if running
+            self.stop_auto_schedule()
             
             # Show Popup
             popup = Popup(title="Match Over", 
@@ -818,7 +1011,8 @@ class GameScreen(BoxLayout):
             # Prepare next game
             msg = f"{winner_name} wins {points} pt(s) ({type_str}). Starting next game..."
             self.update_status(msg)
-            Clock.schedule_once(lambda dt: self.start_next_game(), 3.0)
+            # short delay then start next game
+            Clock.schedule_once(lambda dt: self.start_next_game(), 1.2)
 
     def start_next_game(self):
         self.board.reset_game()
@@ -827,9 +1021,7 @@ class GameScreen(BoxLayout):
         self.update_buttons()
         self.update_status("New Game Started")
         
-        # Winner of previous game usually goes first, or roll for it. 
-        # For simplicity, let's alternate or keep engine default.
-        # Assuming engine.reset() sets turn to 1.
+        # If AI is to move, trigger
         if self.board.game_mode in ['ai_vs_human', 'ai_vs_ai'] and self.board.engine.turn == -1:
             self.trigger_ai_auto()
 
@@ -849,60 +1041,19 @@ class GameScreen(BoxLayout):
         self.update_status()
         self.update_buttons()
         self.board.redraw()
+        # After human ends turn, if it's an AI's turn, trigger it
         self.trigger_ai_auto()
 
-    def trigger_ai_auto(self, continue_turn=False):
-        if self.match_over: return
-        
-        is_ai_turn = False
-        if self.board.game_mode == 'human_vs_ai' and self.board.engine.turn == -1: is_ai_turn = True
-        elif self.board.game_mode == 'ai_vs_human' and self.board.engine.turn == 1: is_ai_turn = True
-        elif self.board.game_mode == 'ai_vs_ai': is_ai_turn = True
-            
-        if is_ai_turn:
-            self.update_status("AI Thinking...")
-            self.update_buttons()
-            
-            # Hook for AI Double (Simple random check for demo if not continuing)
-            # In real code, check NN value here.
-            if not continue_turn and not self.board.crawford_active and self.board.cube_value < 4:
-                # Randomly offer double for testing UI
-                if random.random() < 0.05: 
-                    self.offer_double_to_human()
-                    return
-
-            self.board.run_ai(self.on_ai_finished)
-
-    def on_ai_finished(self):
-        self.board.is_ai_thinking = False
-        
-        winner, mult = self.board.engine.check_win()
-        if winner != 0:
-            self.handle_game_end(winner, mult)
-            return
-
-        self.board.engine.turn *= -1
-        self.board.engine.dice = []
-        self.dice_widget.set_dice([])
-        self.update_status()
-        self.board.redraw()
-        self.update_buttons()
-        
-        if self.board.game_mode == 'ai_vs_ai':
-            Clock.schedule_once(lambda dt: self.trigger_ai_auto(), 1.0)
-
-    def update_status(self, text=None):
-        if text:
-            self.lbl_status.text = text
-            return
-        p = "White" if self.board.engine.turn == 1 else "Black"
-        self.lbl_status.text = f"{p}'s Turn"
-
+    # --- Model loading UI adapted to allow loading for White, Black or Both ---
     def show_load_dialog(self, instance):
         content = BoxLayout(orientation='vertical')
         path = os.getcwd()
         file_chooser = FileChooserListView(path=path, filters=['*.pt', '*.pth'])
         content.add_widget(file_chooser)
+
+        # Choose player to load model for
+        player_choice = Spinner(text='White', values=('White','Black','Both'), size_hint_y=None, height=dp(40))
+        content.add_widget(player_choice)
         
         btns = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
         btn_cancel = Button(text="Cancel")
@@ -917,20 +1068,36 @@ class GameScreen(BoxLayout):
         def load_selection(x):
             if file_chooser.selection:
                 f = file_chooser.selection[0]
+                target = player_choice.text
                 self.update_status("Loading Model...")
-                self.board.load_model_thread(f, self.on_model_loaded)
+                # If both, load twice (or the same file for both)
+                if target == 'White':
+                    self.board.load_model_thread(f, 1, self.on_model_loaded)
+                elif target == 'Black':
+                    self.board.load_model_thread(f, -1, self.on_model_loaded)
+                else:
+                    self.board.load_model_thread(f, 1, self.on_model_loaded)
+                    self.board.load_model_thread(f, -1, self.on_model_loaded)
                 popup.dismiss()
         
         btn_load.bind(on_press=load_selection)
         popup.open()
 
-    def on_model_loaded(self, success, msg):
+    def on_model_loaded(self, success, msg, player):
         if success:
             filename = os.path.basename(msg)
-            self.update_status(f"Loaded: {filename}")
+            pname = "White" if player == 1 else "Black"
+            self.update_status(f"Loaded {filename} for {pname}")
         else:
             self.update_status("Load Failed")
             print(msg)
+
+    def update_status(self, text=None):
+        if text:
+            self.lbl_status.text = text
+            return
+        p = "White" if self.board.engine.turn == 1 else "Black"
+        self.lbl_status.text = f"{p}'s Turn"
 
 
 class BackgammonApp(App):
