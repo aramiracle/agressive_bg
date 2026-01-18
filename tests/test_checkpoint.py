@@ -54,7 +54,7 @@ def modify_checkpoint():
     print("loss:", ckpt.get("loss"))
 
     # Modify values
-    ckpt["step"] = 10000
+    ckpt["step"] = 400000
     ckpt["elo"] = 1000
     ckpt["loss"] = 2.0
 
@@ -72,4 +72,5 @@ def modify_checkpoint():
 
 if __name__ == "__main__":
     test_checkpoint_structure()
+    modify_checkpoint()
 

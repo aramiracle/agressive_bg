@@ -46,8 +46,8 @@ class Config:
     CNN_KERNEL = 3
 
     # MCTS
-    NUM_SIMULATIONS = 64
-    MCTS_BATCH = 8
+    NUM_SIMULATIONS = 128
+    MCTS_BATCH = 16
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
@@ -67,7 +67,7 @@ class Config:
     LR = 5e-4
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-5
-    TRAIN_STEPS = 300000
+    TRAIN_STEPS = 1000000
     LOSS_AVG_WINDOW = 100
     MAX_GAME_MOVES = 2000
 
