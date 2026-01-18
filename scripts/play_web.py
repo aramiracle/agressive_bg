@@ -1,52 +1,19 @@
-"""
-Backgammon Neural WebSocket Server
----------------------------------
-Bridges HTML client <-> bg_engine + MCTS + PyTorch model
+#!/usr/bin/env python3
+"""Entry point for the WebSocket server (HTML UI)."""
 
-Protocol (JSON):
-Client -> Server:
-  { "type": "hello" }
-  { "type": "new_game" }
-  { "type": "roll" }
-  { "type": "double" }
-  { "type": "end_turn" }
-  { "type": "move", "from": int|"bar", "to": int|"off" }
-  { "type": "set_mode", "mode": "human_vs_ai"|"ai_vs_human"|"ai_vs_ai" }
-  { "type": "load_model", "filename": str, "data": base64 }
+import sys
+import os
 
-Server -> Client:
-  {
-    "type": "state",
-    "payload": {
-      "board": [24 ints],
-      "bar": [white, black],
-      "off": [white, black],
-      "turn": 1 or -1,
-      "dice": [d1, d2] or [],
-      "cube_value": int,
-      "cube_owner": 0/1/-1,
-      "legal_moves": [[from, to], ...],
-      "status": "string",
-      "game_over": bool,
-      "winner": 0/1/-1
-    }
-  }
-  { "type": "model_loaded", "filename": str }
-  { "type": "model_error", "error": str }
-"""
+# Add src to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
 
 import asyncio
 import base64
 import io
 import json
-import os
-import sys
 import tempfile
 import torch
 import websockets
-
-# Add src directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
 from backgammon.engine import BackgammonGame
 from backgammon.mcts import MCTS
@@ -60,7 +27,8 @@ from backgammon.config import Config
 HOST = "0.0.0.0"
 PORT = 8765
 DEVICE = Config.DEVICE
-MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints", "best_model.pt")
+CHECKPOINTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints")
+MODEL_PATH = os.path.join(CHECKPOINTS_DIR, "best_model.pt")
 
 
 # =========================
@@ -594,3 +562,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
