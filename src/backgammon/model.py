@@ -31,21 +31,22 @@ class BackgammonTransformer(nn.Module):
         - v: [B, 1] value estimate in [-1, 1]
         - cube: [B, 2] cube decision logits
     """
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
-        d = Config.D_MODEL
+        cfg = config if config is not None else Config
+        d = cfg.D_MODEL
         
         # Input embeddings
-        self.embedding = nn.Embedding(Config.EMBED_VOCAB_SIZE, d)
-        self.ctx_proj = nn.Linear(Config.CONTEXT_SIZE, d)
-        self.pos_encoder = LearnedPositionalEncoding(d, Config.MAX_SEQ_LEN)
+        self.embedding = nn.Embedding(cfg.EMBED_VOCAB_SIZE, d)
+        self.ctx_proj = nn.Linear(cfg.CONTEXT_SIZE, d)
+        self.pos_encoder = LearnedPositionalEncoding(d, cfg.MAX_SEQ_LEN)
         
         # Transformer encoder with Pre-LN (norm_first=True)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d,
-            nhead=Config.N_HEAD,
-            dim_feedforward=Config.DIM_FEEDFORWARD,
-            dropout=Config.DROPOUT,
+            nhead=cfg.N_HEAD,
+            dim_feedforward=cfg.DIM_FEEDFORWARD,
+            dropout=cfg.DROPOUT,
             activation='gelu',
             batch_first=True,
             norm_first=True
@@ -53,27 +54,27 @@ class BackgammonTransformer(nn.Module):
         
         self.transformer = nn.TransformerEncoder(
             encoder_layer, 
-            num_layers=Config.N_LAYERS,
+            num_layers=cfg.N_LAYERS,
             enable_nested_tensor=False
         )
         
         self.out_norm = nn.LayerNorm(d)
         
         # Output heads
-        self.policy_from = nn.Linear(d, Config.NUM_ACTIONS)
-        self.policy_to = nn.Linear(d, Config.NUM_ACTIONS)
+        self.policy_from = nn.Linear(d, cfg.NUM_ACTIONS)
+        self.policy_to = nn.Linear(d, cfg.NUM_ACTIONS)
         
         self.value_head = nn.Sequential(
-            nn.Linear(d, Config.VALUE_HIDDEN),
+            nn.Linear(d, cfg.VALUE_HIDDEN),
             nn.GELU(),
-            nn.Linear(Config.VALUE_HIDDEN, 1),
+            nn.Linear(cfg.VALUE_HIDDEN, 1),
             nn.Tanh()
         )
         
         self.cube_head = nn.Sequential(
-            nn.Linear(d, Config.VALUE_HIDDEN),
+            nn.Linear(d, cfg.VALUE_HIDDEN),
             nn.GELU(),
-            nn.Linear(Config.VALUE_HIDDEN, 2)
+            nn.Linear(cfg.VALUE_HIDDEN, 2)
         )
         
         self._init_weights()
@@ -158,41 +159,42 @@ class BackgammonCNN(nn.Module):
     
     Uses 1D convolutions treating board as a sequence with channel dimension.
     """
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
-        d = Config.D_MODEL
+        cfg = config if config is not None else Config
+        d = cfg.D_MODEL
         
         # Input embeddings
-        self.embedding = nn.Embedding(Config.EMBED_VOCAB_SIZE, d)
-        self.ctx_proj = nn.Linear(Config.CONTEXT_SIZE, d)
+        self.embedding = nn.Embedding(cfg.EMBED_VOCAB_SIZE, d)
+        self.ctx_proj = nn.Linear(cfg.CONTEXT_SIZE, d)
         
         # Initial projection
         self.input_norm = nn.BatchNorm1d(d)
         
         # 1D ResNet Backbone
         self.blocks = nn.ModuleList([
-            ResidualBlock1D(d, Config.CNN_KERNEL, Config.DROPOUT)
-            for _ in range(Config.CNN_BLOCKS)
+            ResidualBlock1D(d, cfg.CNN_KERNEL, cfg.DROPOUT)
+            for _ in range(cfg.CNN_BLOCKS)
         ])
         
         # Global pooling
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         
         # Output heads
-        self.policy_from = nn.Linear(d, Config.NUM_ACTIONS)
-        self.policy_to = nn.Linear(d, Config.NUM_ACTIONS)
+        self.policy_from = nn.Linear(d, cfg.NUM_ACTIONS)
+        self.policy_to = nn.Linear(d, cfg.NUM_ACTIONS)
         
         self.value_head = nn.Sequential(
-            nn.Linear(d, Config.VALUE_HIDDEN),
+            nn.Linear(d, cfg.VALUE_HIDDEN),
             nn.GELU(),
-            nn.Linear(Config.VALUE_HIDDEN, 1),
+            nn.Linear(cfg.VALUE_HIDDEN, 1),
             nn.Tanh()
         )
         
         self.cube_head = nn.Sequential(
-            nn.Linear(d, Config.VALUE_HIDDEN),
+            nn.Linear(d, cfg.VALUE_HIDDEN),
             nn.GELU(),
-            nn.Linear(Config.VALUE_HIDDEN, 2)
+            nn.Linear(cfg.VALUE_HIDDEN, 2)
         )
         
         self._init_weights()

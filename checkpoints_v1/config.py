@@ -76,3 +76,5 @@ class Config:
 
     # Checkpoints
     CHECKPOINT_DIR = "checkpoints"
+    BASELINE_DIR = "checkpoints_v1"
+    BASELINE_MODEL_NAME = "best_model.pt"

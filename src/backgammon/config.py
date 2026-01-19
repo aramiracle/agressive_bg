@@ -76,3 +76,7 @@ class Config:
 
     # Checkpoints
     CHECKPOINT_DIR = "checkpoints"
+    BASELINE_DIR = "checkpoints_v1"
+    BASELINE_MODEL_NAME = "best_model.pt"
+    BASELINE_SWITCH_ON_SURPASS = True
+    BASELINE_SELF_PLAY_RATIO = 0.5
