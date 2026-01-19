@@ -35,8 +35,8 @@ env/
 
 # Checkpoints and models
 # checkpoints/
-*.pt
-*.pth
+# *.pt
+# *.pth
 
 # Logs
 *.log

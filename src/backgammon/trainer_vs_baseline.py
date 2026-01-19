@@ -1,20 +1,24 @@
 """Train new model vs older baseline version."""
 
-import sys
 import os
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import random
-from collections import deque
 from tqdm import tqdm
 
 from src.backgammon.config import Config
 from src.backgammon.engine import BackgammonGame
 from src.backgammon.model import get_model
 from src.backgammon.mcts import MCTS
-from src.backgammon.checkpoint import setup_checkpoint_dir, save_checkpoint, load_checkpoint, get_model_state_dict, load_model_state_dict
+from src.backgammon.checkpoint import (
+    setup_checkpoint_dir, save_checkpoint, load_checkpoint,
+    get_model_state_dict, load_model_state_dict
+)
 from src.backgammon.elo import evaluate_vs_opponent, update_elo
-from src.backgammon.trainer import play_one_game, train_batch
+from src.backgammon.utils import move_to_indices
+from src.backgammon.replay_buffer import get_replay_buffer
+from src.backgammon.trainer import play_one_game, finalize_history, get_cube_decision, train_batch
 
 
 def load_model_with_config(config_path, model_path, device):
@@ -22,13 +26,11 @@ def load_model_with_config(config_path, model_path, device):
     import importlib.util
     from src.backgammon.model import BackgammonTransformer, BackgammonCNN
     
-    # Load config module
     spec = importlib.util.spec_from_file_location("model_config", config_path)
     config_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(config_module)
     ModelConfig = config_module.Config
     
-    # Create model with its own config
     if ModelConfig.MODEL_TYPE == "transformer":
         model = BackgammonTransformer(config=ModelConfig).to(device)
     elif ModelConfig.MODEL_TYPE == "cnn":
@@ -36,7 +38,6 @@ def load_model_with_config(config_path, model_path, device):
     else:
         raise ValueError(f"Unknown MODEL_TYPE: {ModelConfig.MODEL_TYPE}")
     
-    # Load checkpoint
     cp = load_checkpoint(model_path, model, None, device)
     elo = cp['elo'] if cp else ModelConfig.INITIAL_ELO
     model.eval()
@@ -44,71 +45,119 @@ def load_model_with_config(config_path, model_path, device):
     return model, elo
 
 
-def play_vs_baseline(game, current_model, baseline_model, device):
-    """Play game: current vs baseline. Returns (training_data, did_current_win)."""
+def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
+    """
+    Play game: current vs baseline with full cubing support.
+    Returns (training_data, did_current_win).
+    Only saves training data for current model's decisions.
+    """
     game.reset()
     current_is_p1 = random.choice([True, False])
     
-    mcts_current = MCTS(current_model, device)
+    # Reset MCTS trees
+    mcts_current.reset()
+    mcts_baseline = MCTS(baseline_model, device)
     
-    # Baseline model always in eval mode with no_grad
-    baseline_model.eval()
-    with torch.no_grad():
-        mcts_baseline = MCTS(baseline_model, device)
-        history = []
+    history = []
+    
+    for _ in range(Config.MAX_GAME_MOVES):
+        winner, _ = game.check_win()
+        if winner != 0:
+            break
         
-        for _ in range(Config.MAX_GAME_MOVES):
-            winner, _ = game.check_win()
-            if winner != 0:
-                break
+        is_current_turn = (game.turn == 1) == current_is_p1
+        active_model = current_model if is_current_turn else baseline_model
+        active_mcts = mcts_current if is_current_turn else mcts_baseline
+        
+        # --- CUBING PHASE ---
+        if game.can_double() and game.cube < Config.MATCH_TARGET:
+            double_choice = get_cube_decision(active_model, game, device)
             
-            is_current_turn = (game.turn == 1) == current_is_p1
-            mcts = mcts_current if is_current_turn else mcts_baseline
-            
-            # Simplified: no cubing in vs baseline games
-            game.roll_dice()
-            
-            while game.dice:
-                legal = game.get_legal_moves()
-                if not legal:
-                    game.dice = []
-                    break
+            if double_choice == 1:
+                # Opponent decides whether to take
+                game.switch_turn()
+                opponent_model = baseline_model if is_current_turn else current_model
+                take_choice = get_cube_decision(opponent_model, game, device)
+                game.switch_turn()
                 
-                root = mcts.search(game, 0, 0)
-                
-                if root.children:
-                    actions = list(root.children.keys())
-                    visits = torch.tensor([c.visits for c in root.children.values()], dtype=torch.float)
-                    if visits.sum() > 0:
-                        chosen_action = actions[torch.multinomial(visits / visits.sum(), 1).item()]
-                    else:
-                        chosen_action = actions[0]
-                else:
-                    chosen_action = legal[0]
-                
-                # Only save current model's moves
+                # Save current model's doubling decision
                 if is_current_turn:
                     board_t, ctx_t = game.get_vector(0, 0, device='cpu', canonical=True)
-                    from src.backgammon.utils import move_to_indices
-                    canon_act = game.real_action_to_canonical(chosen_action)
-                    s_idx, e_idx = move_to_indices(canon_act[0], canon_act[1])
-                    history.append((board_t, ctx_t, (s_idx, e_idx), game.turn, False))
+                    history.append((board_t, ctx_t, 1, game.turn, True))
                 
-                game.step_atomic(chosen_action)
-                if game.check_win()[0] != 0:
-                    break
-            
-            if game.check_win()[0] == 0:
-                game.switch_turn()
+                if take_choice == 1:
+                    game.apply_double()
+                else:
+                    # Opponent refused - current player wins cube value
+                    final_winner, points = game.handle_cube_refusal()
+                    current_won = (final_winner == 1) == current_is_p1
+                    # Adjust winner perspective for history
+                    hist_winner = game.turn if current_won else -game.turn
+                    return finalize_history(history, hist_winner, points), current_won
         
-        winner, mult = game.check_win()
-        total_points = mult * game.cube
-        current_won = (winner == 1) == current_is_p1
+        # --- MOVEMENT PHASE ---
+        game.roll_dice()
+        
+        while game.dice:
+            legal = game.get_legal_moves()
+            if not legal:
+                game.dice = []
+                break
+            
+            root = active_mcts.search(game, 0, 0)
+            
+            if root.children:
+                actions = list(root.children.keys())
+                visits = torch.tensor([c.visits for c in root.children.values()], dtype=torch.float)
+                if visits.sum() > 0:
+                    chosen_action = actions[torch.multinomial(visits / visits.sum(), 1).item()]
+                else:
+                    chosen_action = actions[0]
+            else:
+                chosen_action = random.choice(legal)
+            
+            # Only save current model's moves for training
+            if is_current_turn:
+                board_t, ctx_t = game.get_vector(0, 0, device='cpu', canonical=True)
+                canon_act = game.real_action_to_canonical(chosen_action)
+                s_idx, e_idx = move_to_indices(canon_act[0], canon_act[1])
+                history.append((board_t, ctx_t, (s_idx, e_idx), game.turn, False))
+            
+            game.step_atomic(chosen_action)
+            
+            # Advance tree for active player
+            active_mcts.advance_to_child(chosen_action)
+            
+            if game.check_win()[0] != 0:
+                break
+        
+        if game.check_win()[0] == 0:
+            game.switch_turn()
+            # Reset trees on turn switch
+            mcts_current.reset()
+            mcts_baseline.reset()
     
-    # Create training data
+    # --- FINALIZATION ---
+    winner, mult = game.check_win()
+    total_points = mult * game.cube
+    current_won = (winner == 1) == current_is_p1
+    
+    # History is from current model's perspective
+    # If current won, their moves get positive reward
+    hist_winner = 1 if current_is_p1 else -1
+    if not current_won:
+        hist_winner = -hist_winner
+    
+    # Remap history turns to consistent winner reference
     data = []
     for board, ctx, act, turn, is_cube in history:
-        reward = (float(total_points) + float(Config.MATCH_TARGET)) if turn == winner else (-float(total_points) - Config.MATCH_TARGET)
+        # turn was saved as game.turn when current model played
+        # current model always played when is_current_turn was True
+        # so turn corresponds to current_is_p1's player number
+        if current_won:
+            reward = float(total_points) + float(Config.MATCH_TARGET)
+        else:
+            reward = -float(total_points) - float(Config.MATCH_TARGET)
         data.append((board, ctx, act, reward, is_cube))
     
     return data, current_won
@@ -118,13 +167,11 @@ def train():
     checkpoint_dir, best_path, latest_path = setup_checkpoint_dir()
     device = torch.device(Config.DEVICE)
     
-    # Current model (new config)
     model = get_model().to(device)
     best_model = get_model().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
-    # Load current model
     cp_latest = load_checkpoint(latest_path, model, optimizer, device)
     train_step = cp_latest['step'] if cp_latest else 0
     current_elo = cp_latest['elo'] if cp_latest else Config.INITIAL_ELO
@@ -140,23 +187,24 @@ def train():
     baseline_path = os.path.join(os.path.dirname(checkpoint_dir), Config.BASELINE_DIR, Config.BASELINE_MODEL_NAME)
     baseline_config_path = os.path.join(os.path.dirname(checkpoint_dir), Config.BASELINE_DIR, 'config.py')
     
+    baseline_model = None
+    baseline_elo = Config.INITIAL_ELO
+    use_baseline = False
+    
     if os.path.exists(baseline_path) and os.path.exists(baseline_config_path):
         baseline_model, baseline_elo = load_model_with_config(baseline_config_path, baseline_path, device)
         print(f"✅ Baseline loaded: {baseline_path} (ELO: {baseline_elo:.0f})")
         use_baseline = True
     else:
         print(f"⚠️  No baseline found at {baseline_path}, using self-play only")
-        use_baseline = False
-        baseline_elo = Config.INITIAL_ELO
     
-    replay_buffer = deque(maxlen=Config.BUFFER_SIZE)
+    # Use prioritized replay buffer
+    use_prioritized = getattr(Config, 'USE_PRIORITIZED_REPLAY', True)
+    replay_buffer = get_replay_buffer(Config.BUFFER_SIZE, prioritized=use_prioritized)
+    
     game = BackgammonGame()
     
-    # Adaptive training: use config ratio until surpassing, then switch to 100% self-play
-    baseline_wins = 0
-    baseline_games = 0
-    
-    if Config.BASELINE_SWITCH_ON_SURPASS:
+    if getattr(Config, 'BASELINE_SWITCH_ON_SURPASS', True):
         phase = "vs_baseline" if use_baseline and current_elo < baseline_elo else "self_play"
     else:
         phase = "vs_baseline" if use_baseline else "self_play"
@@ -164,7 +212,7 @@ def train():
     print(f"\n🎮 Training: Current ELO={current_elo:.0f}, Best ELO={best_elo:.0f}")
     if use_baseline:
         print(f"   Baseline ELO={baseline_elo:.0f}")
-        ratio_pct = Config.BASELINE_SELF_PLAY_RATIO * 100
+        ratio_pct = getattr(Config, 'BASELINE_SELF_PLAY_RATIO', 0.5) * 100
         if phase == "vs_baseline":
             print(f"   Phase: vs_baseline ({ratio_pct:.0f}% self-play, {100-ratio_pct:.0f}% vs baseline)\n")
         else:
@@ -179,11 +227,11 @@ def train():
         model.eval()
         mcts = MCTS(model, device)
         
-        # Adaptive ratio based on phase
+        baseline_ratio = getattr(Config, 'BASELINE_SELF_PLAY_RATIO', 0.5)
         if phase == "vs_baseline":
-            num_self = int(Config.GAMES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
+            num_self = int(Config.GAMES_PER_ITERATION * baseline_ratio)
             num_baseline = Config.GAMES_PER_ITERATION - num_self
-        else:  # self_play phase
+        else:
             num_self = Config.GAMES_PER_ITERATION
             num_baseline = 0
         
@@ -197,11 +245,8 @@ def train():
         # Vs baseline games
         if use_baseline and num_baseline > 0:
             for _ in range(num_baseline):
-                data, won = play_vs_baseline(game, model, baseline_model, device)
+                data, won = play_vs_baseline(game, model, baseline_model, mcts, device)
                 replay_buffer.extend(data)
-                baseline_games += 1
-                if won:
-                    baseline_wins += 1
         
         if len(replay_buffer) < Config.BATCH_SIZE:
             print(f"Buffer warming up: {len(replay_buffer)}/{Config.BATCH_SIZE}")
@@ -233,12 +278,10 @@ def train():
                 model.eval()
                 best_model.eval()
                 
-                # Split evaluation games based on training phase
                 if phase == "vs_baseline":
-                    num_eval_self = int(Config.ELO_EVAL_GAMES * Config.BASELINE_SELF_PLAY_RATIO)
+                    num_eval_self = int(Config.ELO_EVAL_GAMES * baseline_ratio)
                     num_eval_baseline = Config.ELO_EVAL_GAMES - num_eval_self
                 else:
-                    # After crossing baseline: 100% self-play
                     num_eval_self = Config.ELO_EVAL_GAMES
                     num_eval_baseline = 0
                 
@@ -246,7 +289,6 @@ def train():
                 games_total = 0
                 
                 with torch.no_grad():
-                    # Evaluate vs best model (self-play)
                     if num_eval_self > 0:
                         print(f"  Evaluating vs Best Model ({num_eval_self} games)...")
                         wins_self, total_self = evaluate_vs_opponent(
@@ -259,8 +301,7 @@ def train():
                         win_rate_self = (wins_self/total_self)*100 if total_self > 0 else 0
                         print(f"  → vs Best: {wins_self}/{total_self} wins ({win_rate_self:.1f}%)")
                     
-                    # Evaluate vs baseline
-                    if num_eval_baseline > 0:
+                    if num_eval_baseline > 0 and baseline_model is not None:
                         print(f"  Evaluating vs Baseline ({num_eval_baseline} games)...")
                         wins_baseline, total_baseline = evaluate_vs_opponent(
                             game, model, baseline_model,
@@ -274,14 +315,11 @@ def train():
                 
                 old_elo = current_elo
                 
-                # Opponent ELO calculation depends on training phase
                 if phase == "vs_baseline":
-                    # Playing vs both best model and baseline: weighted mean
-                    weight_best = Config.BASELINE_SELF_PLAY_RATIO
-                    weight_baseline = 1 - Config.BASELINE_SELF_PLAY_RATIO
+                    weight_best = baseline_ratio
+                    weight_baseline = 1 - baseline_ratio
                     opponent_elo = (best_elo * weight_best) + (baseline_elo * weight_baseline)
                 else:
-                    # After crossing: Pure self-play, opponent is best model
                     opponent_elo = best_elo
                 
                 new_elo = update_elo(current_elo, opponent_elo, wins_total, games_total)
@@ -302,15 +340,9 @@ def train():
                 current_elo = new_elo
                 save_checkpoint(model, optimizer, train_step, current_elo, loss, latest_path)
                 
-                # Phase transition: switch to self-play when surpassing baseline (if enabled)
-                if Config.BASELINE_SWITCH_ON_SURPASS and use_baseline and phase == "vs_baseline" and current_elo >= baseline_elo:
+                if getattr(Config, 'BASELINE_SWITCH_ON_SURPASS', True) and use_baseline and phase == "vs_baseline" and current_elo >= baseline_elo:
                     phase = "self_play"
                     print(f"🎯 Surpassed baseline! Switching to 100% self-play (ELO {current_elo:.0f} >= {baseline_elo:.0f})")
-                
-                # Reset baseline stats
-                if use_baseline:
-                    baseline_wins = 0
-                    baseline_games = 0
                 
                 model.train()
         
@@ -323,4 +355,3 @@ def train():
 
 if __name__ == "__main__":
     train()
-
