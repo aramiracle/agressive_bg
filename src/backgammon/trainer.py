@@ -274,10 +274,13 @@ def train():
 
             # 3. EVALUATION PHASE
             if train_step % Config.ELO_EVAL_INTERVAL == 0:
-                print(f"\n--- Starting ELO Evaluation at Step {train_step} ---")
+                print(f"\n{'='*60}")
+                print(f"🎯 ELO Evaluation at Step {train_step}")
+                print(f"{'='*60}")
                 model.eval()
                 best_model.eval()
                 with torch.no_grad():
+                    print(f"  Playing {Config.ELO_EVAL_GAMES} games vs Best Model...")
                     wins, total = evaluate_vs_opponent(
                         game, model, best_model,
                         Config.ELO_EVAL_GAMES, device,
@@ -287,8 +290,13 @@ def train():
                 old_elo = current_elo
                 new_elo = update_elo(current_elo, best_elo, wins, total)
                 
-                status_msg = "NEW BEST MODEL" if new_elo > best_elo else "No improvement"
-                print(f"ELO Result: {old_elo:.0f} -> {new_elo:.0f} | Win Rate: {(wins/total)*100:.1f}% | {status_msg}")
+                print(f"\n📊 Evaluation Summary:")
+                print(f"   Wins: {wins}/{total} ({(wins/total)*100:.1f}%)")
+                print(f"   ELO: {old_elo:.0f} → {new_elo:.0f} (Δ{new_elo-old_elo:+.0f})")
+                
+                status_msg = "🏆 NEW BEST MODEL" if new_elo > best_elo else "No improvement"
+                print(f"   {status_msg}")
+                print(f"{'='*60}\n")
 
                 if new_elo > best_elo:
                     best_elo = new_elo
