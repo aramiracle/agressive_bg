@@ -1,7 +1,7 @@
 import torch
 import math
 from collections import deque
-from .config import Config
+from src.backgammon.config import Config
 
 
 class Node:

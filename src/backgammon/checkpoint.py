@@ -2,7 +2,7 @@
 
 import os
 import torch
-from .config import Config
+from src.backgammon.config import Config
 
 
 def setup_checkpoint_dir():

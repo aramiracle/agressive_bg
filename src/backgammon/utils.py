@@ -1,6 +1,6 @@
 """Utility functions for backgammon AI."""
 
-from .config import Config
+from src.backgammon.config import Config
 
 
 def move_to_indices(start, end):

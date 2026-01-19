@@ -10,16 +10,16 @@ import random
 from collections import deque
 from tqdm import tqdm
 
-from .config import Config
-from .engine import BackgammonGame
-from .model import get_model
-from .mcts import MCTS
-from .checkpoint import (
+from src.backgammon.config import Config
+from src.backgammon.engine import BackgammonGame
+from src.backgammon.model import get_model
+from src.backgammon.mcts import MCTS
+from src.backgammon.checkpoint import (
     setup_checkpoint_dir, save_checkpoint, load_checkpoint,
     get_model_state_dict, load_model_state_dict
 )
-from .elo import evaluate_vs_opponent, update_elo
-from .utils import move_to_indices
+from src.backgammon.elo import evaluate_vs_opponent, update_elo
+from src.backgammon.utils import move_to_indices
 
 def get_cube_decision(model, game, device):
     """Queries the model's cube head. returns 1 for Yes (Double/Take), 0 for No."""

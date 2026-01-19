@@ -20,10 +20,10 @@ from kivy.metrics import dp
 
 import torch
 
-from .engine import BackgammonGame
-from .model import get_model
-from .mcts import MCTS
-from .config import Config
+from src.backgammon.engine import BackgammonGame
+from src.backgammon.model import get_model
+from src.backgammon.mcts import MCTS
+from src.backgammon.config import Config
 
 
 # --- VISUAL CONSTANTS (Matching HTML UI realistic theme) ---

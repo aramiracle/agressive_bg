@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from .config import Config
+from src.backgammon.config import Config
 
 
 class LearnedPositionalEncoding(nn.Module):

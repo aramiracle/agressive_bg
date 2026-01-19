@@ -1,9 +1,8 @@
 """ELO rating system for model evaluation."""
 
-import math
 from tqdm import tqdm
-from .config import Config
-from .mcts import MCTS
+from src.backgammon.config import Config
+from src.backgammon.mcts import MCTS
 
 
 def calculate_expected_score(player_elo, opponent_elo):

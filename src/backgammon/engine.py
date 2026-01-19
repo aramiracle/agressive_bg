@@ -1,6 +1,6 @@
 import torch
 import random
-from .config import Config
+from src.backgammon.config import Config
 
 
 class BackgammonGame:
