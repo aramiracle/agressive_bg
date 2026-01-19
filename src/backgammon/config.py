@@ -47,27 +47,27 @@ class Config:
 
     # MCTS
     NUM_SIMULATIONS = 256
-    MCTS_BATCH = 64
+    MCTS_BATCH = 32
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
 
     # ELO
     INITIAL_ELO = 200
-    ELO_K = 4
+    ELO_K = 8
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 2500
-    ELO_EVAL_GAMES = 30
+    ELO_EVAL_GAMES = 40
 
     # Training
-    GAMES_PER_ITERATION = 10
-    STEPS_PER_ITERATION = 500
+    GAMES_PER_ITERATION = 6
+    STEPS_PER_ITERATION = 250
     BATCH_SIZE = 1024 if torch.cuda.is_available() else 128
     BUFFER_SIZE = 262144
-    LR = 5e-4
+    LR = 1e-4
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-5
-    TRAIN_STEPS = 10000
+    TRAIN_STEPS = 1000000
     LOSS_AVG_WINDOW = 100
     MAX_GAME_MOVES = 2000
 

@@ -175,10 +175,10 @@ def train():
     else:
         print(f"   Phase: self_play only\n")
     
-    pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Training")
+    pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Overall Training")
     
     while train_step < Config.TRAIN_STEPS:
-        # Data collection
+        # 1. DATA COLLECTION PHASE
         model.eval()
         mcts = MCTS(model, device)
         
@@ -189,6 +189,8 @@ def train():
         else:  # self_play phase
             num_self = Config.GAMES_PER_ITERATION
             num_baseline = 0
+        
+        print(f"\n[Step {train_step}] Collecting {num_self} self-play + {num_baseline} vs baseline games...")
         
         # Self-play games
         for _ in range(num_self):
@@ -205,23 +207,25 @@ def train():
                     baseline_wins += 1
         
         if len(replay_buffer) < Config.BATCH_SIZE:
+            print(f"Buffer warming up: {len(replay_buffer)}/{Config.BATCH_SIZE}")
             continue
         
-        # Training
+        # 2. OPTIMIZATION PHASE
         model.train()
-        total_loss = 0
+        total_iter_loss = 0
         
-        for _ in range(Config.STEPS_PER_ITERATION):
+        for i in range(Config.STEPS_PER_ITERATION):
             loss, gnorm = train_batch(model, optimizer, replay_buffer, Config.BATCH_SIZE, device, scaler)
-            total_loss += loss
+            total_iter_loss += loss
             train_step += 1
             pbar.update(1)
             
+            buf_fill = (len(replay_buffer) / Config.BUFFER_SIZE) * 100
             postfix = {
                 'loss': f'{loss:.4f}',
+                'gnorm': f'{gnorm:.2f}',
                 'elo': f'{current_elo:.0f}',
-                'phase': phase[:4],  # Show "vs_b" or "self"
-                'buf': f'{len(replay_buffer)/Config.BUFFER_SIZE*100:.0f}%'
+                'buffer': f'{buf_fill:.1f}%'
             }
             
             if use_baseline and baseline_games > 0:
@@ -229,25 +233,40 @@ def train():
             
             pbar.set_postfix(postfix)
             
-            # Evaluate vs best
+            # 3. EVALUATION PHASE
             if train_step % Config.ELO_EVAL_INTERVAL == 0:
+                print(f"\n--- Starting ELO Evaluation at Step {train_step} ---")
                 model.eval()
                 best_model.eval()
                 
                 with torch.no_grad():
-                    wins, total = evaluate_vs_opponent(game, model, best_model, Config.ELO_EVAL_GAMES, device, show_progress=True)
+                    wins, total = evaluate_vs_opponent(
+                        game, model, best_model,
+                        Config.ELO_EVAL_GAMES, device,
+                        show_progress=True
+                    )
                 
-                new_elo = update_elo(current_elo, best_elo, wins, total)
+                old_elo = current_elo
                 
-                print(f"\nStep {train_step}: ELO {current_elo:.0f}->{new_elo:.0f} | WR: {wins/total*100:.0f}%", end='')
+                # Opponent ELO calculation depends on training phase
+                if use_baseline and phase == "vs_baseline":
+                    # Training vs both best model and baseline: weighted mean
+                    weight_best = Config.BASELINE_SELF_PLAY_RATIO
+                    weight_baseline = 1 - Config.BASELINE_SELF_PLAY_RATIO
+                    opponent_elo = (best_elo * weight_best) + (baseline_elo * weight_baseline)
+                else:
+                    # Pure self-play: opponent is best model
+                    opponent_elo = best_elo
+                
+                new_elo = update_elo(current_elo, opponent_elo, wins, total)
+                
+                status_msg = "NEW BEST MODEL" if new_elo > best_elo else "No improvement"
+                print(f"ELO Result: {old_elo:.0f} -> {new_elo:.0f} | Win Rate: {(wins/total)*100:.1f}% | {status_msg}")
                 
                 if new_elo > best_elo:
-                    print(" 🏆 NEW BEST")
                     best_elo = new_elo
                     load_model_state_dict(best_model, get_model_state_dict(model))
                     save_checkpoint(model, optimizer, train_step, best_elo, loss, best_path)
-                else:
-                    print()
                 
                 current_elo = new_elo
                 save_checkpoint(model, optimizer, train_step, current_elo, loss, latest_path)
@@ -263,6 +282,9 @@ def train():
                     baseline_games = 0
                 
                 model.train()
+        
+        avg_loss = total_iter_loss / Config.STEPS_PER_ITERATION
+        print(f"Iteration Complete. Avg Loss: {avg_loss:.4f} | Samples in Buffer: {len(replay_buffer)}")
     
     pbar.close()
     print("\n✅ Training complete!")
