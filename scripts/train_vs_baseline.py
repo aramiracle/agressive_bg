@@ -239,18 +239,43 @@ def train():
                 model.eval()
                 best_model.eval()
                 
+                # Split evaluation games based on training phase
+                if use_baseline and phase == "vs_baseline":
+                    num_eval_self = int(Config.ELO_EVAL_GAMES * Config.BASELINE_SELF_PLAY_RATIO)
+                    num_eval_baseline = Config.ELO_EVAL_GAMES - num_eval_self
+                else:
+                    num_eval_self = Config.ELO_EVAL_GAMES
+                    num_eval_baseline = 0
+                
+                wins_total = 0
+                games_total = 0
+                
                 with torch.no_grad():
-                    wins, total = evaluate_vs_opponent(
-                        game, model, best_model,
-                        Config.ELO_EVAL_GAMES, device,
-                        show_progress=True
-                    )
+                    # Evaluate vs best model (self-play)
+                    if num_eval_self > 0:
+                        wins_self, total_self = evaluate_vs_opponent(
+                            game, model, best_model,
+                            num_eval_self, device,
+                            show_progress=True
+                        )
+                        wins_total += wins_self
+                        games_total += total_self
+                    
+                    # Evaluate vs baseline
+                    if num_eval_baseline > 0:
+                        wins_baseline, total_baseline = evaluate_vs_opponent(
+                            game, model, baseline_model,
+                            num_eval_baseline, device,
+                            show_progress=True
+                        )
+                        wins_total += wins_baseline
+                        games_total += total_baseline
                 
                 old_elo = current_elo
                 
                 # Opponent ELO calculation depends on training phase
                 if use_baseline and phase == "vs_baseline":
-                    # Training vs both best model and baseline: weighted mean
+                    # Playing vs both best model and baseline: weighted mean
                     weight_best = Config.BASELINE_SELF_PLAY_RATIO
                     weight_baseline = 1 - Config.BASELINE_SELF_PLAY_RATIO
                     opponent_elo = (best_elo * weight_best) + (baseline_elo * weight_baseline)
@@ -258,10 +283,10 @@ def train():
                     # Pure self-play: opponent is best model
                     opponent_elo = best_elo
                 
-                new_elo = update_elo(current_elo, opponent_elo, wins, total)
+                new_elo = update_elo(current_elo, opponent_elo, wins_total, games_total)
                 
                 status_msg = "NEW BEST MODEL" if new_elo > best_elo else "No improvement"
-                print(f"ELO Result: {old_elo:.0f} -> {new_elo:.0f} | Win Rate: {(wins/total)*100:.1f}% | {status_msg}")
+                print(f"ELO Result: {old_elo:.0f} -> {new_elo:.0f} | Win Rate: {(wins_total/games_total)*100:.1f}% | {status_msg}")
                 
                 if new_elo > best_elo:
                     best_elo = new_elo
