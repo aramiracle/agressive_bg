@@ -75,11 +75,15 @@ def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=500):
                 action = legal[0]
 
             game.step_atomic(action)
+            mcts.advance_to_child(action)
             move_count += 1
 
         # Switch turn if game not over
         if game.check_win()[0] == 0:
             game.switch_turn()
+            # Reset both MCTS trees on turn switch
+            mcts_a.reset()
+            mcts_b.reset()
 
     # Timeout reached - treat as draw
     return 0.5
