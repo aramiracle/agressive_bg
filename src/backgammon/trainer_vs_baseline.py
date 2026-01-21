@@ -5,7 +5,6 @@
 
 import os
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import random
 from tqdm import tqdm
@@ -102,10 +101,15 @@ def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
                 game.switch_turn()
 
                 # Save ONLY current model's cube decisions
+                # Create a dummy or one-hot distribution for cube actions (e.g., size 2: [no_double, double])
+                cube_probs = torch.zeros(2) # Adjust size based on your model's cube-head output
+                cube_probs[double_choice] = 1.0 
+
                 if is_current_turn:
                     board_t, ctx_t = game.get_vector(game.match_scores[1], game.match_scores[-1], device='cpu', canonical=True)
-                    history.append((board_t, ctx_t, 1, game.turn, True))
-
+                    # REPLACE None with cube_probs
+                    history.append((board_t, ctx_t, double_choice, game.turn, True, cube_probs))
+                
                 if take_choice == 1:
                     game.apply_double()
                 else:
@@ -132,8 +136,8 @@ def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
             root = active_mcts.search(game, 0, 0)
 
             if root.children:
-                actions = list(root.children.keys())
-                visits = torch.tensor([c.visits for c in root.children.values()], dtype=torch.float)
+                actions = [c.action for c in root.children]
+                visits = torch.tensor([c.visits for c in root.children])
 
                 if visits.sum() > 0:
                     probs = visits / visits.sum()
@@ -146,9 +150,24 @@ def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
             # Save ONLY current model's move
             if is_current_turn:
                 board_t, ctx_t = game.get_vector(game.match_scores[1], game.match_scores[-1], device='cpu', canonical=True)
-                canon_act = game.real_action_to_canonical(chosen_action)
-                s_idx, e_idx = move_to_indices(canon_act[0], canon_act[1])
-                history.append((board_t, ctx_t, (s_idx, e_idx), game.turn, False))
+                
+                # Create the two 26-sized target vectors
+                target_f = torch.zeros(26)
+                target_t = torch.zeros(26)
+
+                if root.children:
+                    visits = torch.tensor([c.visits for c in root.children], dtype=torch.float)
+                    probs = visits / visits.sum() if visits.sum() > 0 else torch.ones(len(visits))/len(visits)
+                    
+                    for i, child in enumerate(root.children):
+                        canon_act = game.real_action_to_canonical(child.action)
+                        s, e = move_to_indices(canon_act[0], canon_act[1])
+                        # Ensure indices are within bounds (0-25)
+                        if 0 <= s < 26: target_f[s] += probs[i]
+                        if 0 <= e < 26: target_t[e] += probs[i]
+
+                # Append using the TUPLE format (target_f, target_t)
+                history.append((board_t, ctx_t, None, game.turn, False, (target_f, target_t)))
 
             game.step_atomic(chosen_action)
             active_mcts.advance_to_child(chosen_action)
@@ -174,7 +193,7 @@ def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
         hist_winner = -hist_winner
 
     data = []
-    for board, ctx, act, turn, is_cube in history:
+    for board, ctx, act, turn, is_cube, _ in history:
         reward = float(total_points) + float(Config.MATCH_TARGET)
         if not current_won:
             reward = -reward
@@ -253,7 +272,7 @@ def train():
     # =========================
     use_prioritized = getattr(Config, 'USE_PRIORITIZED_REPLAY', True)
     replay_buffer = get_replay_buffer(
-        Config.BUFFER_SIZE,
+        int(Config.BUFFER_SIZE * 0.6),
         prioritized=use_prioritized
     )
 

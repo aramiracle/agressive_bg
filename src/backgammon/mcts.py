@@ -3,35 +3,25 @@ import torch
 
 
 class MCTSNode:
-    __slots__ = (
-        "parent",
-        "action",
-        "children",
-        "visits",
-        "value_sum",
-        "prior",
-    )
+    __slots__ = ("parent", "action", "children", "visits", "value_sum", "prior")
 
     def __init__(self, parent=None, action=None, prior=0.0):
         self.parent = parent
-        self.action = action          # atomic move
-        self.children = []            # list[MCTSNode]
+        self.action = action
+        self.children = []
         self.visits = 0
         self.value_sum = 0.0
         self.prior = prior
 
 
 class MCTS:
-    def __init__(self, model, cpuct=1.5, num_sims=100, device="cpu"):
+    def __init__(self, model, cpuct=1.5, num_sims=100, device="cpu", batch_size=8):
         self.model = model
         self.cpuct = cpuct
         self.num_sims = num_sims
         self.device = device
+        self.batch_size = batch_size
         self.root = MCTSNode()
-
-    # =====================================================
-    # TREE MANAGEMENT
-    # =====================================================
 
     def reset(self):
         self.root = MCTSNode()
@@ -44,23 +34,17 @@ class MCTS:
                 return
         self.reset()
 
-    # =====================================================
-    # PUBLIC SEARCH
-    # =====================================================
-
     def search(self, game, my_score, opp_score):
         if not self.root.children:
             self._expand_node(self.root, game)
 
         root_snapshot = game.fast_save()
+        eval_queue = []
 
         for _ in range(self.num_sims):
             node = self.root
             game.fast_restore(root_snapshot)
 
-            # -----------------------
-            # SELECTION
-            # -----------------------
             while node.children:
                 best = None
                 best_score = -1e9
@@ -84,33 +68,45 @@ class MCTS:
                 if not game.dice:
                     break
 
-            # -----------------------
-            # TERMINAL CHECK
-            # -----------------------
             winner, _ = game.check_win()
             if winner != 0:
                 value = 1.0 if winner == game.turn else -1.0
                 self._backpropagate(node, value)
                 continue
 
-            # -----------------------
-            # EXPANSION
-            # -----------------------
             if not node.children:
                 self._expand_node(node, game)
 
-            # -----------------------
-            # EVALUATION
-            # -----------------------
-            value = self._evaluate(game, my_score, opp_score)
-            self._backpropagate(node, value)
+            b_t, c_t = game.get_vector(
+                my_score=my_score,
+                opp_score=opp_score,
+                device=self.device,
+                canonical=False,
+            )
+
+            eval_queue.append((node, b_t, c_t))
+
+            if len(eval_queue) >= self.batch_size:
+                self._flush_batch(eval_queue)
+                eval_queue.clear()
+
+        if eval_queue:
+            self._flush_batch(eval_queue)
 
         game.fast_restore(root_snapshot)
         return self.root
 
-    # =====================================================
-    # CORE OPERATIONS
-    # =====================================================
+    def _flush_batch(self, batch):
+        boards = torch.stack([b for _, b, _ in batch]).to(self.device)
+        ctxs = torch.stack([c for _, _, c in batch]).to(self.device)
+
+        with torch.no_grad():
+            out = self.model(boards, ctxs)
+            values = out[2].squeeze(-1)
+
+        for i, (node, _, _) in enumerate(batch):
+            v = float(values[i].item())
+            self._backpropagate(node, v)
 
     def _expand_node(self, node, game):
         legal = game.get_legal_moves()
@@ -118,23 +114,7 @@ class MCTS:
             return
 
         prior = 1.0 / len(legal)
-        children = []
-        for mv in legal:
-            children.append(MCTSNode(node, mv, prior))
-        node.children = children
-
-    def _evaluate(self, game, my_score, opp_score):
-        with torch.no_grad():
-            b_t, c_t = game.get_vector(
-                my_score=my_score,
-                opp_score=opp_score,
-                device=self.device,
-                canonical=False,
-            )
-            out = self.model(b_t.unsqueeze(0), c_t.unsqueeze(0))
-            if isinstance(out, tuple):
-                return float(out[2].item())
-            return float(out.item())
+        node.children = [MCTSNode(node, mv, prior) for mv in legal]
 
     def _backpropagate(self, node, value):
         v = value
@@ -143,34 +123,3 @@ class MCTS:
             node.value_sum += v
             v = -v
             node = node.parent
-
-    # =====================================================
-    # ACTION SELECTION
-    # =====================================================
-
-    def best_action(self, temperature=0.0):
-        if not self.root.children:
-            return None
-
-        if temperature <= 0:
-            best = None
-            max_visits = -1
-            for c in self.root.children:
-                if c.visits > max_visits:
-                    max_visits = c.visits
-                    best = c
-            return best.action
-
-        visits = torch.tensor([c.visits for c in self.root.children], dtype=torch.float)
-        probs = visits ** (1.0 / temperature)
-        probs /= probs.sum()
-        idx = torch.multinomial(probs, 1).item()
-        return self.root.children[idx].action
-
-    # =====================================================
-    # SAFETY
-    # =====================================================
-
-    def sanity_check(self, game):
-        legal = set(game.get_legal_moves())
-        self.root.children = [c for c in self.root.children if c.action in legal]
