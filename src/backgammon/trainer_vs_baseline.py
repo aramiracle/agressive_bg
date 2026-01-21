@@ -103,7 +103,7 @@ def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
 
                 # Save ONLY current model's cube decisions
                 if is_current_turn:
-                    board_t, ctx_t = game.get_vector(game.scores[1], game.scores[-1], device='cpu', canonical=True)
+                    board_t, ctx_t = game.get_vector(game.match_scores[1], game.match_scores[-1], device='cpu', canonical=True)
                     history.append((board_t, ctx_t, 1, game.turn, True))
 
                 if take_choice == 1:
@@ -145,7 +145,7 @@ def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
 
             # Save ONLY current model's move
             if is_current_turn:
-                board_t, ctx_t = game.get_vector(game.scores[1], game.scores[-1], device='cpu', canonical=True)
+                board_t, ctx_t = game.get_vector(game.match_scores[1], game.match_scores[-1], device='cpu', canonical=True)
                 canon_act = game.real_action_to_canonical(chosen_action)
                 s_idx, e_idx = move_to_indices(canon_act[0], canon_act[1])
                 history.append((board_t, ctx_t, (s_idx, e_idx), game.turn, False))

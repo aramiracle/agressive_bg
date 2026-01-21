@@ -21,7 +21,7 @@ def update_elo(current_elo, opponent_elo, wins, total_games):
     delta = max(-Config.ELO_SCALE, min(Config.ELO_SCALE, delta))
     return current_elo + delta * total_games
 
-def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=500):
+def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=1000):
     """
     Play a single game between two MCTS agents.
     """

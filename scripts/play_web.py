@@ -357,7 +357,7 @@ class BackgammonServer:
             )
             
             if root.children:
-                best_move = max(root.children.items(), key=lambda x: x[1].visits)[0]
+                best_move = max(root.children, key=lambda n: n.visits).action
             else:
                 best_move = legal[0]
             
