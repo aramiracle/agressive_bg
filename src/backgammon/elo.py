@@ -49,11 +49,12 @@ def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=1000):
             a_turn = (game.turn == 1 and a_is_white) or (game.turn == -1 and not a_is_white)
             mcts = mcts_a if a_turn else mcts_b
             
-            # Search using current game state (MCTS internally copies)
             root = mcts.search(game, 0, 0)
 
             if root.children:
-                action = max(root.children.items(), key=lambda x: x[1].visits)[0]
+                # Fixed: Accessing object attributes .visits and .action
+                best_child = max(root.children, key=lambda node: node.visits)
+                action = best_child.action
             else:
                 action = legal[0]
 
@@ -66,7 +67,6 @@ def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=1000):
 
         if game.check_win()[0] == 0:
             game.switch_turn()
-            # Dice roll changes randomness, so old trees are invalid for new turn
             mcts_a.reset()
             mcts_b.reset()
 

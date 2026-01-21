@@ -181,25 +181,23 @@ def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
             mcts_baseline.reset()
 
     # =========================
-    # FINALIZATION
+    # FINALIZATION (Updated for 6-element schema)
     # =========================
     winner, mult = game.check_win()
     total_points = mult * game.cube
 
     current_won = (winner == 1) == current_is_p1
 
-    hist_winner = 1 if current_is_p1 else -1
-    if not current_won:
-        hist_winner = -hist_winner
-
     data = []
-    for board, ctx, act, turn, is_cube, _ in history:
+    for board, ctx, act, turn, is_cube, visit_probs in history:
+        # Calculate normalized reward
         reward = float(total_points) + float(Config.MATCH_TARGET)
         if not current_won:
             reward = -reward
-
         reward /= Config.MATCH_TARGET
-        data.append((board, ctx, act, reward, is_cube))
+        
+        # APPEND 6 ELEMENTS: (board, ctx, action, reward, is_cube, visit_probs)
+        data.append((board, ctx, act, reward, is_cube, visit_probs))
 
     return data, current_won
 
