@@ -1,5 +1,4 @@
 import math
-import random
 import torch
 
 """
@@ -87,58 +86,89 @@ class MCTS:
         """
         Run MCTS simulations from current game state.
         Returns the root node.
+        Uses batched neural network evaluation for efficiency.
         """
         # If root is unexpanded, expand once
         if not self.root.children:
             self._expand_root(game)
 
-        for _ in range(self.num_sims):
-            sim_game = game.copy()
-            node = self.root
+        # Save initial state once - we'll restore to this after each sim
+        initial_snapshot = game.fast_save()
+
+        # Batch size for neural network evaluation
+        batch_size = min(32, self.num_sims)
+        
+        sim_idx = 0
+        while sim_idx < self.num_sims:
+            # Collect a batch of leaf nodes to evaluate
+            current_batch_size = min(batch_size, self.num_sims - sim_idx)
+            
+            leaf_nodes = []
+            leaf_snapshots = []
+            leaf_values = []  # For terminal nodes
+            
+            for _ in range(current_batch_size):
+                # Restore to initial state
+                game.fast_restore(initial_snapshot)
+                node = self.root
+
+                # -----------------
+                # 1. SELECTION
+                # -----------------
+                while True:
+                    if not node.children:
+                        break
+
+                    best_child = self._select_child(node)
+                    if best_child is None:
+                        break
+
+                    # Apply move safely
+                    try:
+                        game.step_atomic(best_child.action)
+                    except Exception:
+                        # Prune illegal branch
+                        node.children.pop(best_child.action, None)
+                        break
+
+                    node = best_child
+
+                    # If turn ended, stop descent
+                    if not game.dice:
+                        break
+
+                # -----------------
+                # 2. CHECK TERMINAL / EXPAND
+                # -----------------
+                winner, _ = game.check_win()
+
+                if winner != 0:
+                    # Terminal state - no need for NN eval
+                    v = 1.0 if winner == game.turn else -1.0
+                    leaf_values.append((node, v))
+                else:
+                    # Expand if possible
+                    self._expand_node(node, game)
+                    # Save state for batched evaluation
+                    leaf_nodes.append(node)
+                    leaf_snapshots.append(game.fast_save())
 
             # -----------------
-            # 1. SELECTION
+            # 3. BATCHED EVALUATION
             # -----------------
-            while True:
-                if not node.children:
-                    break
+            if leaf_nodes:
+                values = self._evaluate_batch(game, leaf_snapshots, my_score, opp_score)
+                for node, v in zip(leaf_nodes, values):
+                    self._backpropagate(node, v)
 
-                best_child = self._select_child(node)
-                if best_child is None:
-                    break
+            # Backprop terminal values
+            for node, v in leaf_values:
+                self._backpropagate(node, v)
 
-                # Apply move safely
-                try:
-                    sim_game.step_atomic(best_child.action)
-                except Exception:
-                    # Prune illegal branch
-                    node.children.pop(best_child.action, None)
-                    break
+            sim_idx += current_batch_size
 
-                node = best_child
-
-                # If turn ended, stop descent
-                if not sim_game.dice:
-                    break
-
-            # -----------------
-            # 2. EVALUATION
-            # -----------------
-            winner, _ = sim_game.check_win()
-
-            if winner != 0:
-                # Terminal
-                v = 1.0 if winner == sim_game.turn else -1.0
-            else:
-                # Expand if possible
-                self._expand_node(node, sim_game)
-                v = self._evaluate(sim_game, my_score, opp_score)
-
-            # -----------------
-            # 3. BACKPROP
-            # -----------------
-            self._backpropagate(node, v)
-
+        # Restore game to initial state
+        game.fast_restore(initial_snapshot)
         return self.root
 
     # =========================
@@ -211,6 +241,46 @@ class MCTS:
 
             return float(v.item())
 
+    def _evaluate_batch(self, game, snapshots, my_score, opp_score):
+        """Batched neural value evaluation for multiple states."""
+        if not snapshots:
+            return []
+        
+        batch_size = len(snapshots)
+        
+        # Pre-allocate tensors for the batch
+        board_tensors = []
+        ctx_tensors = []
+        
+        for snapshot in snapshots:
+            game.fast_restore(snapshot)
+            b_t, c_t = game.get_vector(
+                my_score=my_score,
+                opp_score=opp_score,
+                device=self.device,
+                canonical=False
+            )
+            board_tensors.append(b_t)
+            ctx_tensors.append(c_t)
+        
+        # Stack into batches
+        batch_board = torch.stack(board_tensors, dim=0)
+        batch_ctx = torch.stack(ctx_tensors, dim=0)
+        
+        with torch.no_grad():
+            out = self.model(batch_board, batch_ctx)
+            
+            if isinstance(out, tuple):
+                v = out[2]
+            else:
+                v = out
+            
+            # Handle both scalar and tensor outputs
+            if v.dim() == 0:
+                return [float(v.item())]
+            
+            return [float(v[i].item()) for i in range(batch_size)]
+
     def _backpropagate(self, node, value):
         """
         Backpropagate value up the tree.
@@ -237,14 +307,21 @@ class MCTS:
             return None
 
         actions = list(self.root.children.keys())
-        visits = torch.tensor([
-            self.root.children[a].visits for a in actions
-        ], dtype=torch.float)
+        visits = [self.root.children[a].visits for a in actions]
 
         if temperature <= 0:
-            return actions[int(torch.argmax(visits).item())]
+            # Greedy: pick action with most visits
+            max_visits = -1
+            best_idx = 0
+            for i, v in enumerate(visits):
+                if v > max_visits:
+                    max_visits = v
+                    best_idx = i
+            return actions[best_idx]
 
-        probs = visits ** (1.0 / temperature)
+        # Stochastic selection with temperature
+        visits_tensor = torch.tensor(visits, dtype=torch.float)
+        probs = visits_tensor ** (1.0 / temperature)
         probs = probs / probs.sum()
 
         idx = torch.multinomial(probs, 1).item()
