@@ -24,9 +24,9 @@ from src.backgammon.replay_buffer import get_replay_buffer
 # Cube decision helper
 # ------------------------------------------------------------
 
-def get_cube_decision(model, game, device):
+def get_cube_decision(model, game, device, my_score=0, opp_score=0):
     """Returns 1 = double, 0 = no double"""
-    board_t, ctx_t = game.get_vector(device=device, canonical=True)
+    board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
     with torch.no_grad():
         _, _, v, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
 
@@ -86,12 +86,12 @@ def play_one_game(
 
         # ---------------- Cubing phase ----------------
         if game.can_double() and game.cube < Config.MATCH_TARGET:
-            double_choice = get_cube_decision(model, game, device)
+            double_choice = get_cube_decision(model, game, device, my_s, opp_s)
 
             if double_choice == 1:
                 # Opponent decision
                 game.switch_turn()
-                take_choice = get_cube_decision(model, game, device)
+                take_choice = get_cube_decision(model, game, device, opp_s, my_s)
                 game.switch_turn()
 
                 if not is_eval:
