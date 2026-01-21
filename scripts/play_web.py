@@ -11,7 +11,6 @@ import asyncio
 import base64
 import io
 import json
-import tempfile
 import torch
 import websockets
 
@@ -44,7 +43,10 @@ class BackgammonServer:
         self.game_over = False
         self.winner = 0
         self.has_rolled = False  # Track if current player has rolled
-        self.match_target = Config.MATCH_TARGET  # Configurable match target
+        self.match_target = Config.MATCH_TARGET
+        
+        # Ensure engine knows the config target
+        self.game.match_target = self.match_target
         
         # Try to load default model
         self._try_load_default_model()
@@ -60,7 +62,7 @@ class BackgammonServer:
             try:
                 checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
                 
-                # Check model type from checkpoint config (as saved by trainer.py)
+                # Check model type from checkpoint config
                 checkpoint_model_type = None
                 if isinstance(checkpoint, dict) and 'config' in checkpoint:
                     checkpoint_model_type = checkpoint['config'].get('model_type', None)
@@ -70,16 +72,14 @@ class BackgammonServer:
                     print(f"⚠️ Skipping {path}: model type mismatch (checkpoint: {checkpoint_model_type}, config: {Config.MODEL_TYPE})")
                     continue
                 
-                # Create model and load weights
                 model = get_model().to(DEVICE)
                 
-                # Load state dict (trainer.py saves as 'model_state_dict')
+                # Load state dict
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     model.load_state_dict(checkpoint['model_state_dict'])
                 elif isinstance(checkpoint, dict) and 'model' in checkpoint:
                     model.load_state_dict(checkpoint['model'])
                 else:
-                    # Assume it's a raw state dict
                     model.load_state_dict(checkpoint)
                 
                 model.eval()
@@ -87,7 +87,6 @@ class BackgammonServer:
                 self.mcts = MCTS(self.model, device=DEVICE)
                 self.model_filename = os.path.basename(path)
                 
-                # Get additional info from checkpoint
                 elo = checkpoint.get('elo', 'N/A') if isinstance(checkpoint, dict) else 'N/A'
                 step = checkpoint.get('step', 'N/A') if isinstance(checkpoint, dict) else 'N/A'
                 model_info = checkpoint_model_type or Config.MODEL_TYPE
@@ -96,59 +95,33 @@ class BackgammonServer:
                 print(f"   Type: {model_info}, ELO: {elo}, Step: {step}")
                 return
                 
-            except RuntimeError as e:
-                error_str = str(e)
-                if "size mismatch" in error_str or "Missing key" in error_str:
-                    print(f"⚠️ Skipping {path}: architecture mismatch with Config.MODEL_TYPE ({Config.MODEL_TYPE})")
-                else:
-                    print(f"⚠️ Error loading {path}: {e}")
             except Exception as e:
                 print(f"⚠️ Error loading {path}: {e}")
         
         print(f"⚠️ No compatible model found - AI will not work until model is loaded")
-        print(f"   Current Config.MODEL_TYPE: {Config.MODEL_TYPE}")
 
     def load_model_from_data(self, filename, data_base64):
         """Load model from base64 encoded data sent from client"""
         try:
-            # Decode base64 data
             model_bytes = base64.b64decode(data_base64)
-            
-            # Load into buffer
             buffer = io.BytesIO(model_bytes)
-            
-            # Load checkpoint first to check model type
             checkpoint = torch.load(buffer, map_location=DEVICE, weights_only=False)
             
-            # Check if checkpoint contains model type info (as saved by trainer.py)
+            # Check model type
             checkpoint_model_type = None
-            checkpoint_elo = None
-            checkpoint_step = None
+            if isinstance(checkpoint, dict) and 'config' in checkpoint:
+                checkpoint_model_type = checkpoint['config'].get('model_type', None)
             
-            if isinstance(checkpoint, dict):
-                if 'config' in checkpoint:
-                    checkpoint_model_type = checkpoint['config'].get('model_type', None)
-                checkpoint_elo = checkpoint.get('elo', None)
-                checkpoint_step = checkpoint.get('step', None)
+            if checkpoint_model_type and checkpoint_model_type != Config.MODEL_TYPE:
+                return {"type": "model_error", "error": f"Type mismatch: {checkpoint_model_type} vs {Config.MODEL_TYPE}"}
             
-            current_model_type = Config.MODEL_TYPE
-            
-            # Warn if model types don't match
-            if checkpoint_model_type and checkpoint_model_type != current_model_type:
-                error_msg = f"Model type mismatch! Checkpoint: {checkpoint_model_type}, Config: {current_model_type}"
-                print(f"❌ {error_msg}")
-                return {"type": "model_error", "error": error_msg}
-            
-            # Create model based on current config
             model = get_model().to(DEVICE)
             
-            # Try to load state dict (trainer.py saves as 'model_state_dict')
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
             elif isinstance(checkpoint, dict) and 'model' in checkpoint:
                 model.load_state_dict(checkpoint['model'])
             else:
-                # Assume it's a raw state dict
                 model.load_state_dict(checkpoint)
             
             model.eval()
@@ -156,29 +129,11 @@ class BackgammonServer:
             self.mcts = MCTS(self.model, device=DEVICE)
             self.model_filename = filename
             
-            model_info = checkpoint_model_type or current_model_type
-            
-            print(f"✅ Model loaded from client: {filename}")
-            print(f"   Type: {model_info}, ELO: {checkpoint_elo}, Step: {checkpoint_step}")
-            
             return {
                 "type": "model_loaded", 
                 "filename": filename, 
-                "model_type": model_info,
-                "elo": checkpoint_elo,
-                "step": checkpoint_step
+                "model_type": checkpoint_model_type or Config.MODEL_TYPE
             }
-            
-        except RuntimeError as e:
-            # This usually means model architecture mismatch
-            error_str = str(e)
-            if "size mismatch" in error_str or "Missing key" in error_str or "Unexpected key" in error_str:
-                error_msg = f"Model architecture mismatch. Check if checkpoint matches Config.MODEL_TYPE ({Config.MODEL_TYPE})"
-                print(f"❌ {error_msg}")
-                print(f"   Details: {error_str[:200]}")
-                return {"type": "model_error", "error": error_msg}
-            print(f"❌ Model load error: {e}")
-            return {"type": "model_error", "error": str(e)}
         except Exception as e:
             print(f"❌ Model load error: {e}")
             return {"type": "model_error", "error": str(e)}
@@ -215,13 +170,12 @@ class BackgammonServer:
                 "model_filename": self.model_filename,
                 "model_type": Config.MODEL_TYPE,
                 "has_rolled": self.has_rolled,
-                # Match info
                 "match_target": self.match_target,
                 "match_scores": {
                     "white": self.game.match_scores.get(1, 0),
                     "black": self.game.match_scores.get(-1, 0)
                 },
-                "crawford": self.game.crawford,
+                "crawford": self.game.crawford_active,
                 "crawford_used": self.game.crawford_used
             }
         }
@@ -230,72 +184,44 @@ class BackgammonServer:
     # GAME ACTIONS
     # =====================
     def new_game(self):
-        """Start a new game (keeps match scores)"""
-        # Update crawford status based on current match scores
-        self._update_crawford_status()
         self.game.reset()
         self.game_over = False
         self.winner = 0
         self.has_rolled = False
-        
-        crawford_msg = " (Crawford Game!)" if self.game.crawford else ""
+        crawford_msg = " (Crawford Game!)" if self.game.crawford_active else ""
         return self.serialize(f"New game started!{crawford_msg} Roll dice to begin.")
     
-    def _update_crawford_status(self):
-        """Update Crawford status based on match scores"""
-        score_w = self.game.match_scores.get(1, 0)
-        score_b = self.game.match_scores.get(-1, 0)
-        
-        # Crawford activates when one player is exactly 1 point away from winning
-        # and Crawford hasn't been used yet
-        if not self.game.crawford_used:
-            if score_w == self.match_target - 1 or score_b == self.match_target - 1:
-                self.game.crawford = True
-            else:
-                self.game.crawford = False
-        else:
-            self.game.crawford = False
-    
     def new_match(self, target=None):
-        """Start a completely new match (resets scores)"""
         if target is not None:
-            self.match_target = max(1, min(21, int(target)))  # Clamp between 1-21
+            self.match_target = max(1, min(21, int(target)))
+            self.game.match_target = self.match_target
+            
         self.game.match_scores = {1: 0, -1: 0}
-        self.game.crawford = False
         self.game.crawford_used = False
-        self.game.reset()
+        self.game.reset() 
+        
         self.game_over = False
         self.winner = 0
         self.has_rolled = False
         return self.serialize(f"New match started! First to {self.match_target} points.")
     
-    def _handle_game_win(self, winner, mult):
-        """Handle game win - update match scores"""
-        points = mult * self.game.cube
-        self.game.match_scores[winner] = self.game.match_scores.get(winner, 0) + points
+    def _handle_game_win(self, winner, points):
+        score_w = self.game.match_scores.get(1, 0)
+        score_b = self.game.match_scores.get(-1, 0)
         
-        # Check if match is won
         match_winner = None
-        if self.game.match_scores[winner] >= self.match_target:
-            match_winner = winner
-        
-        # Update crawford status for next game
-        if self.game.crawford:
-            self.game.crawford_used = True
+        if score_w >= self.match_target: match_winner = 1
+        elif score_b >= self.match_target: match_winner = -1
         
         self.game_over = True
         self.winner = winner
         
         winner_name = "White" if winner == 1 else "Black"
-        mult_text = {1: "", 2: " (Gammon!)", 3: " (Backgammon!)"}
-        
-        score_w = self.game.match_scores.get(1, 0)
-        score_b = self.game.match_scores.get(-1, 0)
         
         if match_winner:
-            return f"🏆 {winner_name} WINS THE MATCH{mult_text.get(mult, '')}! Final: {score_w}-{score_b}"
+            return f"🏆 {winner_name} WINS THE MATCH! Final: {score_w}-{score_b}"
         else:
-            return f"{winner_name} wins{mult_text.get(mult, '')} (+{points}pts)! Score: {score_w}-{score_b}. Click 'New Game' to continue."
+            return f"{winner_name} wins (+{points}pts)! Score: {score_w}-{score_b}. Click 'New Game'."
 
     def roll(self):
         if self.game_over:
@@ -308,7 +234,6 @@ class BackgammonServer:
         self.game.roll_dice()
         self.has_rolled = True
         
-        # Check if there are legal moves
         legal = self.game.get_legal_moves()
         if not legal:
             status = f"Rolled {self.game.dice[0]}, {self.game.dice[1]} - No legal moves!"
@@ -323,20 +248,19 @@ class BackgammonServer:
         if not self.game.can_double():
             return self.serialize("Cannot double now")
         
-        self.game.apply_double()
-        return self.serialize(f"Cube doubled to {self.game.cube}")
+        if self.game.double():
+            return self.serialize(f"Cube doubled to {self.game.cube}")
+        else:
+            return self.serialize("Double rejected (Not implemented in UI yet)")
 
     def end_turn(self):
         if self.game_over:
             return self.serialize("Game is over")
-        
         if not self.has_rolled:
             return self.serialize("Roll dice first!")
         
-        # Clear remaining dice and switch turn
-        self.game.dice = []
         self.game.switch_turn()
-        self.has_rolled = False  # Reset for next player
+        self.has_rolled = False
         
         turn_name = "White" if self.game.turn == 1 else "Black"
         return self.serialize(f"{turn_name}'s turn")
@@ -347,32 +271,27 @@ class BackgammonServer:
         if not self.game.dice:
             return self.serialize("Roll dice first!")
         
-        # Convert string values
-        if src == "bar":
-            src = "bar"
-        elif isinstance(src, str):
-            src = int(src)
+        if src == "bar": src = "bar"
+        elif isinstance(src, str): src = int(src)
             
-        if dst == "off":
-            dst = "off"
-        elif isinstance(dst, str):
-            dst = int(dst)
+        if dst == "off": dst = "off"
+        elif isinstance(dst, str): dst = int(dst)
         
-        # Check if move is legal
         legal_moves = self.game.get_legal_moves()
         move = (src, dst)
         
         if move not in legal_moves:
             return self.serialize(f"Illegal move: {src} -> {dst}")
         
-        # Apply move
-        winner, mult = self.game.step_atomic(move)
+        try:
+            winner, points = self.game.step_atomic(move)
+        except ValueError as e:
+            return self.serialize(f"Engine Error: {str(e)}")
         
         if winner != 0:
-            status = self._handle_game_win(winner, mult)
+            status = self._handle_game_win(winner, points)
             return self.serialize(status)
         
-        # Check if more moves available
         if self.game.dice:
             legal = self.game.get_legal_moves()
             if not legal:
@@ -392,9 +311,9 @@ class BackgammonServer:
     # =====================
     def is_ai_turn(self):
         if self.game_mode == "human_vs_ai":
-            return self.game.turn == -1  # AI plays black
+            return self.game.turn == -1
         elif self.game_mode == "ai_vs_human":
-            return self.game.turn == 1   # AI plays white
+            return self.game.turn == 1
         elif self.game_mode == "ai_vs_ai":
             return True
         return False
@@ -404,14 +323,12 @@ class BackgammonServer:
         if self.game_over or not self.is_ai_turn():
             return
         
-        # Check if model is loaded
         if not self.model or not self.mcts:
             await websocket.send(json.dumps(
                 self.serialize("⚠️ No model loaded! Please load a model first.")
             ))
             return
         
-        # Roll dice if needed
         if not self.game.dice:
             self.game.roll_dice()
             self.has_rolled = True
@@ -420,27 +337,32 @@ class BackgammonServer:
             ))
             await asyncio.sleep(0.3)
         
-        # Make moves until dice exhausted
+        # Keep moving until dice are exhausted or no legal moves
         while self.game.dice and not self.game_over:
             legal = self.game.get_legal_moves()
             if not legal:
                 break
             
-            # Use MCTS to find best move
+            # --- MCTS Step ---
+            # IMPORTANT: Pass a COPY of the game to MCTS.
+            # MCTS simulations modify the board. If we pass self.game, 
+            # the live board gets corrupted (dice consumed), causing crashes 
+            # on subsequent loops or step_atomic calls.
+            game_copy = self.game.copy()
+            
             root = self.mcts.search(
-                self.game, 
+                game_copy, 
                 self.game.match_scores.get(self.game.turn, 0),
                 self.game.match_scores.get(-self.game.turn, 0)
             )
             
-            # Select move with most visits
             if root.children:
                 best_move = max(root.children.items(), key=lambda x: x[1].visits)[0]
             else:
                 best_move = legal[0]
             
-            # Apply move
-            winner, mult = self.game.step_atomic(best_move)
+            # --- Apply Move ---
+            winner, points = self.game.step_atomic(best_move)
             
             src, dst = best_move
             await websocket.send(json.dumps(
@@ -448,18 +370,15 @@ class BackgammonServer:
             ))
             
             if winner != 0:
-                status = self._handle_game_win(winner, mult)
-                await websocket.send(json.dumps(
-                    self.serialize(status)
-                ))
+                status = self._handle_game_win(winner, points)
+                await websocket.send(json.dumps(self.serialize(status)))
                 return
             
             await asyncio.sleep(0.2)
         
         # End AI turn
-        self.game.dice = []
         self.game.switch_turn()
-        self.has_rolled = False  # Reset for next player
+        self.has_rolled = False
         
         turn_name = "White" if self.game.turn == 1 else "Black"
         await websocket.send(json.dumps(
@@ -485,12 +404,10 @@ class BackgammonServer:
         if t == "roll":
             result = self.roll()
             await websocket.send(json.dumps(result))
-            
-            # If AI's turn after roll, let AI play
             if self.is_ai_turn() and not self.game_over:
                 await asyncio.sleep(0.3)
                 await self.ai_move(websocket)
-            return None  # Already sent
+            return None
 
         if t == "double":
             return self.double()
@@ -498,8 +415,6 @@ class BackgammonServer:
         if t == "end_turn":
             result = self.end_turn()
             await websocket.send(json.dumps(result))
-            
-            # If AI's turn, let AI play
             if self.is_ai_turn() and not self.game_over:
                 await asyncio.sleep(0.3)
                 await self.ai_move(websocket)
@@ -514,15 +429,12 @@ class BackgammonServer:
             mode = msg.get("mode")
             result = self.set_mode(mode)
             await websocket.send(json.dumps(result))
-            
-            # If AI starts, let it play
             if self.is_ai_turn() and not self.game_over and not self.game.dice:
                 await asyncio.sleep(0.3)
                 await self.ai_move(websocket)
             return None
 
         if t == "ai_play":
-            # Manual trigger for AI move (useful for ai_vs_ai stepping)
             if self.is_ai_turn() and not self.game_over:
                 await self.ai_move(websocket)
             return None
@@ -562,4 +474,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

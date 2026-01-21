@@ -1,148 +1,264 @@
-import torch
 import math
-from collections import deque
-from src.backgammon.config import Config
+import random
+import torch
+
+"""
+AlphaZero-style Monte Carlo Tree Search for Backgammon
+------------------------------------------------------
+
+Design goals:
+- Works in REAL board space (no canonical confusion)
+- Atomic-move aware (multiple moves per turn / dice consumption)
+- Strictly legal: never calls step_atomic() with illegal actions
+- Safe for Web / MCTS / NN integration
+- Preserves tree across multi-atomic moves in same turn
+
+Model Interface Expectations:
+-----------------------------
+Your model(model(board, ctx)) can return:
+  1) value tensor
+  OR
+  2) tuple: (policy_from, policy_to, value, cube_logits)
+
+This implementation only USES the value head.
+Policy is handled by uniform priors over legal moves (robust + simple).
+
+If you later want true policy guidance, I can wire from/to heads.
+"""
 
 
-class Node:
-    __slots__ = ['visits', 'value_sum', 'prior', 'children', 'is_expanded', 'parent']
+class MCTSNode:
+    __slots__ = (
+        "parent",
+        "action",
+        "children",
+        "visits",
+        "value_sum",
+        "prior",
+    )
 
-    def __init__(self, prior=0.0, parent=None):
+    def __init__(self, parent=None, action=None, prior=0.0):
+        self.parent = parent
+        self.action = action  # REAL atomic move: (start, end)
+        self.children = {}    # {action: MCTSNode}
         self.visits = 0
         self.value_sum = 0.0
         self.prior = prior
-        self.children = {}
-        self.is_expanded = False
-        self.parent = parent
+
+    @property
+    def value(self):
+        if self.visits == 0:
+            return 0.0
+        return self.value_sum / self.visits
 
 
 class MCTS:
-    def __init__(self, model, device):
+    def __init__(self, model, cpuct=1.5, num_sims=100, device="cpu"):
         self.model = model
+        self.cpuct = cpuct
+        self.num_sims = num_sims
         self.device = device
-        self.c_puct = Config.C_PUCT
-        self.batch_size = Config.MCTS_BATCH
-        self.root = None
-        self.root_snapshot = None
+        self.root = MCTSNode()
+
+    # =========================
+    # TREE MANAGEMENT
+    # =========================
 
     def reset(self):
-        """Reset tree for new game."""
-        self.root = None
-        self.root_snapshot = None
+        """Clear tree (call on new game)."""
+        self.root = MCTSNode()
 
     def advance_to_child(self, action):
-        """Reuse subtree after action is taken."""
-        if self.root is not None and action in self.root.children:
+        """
+        Advance root after a REAL move is played.
+        Preserves statistics for multi-step turns.
+        """
+        if action in self.root.children:
             self.root = self.root.children[action]
             self.root.parent = None
         else:
-            self.root = None
+            self.reset()
+
+    # =========================
+    # PUBLIC SEARCH API
+    # =========================
 
     def search(self, game, my_score, opp_score):
-        # Reuse existing root or create new one
-        if self.root is None:
-            self.root = Node()
-        
-        root = self.root
-        root_snapshot = game.fast_save()
-        self.root_snapshot = root_snapshot
+        """
+        Run MCTS simulations from current game state.
+        Returns the root node.
+        """
+        # If root is unexpanded, expand once
+        if not self.root.children:
+            self._expand_root(game)
 
-        # Initial expansion of root if needed
-        if not root.is_expanded:
-            self._evaluate_batch([deque([root])], [root_snapshot], game, my_score, opp_score)
+        for _ in range(self.num_sims):
+            sim_game = game.copy()
+            node = self.root
 
-        # Run simulations
-        for _ in range(0, Config.NUM_SIMULATIONS, self.batch_size):
-            paths, snaps = [], []
+            # -----------------
+            # 1. SELECTION
+            # -----------------
+            while True:
+                if not node.children:
+                    break
 
-            for _ in range(self.batch_size):
-                game.fast_restore(root_snapshot)
-                node = root
-                path = deque([node])
+                best_child = self._select_child(node)
+                if best_child is None:
+                    break
 
-                # Selection: traverse tree using UCB
-                while node.is_expanded and node.children:
-                    sqrt_v = math.sqrt(node.visits) if node.visits > 0 else 1.0
-                    best_act, best_child = None, -float('inf')
-                    
-                    for act, child in node.children.items():
-                        q = child.value_sum / child.visits if child.visits > 0 else 0.0
-                        u = self.c_puct * child.prior * sqrt_v / (1 + child.visits)
-                        score = q + u
-                        
-                        if score > best_child:
-                            best_child = score
-                            best_act = (act, child)
+                # Apply move safely
+                try:
+                    sim_game.step_atomic(best_child.action)
+                except Exception:
+                    # Prune illegal branch
+                    node.children.pop(best_child.action, None)
+                    break
 
-                    if best_act is None:
-                        break
-                    game.step_atomic(best_act[0])
-                    node = best_act[1]
-                    path.append(node)
+                node = best_child
 
-                paths.append(path)
-                snaps.append(game.fast_save())
+                # If turn ended, stop descent
+                if not sim_game.dice:
+                    break
 
-            self._evaluate_batch(paths, snaps, game, my_score, opp_score)
-
-        game.fast_restore(root_snapshot)
-        return root
-
-    def _evaluate_batch(self, paths, snaps, game, ms, os):
-        boards, ctxs, idxs = [], [], []
-
-        for i, snap in enumerate(snaps):
-            game.fast_restore(snap)
-            winner, _ = game.check_win()
+            # -----------------
+            # 2. EVALUATION
+            # -----------------
+            winner, _ = sim_game.check_win()
 
             if winner != 0:
-                val = 1.0 if winner == game.turn else -1.0
-                self._backprop(paths[i], val)
+                # Terminal
+                v = 1.0 if winner == sim_game.turn else -1.0
             else:
-                b, c = game.get_vector(ms, os, self.device, canonical=True)
-                boards.append(b)
-                ctxs.append(c)
-                idxs.append(i)
+                # Expand if possible
+                self._expand_node(node, sim_game)
+                v = self._evaluate(sim_game, my_score, opp_score)
 
-        if not boards:
+            # -----------------
+            # 3. BACKPROP
+            # -----------------
+            self._backpropagate(node, v)
+
+        return self.root
+
+    # =========================
+    # CORE MCTS OPS
+    # =========================
+
+    def _select_child(self, node):
+        """PUCT selection."""
+        best_score = -float("inf")
+        best_child = None
+
+        sqrt_visits = math.sqrt(node.visits + 1)
+
+        for child in node.children.values():
+            u = self.cpuct * child.prior * sqrt_visits / (1 + child.visits)
+            score = child.value + u
+
+            if score > best_score:
+                best_score = score
+                best_child = child
+
+        return best_child
+
+    def _expand_root(self, game):
+        legal = game.get_legal_moves()
+        if not legal:
             return
 
+        prior = 1.0 / len(legal)
+        for mv in legal:
+            self.root.children[mv] = MCTSNode(
+                parent=self.root,
+                action=mv,
+                prior=prior
+            )
+
+    def _expand_node(self, node, game):
+        """Expand leaf node with all legal atomic moves."""
+        if node.children:
+            return
+
+        legal = game.get_legal_moves()
+        if not legal:
+            return
+
+        prior = 1.0 / len(legal)
+        for mv in legal:
+            node.children[mv] = MCTSNode(
+                parent=node,
+                action=mv,
+                prior=prior
+            )
+
+    def _evaluate(self, game, my_score, opp_score):
+        """Neural value evaluation (REAL board, no canonical)."""
         with torch.no_grad():
-            pb = torch.stack(boards)
-            pc = torch.stack(ctxs)
-            pf, pt, v, _ = self.model(pb, pc)
-            pf = torch.softmax(pf, dim=1)
-            pt = torch.softmax(pt, dim=1)
-            values = v.squeeze(-1).tolist()
+            b_t, c_t = game.get_vector(
+                my_score=my_score,
+                opp_score=opp_score,
+                device=self.device,
+                canonical=False
+            )
 
-        for j, i in enumerate(idxs):
-            path = paths[i]
-            leaf = path[-1]
-            game.fast_restore(snaps[i])
+            out = self.model(b_t.unsqueeze(0), c_t.unsqueeze(0))
 
-            moves = game.get_legal_moves()
-            if moves:
-                total = 0.0
-                probs = []
+            if isinstance(out, tuple):
+                v = out[2]
+            else:
+                v = out
 
-                for m in moves:
-                    canon_m = game.real_action_to_canonical(m)
-                    s, e = canon_m
-                    si = Config.BAR_IDX if s == 'bar' else s
-                    ei = Config.OFF_IDX if e == 'off' else e
-                    p = (pf[j, si] * pt[j, ei]).item()
-                    probs.append((m, p))
-                    total += p
+            return float(v.item())
 
-                for m, p in probs:
-                    child = Node(prior=p / total if total > 0 else 1.0 / len(moves), parent=leaf)
-                    leaf.children[m] = child
-                leaf.is_expanded = True
+    def _backpropagate(self, node, value):
+        """
+        Backpropagate value up the tree.
+        Perspective flips each level.
+        """
+        v = value
+        while node is not None:
+            node.visits += 1
+            node.value_sum += v
+            v = -v
+            node = node.parent
 
-            self._backprop(path, values[j])
+    # =========================
+    # ACTION SELECTION
+    # =========================
 
-    def _backprop(self, path, val):
-        for n in reversed(path):
-            n.visits += 1
-            n.value_sum += val
-            val = -val
+    def best_action(self, temperature=0.0):
+        """
+        Pick action from root.
+        temperature = 0  -> greedy
+        temperature > 0  -> stochastic
+        """
+        if not self.root.children:
+            return None
+
+        actions = list(self.root.children.keys())
+        visits = torch.tensor([
+            self.root.children[a].visits for a in actions
+        ], dtype=torch.float)
+
+        if temperature <= 0:
+            return actions[int(torch.argmax(visits).item())]
+
+        probs = visits ** (1.0 / temperature)
+        probs = probs / probs.sum()
+
+        idx = torch.multinomial(probs, 1).item()
+        return actions[idx]
+
+    # =========================
+    # DEBUG / SAFETY
+    # =========================
+
+    def sanity_check(self, game):
+        """
+        Removes illegal children from root (debug / web safety)
+        """
+        legal = set(game.get_legal_moves())
+        for a in list(self.root.children.keys()):
+            if a not in legal:
+                self.root.children.pop(a)

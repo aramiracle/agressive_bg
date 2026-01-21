@@ -1,5 +1,6 @@
 # Kivy-based Backgammon UI - Consistent with ws_server.py and bg_engine.py
 # Desktop alternative to the HTML WebSocket client
+# FIXED: Proper MCTS tree management and dice handling
 
 import threading
 import os
@@ -194,6 +195,8 @@ class BackgammonBoard(Widget):
         self.has_rolled = False
         self.selected_index = None
         self.legal_moves = []
+        if self.mcts:
+            self.mcts.reset()
         self.redraw()
 
     def new_game(self):
@@ -205,6 +208,8 @@ class BackgammonBoard(Widget):
         self.has_rolled = False
         self.selected_index = None
         self.legal_moves = []
+        if self.mcts:
+            self.mcts.reset()
         self.redraw()
 
     def _update_crawford_status(self):
@@ -472,6 +477,7 @@ class BackgammonBoard(Widget):
         return False
 
     def handle_click(self, index):
+        """FIXED: Properly recalculates legal moves after each move."""
         # 1. Execute move if clicking on a legal destination
         if index in self.legal_moves and self.selected_index is not None:
             winner, mult = self.engine.step_atomic((self.selected_index, index))
@@ -484,10 +490,24 @@ class BackgammonBoard(Widget):
                     self.game_screen.update_status(status)
                     self.game_screen.update_score_display()
             
-            self.redraw()
+            # FIXED: Update dice display and check if more moves available
             if hasattr(self, 'game_screen'):
                 self.game_screen.dice_widget.set_dice(self.engine.dice)
+                
+                # If no dice left, don't allow more selections
+                if not self.engine.dice:
+                    self.game_screen.update_status("No dice left - End your turn")
+                else:
+                    # Check if any legal moves remain
+                    remaining_legal = self.engine.get_legal_moves()
+                    if not remaining_legal:
+                        self.game_screen.update_status("No legal moves - End your turn")
+                    else:
+                        self.game_screen.update_status(f"Dice: {self.engine.dice} - Continue moving")
+                
                 self.game_screen.update_buttons()
+            
+            self.redraw()
             return
 
         # 2. Select source
@@ -524,7 +544,7 @@ class BackgammonBoard(Widget):
         threading.Thread(target=_load, daemon=True).start()
 
     def run_ai(self, finished_callback):
-        """Run AI for the current player (matches ws_server.py ai_move)"""
+        """FIXED: Properly uses engine state for MCTS and advances tree."""
         if not self.model or not self.mcts:
             if hasattr(self, 'game_screen'):
                 self.game_screen.update_status("⚠️ No model loaded!")
@@ -542,33 +562,38 @@ class BackgammonBoard(Widget):
                     Clock.schedule_once(lambda dt: self._update_ui_dice())
                     time.sleep(0.3)
                 
+                # Get match scores for MCTS
+                my_score = self.engine.match_scores.get(self.engine.turn, 0)
+                opp_score = self.engine.match_scores.get(-self.engine.turn, 0)
+                
                 # Make moves until dice exhausted
                 while self.engine.dice and not self.game_over:
                     legal = self.engine.get_legal_moves()
                     if not legal:
+                        self.engine.dice = []  # Clear dice if stuck
                         break
                     
-                    # Use MCTS to find best move
-                    root = self.mcts.search(
-                        self.engine.copy(),
-                        self.engine.match_scores.get(self.engine.turn, 0),
-                        self.engine.match_scores.get(-self.engine.turn, 0)
-                    )
+                    # FIXED: Use real engine for MCTS search, not copy
+                    root = self.mcts.search(self.engine, my_score, opp_score)
                     
                     if root.children:
+                        # Deterministic: always pick move with highest visits (no randomness)
                         best_move = max(root.children.items(), key=lambda x: x[1].visits)[0]
                     else:
+                        # Fallback: no MCTS children, use first legal move
                         best_move = legal[0]
                     
-                    # Apply move
+                    # Apply move to engine
                     winner, mult = self.engine.step_atomic(best_move)
+                    
+                    # FIXED: Advance MCTS tree to the child we just moved to
+                    self.mcts.advance_to_child(best_move)
                     
                     Clock.schedule_once(lambda dt: self.redraw())
                     Clock.schedule_once(lambda dt: self._update_ui_dice())
                     
                     if winner != 0:
                         status = self._handle_game_win(winner, mult)
-                        # Call finished_callback even on win so autoplay continues
                         Clock.schedule_once(lambda dt, s=status: self._on_ai_win(s, finished_callback))
                         return
                     
@@ -579,6 +604,15 @@ class BackgammonBoard(Widget):
                 self.engine.switch_turn()
                 self.has_rolled = False
                 
+                # FIXED: Reset MCTS tree when turn ends
+                self.mcts.reset()
+                
+                Clock.schedule_once(lambda dt: finished_callback())
+            except Exception as e:
+                print(f"AI Error: {e}")
+                import traceback
+                traceback.print_exc()
+                self.is_ai_thinking = False
                 Clock.schedule_once(lambda dt: finished_callback())
             finally:
                 self.is_ai_thinking = False
@@ -926,6 +960,10 @@ class GameScreen(BoxLayout):
         self.board.selected_index = None
         self.board.legal_moves = []
         
+        # Reset MCTS tree on turn end
+        if self.board.mcts:
+            self.board.mcts.reset()
+        
         self.dice_widget.set_dice([])
         turn_name = "White" if self.board.engine.turn == 1 else "Black"
         self.update_status(f"{turn_name}'s turn")
@@ -1003,4 +1041,3 @@ class BackgammonApp(App):
 
 if __name__ == '__main__':
     BackgammonApp().run()
-
