@@ -359,7 +359,7 @@ def train():
 
             pbar.set_postfix({
                 'loss': f'{loss:.4f}',
-                'gnorm': f'{gnorm:.2f}',
+                'gnorm': f'{gnorm:.3f}',
                 'elo': f'{current_elo:.0f}',
                 'buffer': f'{buf_fill:.1f}%'
             })
@@ -391,8 +391,7 @@ def train():
                             model,
                             best_model,
                             num_eval_self,
-                            device,
-                            show_progress=True
+                            device
                         )
                         wins_total += w
                         games_total += t
@@ -405,8 +404,7 @@ def train():
                             model,
                             baseline_model,
                             num_eval_baseline,
-                            device,
-                            show_progress=True
+                            device
                         )
                         wins_total += w
                         games_total += t

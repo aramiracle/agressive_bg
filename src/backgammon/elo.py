@@ -1,7 +1,9 @@
 """ELO rating system for model evaluation."""
 
-from tqdm import tqdm
 import torch
+import torch.multiprocessing as mp
+from functools import partial
+from tqdm import tqdm
 from src.backgammon.config import Config
 from src.backgammon.mcts import MCTS
 
@@ -72,25 +74,49 @@ def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=1000):
 
     return 0.5 # Draw/Timeout
 
-def evaluate_vs_opponent(game, model_a, model_b, num_games, device, show_progress=False):
-    """Evaluate model_a against model_b."""
+def _worker_play_game(game_instance, model_a, model_b, device, i):
+    """
+    Each worker gets a reference to the shared models in RAM.
+    """
+    # 1. Critical for CPU performance: prevent thread oversubscription
+    torch.set_num_threads(1)
+    
+    # 2. Local MCTS initialization
     mcts_a = MCTS(model_a, device=device)
     mcts_b = MCTS(model_b, device=device)
-
-    wins = 0.0
-    games_played = 0
     
-    iterable = range(num_games)
-    if show_progress:
-        iterable = tqdm(iterable, desc="ELO Evaluation", dynamic_ncols=True, leave=False)
+    a_is_white = (i % 2 == 0)
+    
+    # play_single_game handles game.reset()
+    return play_single_game(game_instance, mcts_a, mcts_b, a_is_white)
 
-    for i in iterable:
-        a_is_white = (i % 2 == 0)
-        result = play_single_game(game, mcts_a, mcts_b, a_is_white)
-        wins += result
-        games_played += 1
-        
-        if show_progress:
-            iterable.set_postfix({'Wins': f'{wins:.1f}/{games_played}'})
+def evaluate_vs_opponent(game, model_a, model_b, num_games, device='cpu', num_processes=None):
+    if num_processes is None:
+        num_processes = mp.cpu_count()
 
-    return wins, games_played
+    # CRITICAL: Move models to CPU and move to SHARED MEMORY
+    model_a.to('cpu').eval()
+    model_b.to('cpu').eval()
+    model_a.share_memory()  # No more pickling overhead!
+    model_b.share_memory()
+
+    # Use 'spawn' to ensure a clean state and avoid deadlocks
+    # This is the recommended method for PyTorch multiprocessing
+    ctx = mp.get_context('spawn')
+    
+    # Partial freezes the objects that don't change
+    worker_func = partial(_worker_play_game, game, model_a, model_b, 'cpu')
+    
+    wins = 0.0
+    with ctx.Pool(processes=num_processes) as pool:
+        # imap_unordered makes the tqdm bar update smoothly
+        results = list(tqdm(
+            pool.imap_unordered(worker_func, range(num_games)), 
+            total=num_games, 
+            desc=f"Parallel ELO ({num_processes} cores)",
+            dynamic_ncols=True,
+            leave=False
+        ))
+
+    wins = sum(results)
+    return wins, num_games
