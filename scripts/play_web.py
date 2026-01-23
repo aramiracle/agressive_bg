@@ -19,6 +19,7 @@ from backgammon.engine import BackgammonGame
 from backgammon.mcts import MCTS
 from backgammon.model import get_model
 from backgammon.config import Config
+from backgammon.utils import get_learned_cube_decision
 
 
 # =========================
@@ -43,6 +44,7 @@ class BackgammonServer:
         self.game_mode = "human_vs_ai"  # human_vs_ai, ai_vs_human, ai_vs_ai
         self.game_over = False
         self.winner = 0
+        self.waiting_for_cube_decision = False
         self.has_rolled = False  # Track if current player has rolled
         self.match_target = Config.MATCH_TARGET
         
@@ -161,7 +163,8 @@ class BackgammonServer:
                 "dice": list(self.game.dice) if self.game.dice else [],
                 "cube_value": self.game.cube,
                 "cube_owner": self.game.cube_owner,
-                "can_double": self.can_offer_double(),
+                "waiting_for_cube": self.waiting_for_cube_decision,
+                "can_double": self.can_offer_double() and not self.waiting_for_cube_decision,
                 "legal_moves": legal_moves,
                 "status": status,
                 "game_over": self.game_over,
@@ -336,6 +339,43 @@ class BackgammonServer:
 
         return True
 
+    def offer_double(self):
+        """Initiates the doubling process."""
+        if not self.can_offer_double():
+            return self.serialize("Cannot double right now.")
+        
+        self.waiting_for_cube_decision = True
+        # We switch the 'turn' visually so the UI knows who must decide
+        self.game.turn *= -1 
+        return self.serialize("Double offered! Take or Pass?")
+
+    def take_double(self):
+        """Player accepts the double."""
+        if not self.waiting_for_cube_decision:
+            return self.serialize("No double offered.")
+
+        # Revert turn to the offerer so apply_double() works correctly
+        self.game.turn *= -1 
+        self.game.apply_double()
+        self.waiting_for_cube_decision = False
+        
+        return self.serialize(f"Double accepted! Cube is now {self.game.cube}")
+
+    def refuse_double(self):
+        """Player refuses (Passes). The game ends immediately."""
+        if not self.waiting_for_cube_decision:
+            return self.serialize("No double offered.")
+
+        # In engine.py, handle_cube_refusal() gives points to the current turn.
+        # Since we flipped the turn in offer_double, the 'offerer' is now -turn.
+        # So we flip back first.
+        self.game.turn *= -1
+        winner, points = self.game.handle_cube_refusal()
+        
+        self.waiting_for_cube_decision = False
+        status = self._handle_game_win(winner, points)
+        return self.serialize(status)
+
     # =====================
     # AI
     # =====================
@@ -365,43 +405,22 @@ class BackgammonServer:
         my_score = self.game.match_scores.get(self.game.turn, 0)
         opp_score = self.game.match_scores.get(-self.game.turn, 0)
 
-        def get_cube_decision_local():
-            board_t, ctx_t = self.game.get_vector(my_score, opp_score, device=DEVICE, canonical=True)
-            with torch.no_grad():
-                _, _, v, cube_logits = self.model(
-                    board_t.unsqueeze(0),
-                    ctx_t.unsqueeze(0)
-                )
-                win_prob = torch.sigmoid(v.squeeze(0)).item()
-
-            cube = max(1, self.game.cube)
-            equity_double = win_prob * (cube * 2) - (1 - win_prob) * (cube * 2)
-            equity_nodouble = win_prob * cube - (1 - win_prob) * cube
-
-            return 1 if (equity_double - equity_nodouble) > Config.CUBE_THERESHOLD else 0
-
         # If AI can offer double
-        if self.can_offer_double():
-            double_choice = get_cube_decision_local()
-            if double_choice == 1:
-                # Offer double
-                await websocket.send(json.dumps(self.serialize("AI offers double!")))
-                
-                # Simulate opponent decision (use equity as proxy)
-                self.game.switch_turn()
-                take_choice = get_cube_decision_local()
-                self.game.switch_turn()
+        if self.waiting_for_cube_decision and self.is_ai_turn():
+            my_score = self.game.match_scores.get(self.game.turn, 0)
+            opp_score = self.game.match_scores.get(-self.game.turn, 0)
 
-                if take_choice == 1:
-                    self.game.apply_double()
-                    await websocket.send(json.dumps(self.serialize(f"AI doubled cube to {self.game.cube}")))
-                else:
-                    winner, points = self.game.handle_cube_refusal()
-                    status = f"Opponent refused double. {('White' if winner==1 else 'Black')} wins {points} points!"
-                    self.game_over = True
-                    self.winner = winner
-                    await websocket.send(json.dumps(self.serialize(status)))
-                    return  # Cube refusal ends turn/game
+            # Taker policy decision
+            take_choice, _ = get_learned_cube_decision(
+                self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
+            )
+
+            await asyncio.sleep(0.5) # Add drama
+            if take_choice == 1:
+                await websocket.send(json.dumps(self.take_double()))
+            else:
+                await websocket.send(json.dumps(self.refuse_double()))
+                return # Game over
 
         # --------------------
         # Roll if not rolled
@@ -491,7 +510,13 @@ class BackgammonServer:
             return None
 
         if t == "double":
-            return self.double()
+            return self.offer_double() # Use our new wrapper
+
+        if t == "take_double":
+            return self.take_double()
+
+        if t == "refuse_double":
+            return self.refuse_double()
 
         if t == "end_turn":
             result = self.end_turn()

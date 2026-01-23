@@ -62,25 +62,40 @@ def collection_worker(args):
 
     return collected
 
-def parallel_collect(mode, model, baseline_model, replay_buffer, total_games):
+# Top-level worker wrapper
+def collect_worker_wrapper(args):
+    return collection_worker(args)
+
+def parallel_collect(mode, model, baseline_model, replay_buffer, total_games, device="cpu"):
+    """
+    Collect games in parallel using imap_unordered (like ELO evaluation)
+    """
     num_workers = mp.cpu_count()
     games_per_worker = max(1, total_games // num_workers)
 
     model_state = model.state_dict()
     baseline_state = baseline_model.state_dict() if baseline_model else None
 
-    # spawn processes
+    # Context for spawn
     ctx = mp.get_context("spawn")
-    with ctx.Pool(num_workers) as pool:
-        args_list = [
-            (mode, model_state, baseline_state, games_per_worker, "cpu")
-            for _ in range(num_workers)
-        ]
-        results = pool.map(collection_worker, args_list)
 
-    # merge into replay buffer
-    for r in results:
-        replay_buffer.extend(r)
+    # Build arguments list
+    args_list = [
+        (mode, model_state, baseline_state, games_per_worker, device)
+        for _ in range(num_workers)
+    ]
+
+    collected = []
+
+    with ctx.Pool(processes=num_workers) as pool:
+        pbar = tqdm(total=total_games, desc=f"Collecting ({mode})", dynamic_ncols=True)
+        for result in pool.imap_unordered(collect_worker_wrapper, args_list):
+            collected.extend(result)
+            pbar.update(len(result))
+        pbar.close()
+
+    # Merge into replay buffer
+    replay_buffer.extend(collected)
 
 # =========================
 # TRAIN LOOP

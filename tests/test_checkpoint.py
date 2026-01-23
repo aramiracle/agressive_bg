@@ -8,8 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src
 
 import torch
 
-INPUT_FILE = "checkpoints_v1/latest_model.pt"
-OUTPUT_FILE = "checkpoints_v1/latest_model.pt"
+INPUT_FILE = "checkpoints_v1/best_model.pt"
+OUTPUT_FILE = "checkpoints_v1/best_model.pt"
 
 
 def test_checkpoint_structure():

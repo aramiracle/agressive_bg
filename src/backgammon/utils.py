@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from src.backgammon.mcts import MCTS
 from src.backgammon.config import Config
-from checkpoint import load_checkpoint
+from src.backgammon.checkpoint import load_checkpoint
 
 
 def move_to_indices(start, end):

@@ -53,21 +53,33 @@ def collection_worker(args):
 # Parallel self-play collection
 # ------------------------------------------------------------
 
-def parallel_collect_self_play(model, replay_buffer, total_games):
+# Top-level wrapper for multiprocessing (picklable)
+def collect_worker_wrapper(args):
+    return collection_worker(args)
+
+
+def parallel_collect_self_play(model, replay_buffer, total_games, device="cpu"):
     """
-    Use all CPU cores to collect self-play games.
+    Parallel self-play collection using imap_unordered with tqdm
     """
     num_workers = mp.cpu_count()
     games_per_worker = max(1, total_games // num_workers)
     model_state = model.state_dict()
 
     ctx = mp.get_context("spawn")
-    with ctx.Pool(num_workers) as pool:
-        args_list = [(model_state, games_per_worker, "cpu") for _ in range(num_workers)]
-        results = pool.map(collection_worker, args_list)
+    args_list = [(model_state, games_per_worker, device) for _ in range(num_workers)]
 
-    for r in results:
-        replay_buffer.extend(r)
+    collected = []
+
+    with ctx.Pool(processes=num_workers) as pool:
+        pbar = tqdm(total=total_games, desc="Collecting (self-play)", dynamic_ncols=True)
+        for result in pool.imap_unordered(collect_worker_wrapper, args_list):
+            collected.extend(result)
+            pbar.update(len(result))
+        pbar.close()
+
+    replay_buffer.extend(collected)
+
 
 # ------------------------------------------------------------
 # TRAIN LOOP
@@ -128,7 +140,7 @@ def train():
                 model.eval()
                 best_model.eval()
 
-                wins, total = evaluate_vs_opponent(game, model, best_model, Config.ELO_EVAL_GAMES, device, True)
+                wins, total = evaluate_vs_opponent(game, model, best_model, Config.ELO_EVAL_GAMES, device)
                 old_elo = current_elo
                 current_elo = update_elo(current_elo, best_elo, wins, total)
                 print(f"  📊 Summary: {wins}/{total} wins | ELO: {old_elo:.0f} -> {current_elo:.0f}")

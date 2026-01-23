@@ -805,6 +805,14 @@ select:focus {
 <!-- STATUS -->
 <div class="panel status" id="status">Connecting to AI...</div>
 
+<div id="cubeOverlay" class="panel" style="display:none; background: linear-gradient(180deg, #5c3a24, #3d2517); border: 3px solid var(--accent); position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 1000; flex-direction: column; gap: 15px; padding: 30px; box-shadow: 0 0 50px rgba(0,0,0,0.8);">
+  <h2 id="cubePrompt" style="margin: 0; color: var(--accent); text-align: center;">Double Offered!</h2>
+  <div style="display: flex; gap: 20px;">
+    <button id="btnTake" class="btn-roll" style="padding: 15px 40px; font-size: 16px;">Take</button>
+    <button id="btnPass" class="btn-new" style="padding: 15px 40px; font-size: 16px;">Pass</button>
+  </div>
+</div>
+
 <!-- BOARD -->
 <div class="board-wrapper">
   <div class="board">
@@ -870,6 +878,29 @@ select:focus {
 ============================ */
 const WS_URL = "ws://localhost:8765";
 let socket = null;
+
+/* ============================
+   CUBE DECISION LISTENER
+============================ */
+const btnTake = document.getElementById("btnTake");
+const btnPass = document.getElementById("btnPass");
+
+btnTake.onclick = () => {
+    send({ type: "take_double" });
+};
+
+btnPass.onclick = () => {
+    if (confirm("Are you sure you want to pass? You will lose the current cube value.")) {
+        send({ type: "refuse_double" });
+    }
+};
+
+// Update the existing btnDouble.onclick to be cleaner
+btnDouble.onclick = () => {
+    if (confirm("Offer to double the stakes?")) {
+        send({ type: "double" });
+    }
+};
 
 /* ============================
    STATE
@@ -1164,6 +1195,9 @@ function renderDice() {
 function applyState(s) {
   const wasGameOver = gameOver;
   const oldCubeValue = cubeValue;
+  const isWaitingForCube = s.waiting_for_cube || false;
+  const cubeOverlay = document.getElementById("cubeOverlay");
+  const cubePrompt = document.getElementById("cubePrompt");
   
   boardState = s.board;
   bar = s.bar;
@@ -1191,6 +1225,18 @@ function applyState(s) {
 
   // Clear selection when state changes
   selectedPoint = null;
+  if (isWaitingForCube) {
+    cubeOverlay.style.display = "flex";
+    // Show who needs to decide based on the current turn
+    cubePrompt.textContent = `${turn === 1 ? "White" : "Black"}: Take or Pass?`;
+    
+    // Disable other controls while deciding
+    btnRoll.disabled = true;
+    btnDouble.disabled = true;
+    btnEnd.disabled = true;
+  } else {
+    cubeOverlay.style.display = "none";
+  }
 
   // Update cube display
   cubeValEl.textContent = cubeValue;
