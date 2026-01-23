@@ -1,9 +1,14 @@
 # Full Trainer vs Baseline (Crawford-safe, MCTS-safe, Engine-compatible)
-"""Train new model vs older baseline version with full cubing, MCTS reuse, and ELO tracking."""
+"""
+Train new model vs older baseline version with full cubing, MCTS reuse, and ELO tracking.
+Features: Mixed-opponent collection, detailed evaluation vs both Best and Baseline models.
+"""
 
 import os
 import torch
 import torch.optim as optim
+import torch.multiprocessing as mp
+
 import random
 from tqdm import tqdm
 
@@ -16,157 +21,66 @@ from src.backgammon.checkpoint import (
     get_model_state_dict, load_model_state_dict
 )
 from src.backgammon.elo import evaluate_vs_opponent, update_elo
-from src.backgammon.utils import move_to_indices
+from src.backgammon.utils import play_one_game,play_vs_baseline, train_batch, load_model_with_config
 from src.backgammon.replay_buffer import get_replay_buffer
-from src.backgammon.trainer import (
-    play_one_game,
-    finalize_history,
-    get_learned_cube_decision,
-    train_batch,
-)
 
-# =========================
-# BASELINE LOADER
-# =========================
+# ------------------------------------------------------------
+# Collection helpers (Self-play + Vs Baseline)
+# ------------------------------------------------------------
 
-def load_model_with_config(config_path, model_path, device):
-    """Load model with its own config without affecting global Config."""
-    import importlib.util
-    from src.backgammon.model import BackgammonTransformer, BackgammonCNN
+def collection_worker(args):
+    """
+    Torch multiprocessing worker for self-play or vs-baseline.
+    Returns list of samples.
+    """
+    mode, model_state, baseline_state, games_per_worker, device = args
 
-    spec = importlib.util.spec_from_file_location("model_config", config_path)
-    config_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config_module)
-    ModelConfig = config_module.Config
+    torch.set_num_threads(1)  # avoid thread oversubscription
 
-    if ModelConfig.MODEL_TYPE == "transformer":
-        model = BackgammonTransformer(config=ModelConfig).to(device)
-    elif ModelConfig.MODEL_TYPE == "cnn":
-        model = BackgammonCNN(config=ModelConfig).to(device)
-    else:
-        raise ValueError(f"Unknown MODEL_TYPE: {ModelConfig.MODEL_TYPE}")
-
-    cp = load_checkpoint(model_path, model, None, device)
-    elo = cp['elo'] if cp else ModelConfig.INITIAL_ELO
+    game = BackgammonGame()
+    model = get_model().to(device)
+    model.load_state_dict(model_state)
     model.eval()
 
-    return model, elo
+    baseline_model = None
+    if baseline_state:
+        baseline_model = get_model().to(device)
+        baseline_model.load_state_dict(baseline_state)
+        baseline_model.eval()
 
+    mcts = MCTS(model, device=device)
+    collected = []
 
-# =========================
-# VS BASELINE GAME LOOP
-# =========================
-
-def play_vs_baseline(game, current_model, baseline_model, mcts_current, device):
-    """
-    Play game: current vs baseline with full cubing support.
-    Only saves training data for current model's decisions.
-    """
-    game.reset()
-    game.set_match_scores(0, 0)
-    current_is_p1 = random.choice([True, False])
-
-    mcts_current.reset()
-    mcts_baseline = MCTS(baseline_model, device=device)
-    history = []
-
-    for _ in range(Config.MAX_GAME_MOVES):
-        winner, _ = game.check_win()
-        if winner != 0: break
-
-        is_current_turn = (game.turn == 1) == current_is_p1
-        active_model = current_model if is_current_turn else baseline_model
-        active_mcts = mcts_current if is_current_turn else mcts_baseline
-        
-        my_score = game.match_scores[game.turn]
-        opp_score = game.match_scores[-game.turn]
-
-        # =========================
-        # LEARNED CUBING PHASE
-        # =========================
-        if game.can_double() and not game.crawford_active:
-            double_choice, d_probs = get_learned_cube_decision(
-                active_model, game, device, my_score, opp_score, stochastic=True
+    for _ in range(games_per_worker):
+        if mode == "self":
+            data, _ = play_one_game(game=game, mcts=mcts, model=model, device=device)
+        else:
+            data, _ = play_vs_baseline(
+                game=game, current_model=model, baseline_model=baseline_model, mcts_current=mcts, device=device
             )
+        collected.extend(data)
 
-            if is_current_turn:
-                board_t, ctx_t = game.get_vector(my_score, opp_score, device='cpu', canonical=True)
-                # Matches trainer.py schema: (board, ctx, action, turn, is_cube, probs)
-                history.append((board_t, ctx_t, None, game.turn, True, d_probs))
+    return collected
 
-            if double_choice == 1:
-                game.switch_turn() 
-                is_responder_current = (game.turn == 1) == current_is_p1
-                resp_model = current_model if is_responder_current else baseline_model
-                
-                take_choice, t_probs = get_learned_cube_decision(
-                    resp_model, game, device, opp_score, my_score, stochastic=True
-                )
+def parallel_collect(mode, model, baseline_model, replay_buffer, total_games):
+    num_workers = mp.cpu_count()
+    games_per_worker = max(1, total_games // num_workers)
 
-                if is_responder_current:
-                    board_t, ctx_t = game.get_vector(opp_score, my_score, device='cpu', canonical=True)
-                    history.append((board_t, ctx_t, None, game.turn, True, t_probs))
+    model_state = model.state_dict()
+    baseline_state = baseline_model.state_dict() if baseline_model else None
 
-                game.switch_turn() 
+    # spawn processes
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(num_workers) as pool:
+        args_list = [
+            (mode, model_state, baseline_state, games_per_worker, "cpu")
+            for _ in range(num_workers)
+        ]
+        results = pool.map(collection_worker, args_list)
 
-                if take_choice == 1:
-                    game.apply_double()
-                else:
-                    winner, points = game.handle_cube_refusal()
-                    current_won = (winner == 1) == current_is_p1
-                    # Use imported finalize_history for reward consistency
-                    return finalize_history(history, current_won, points), current_won
-
-        # =========================
-        # MOVEMENT PHASE
-        # =========================
-        game.roll_dice()
-        while game.dice:
-            legal = game.get_legal_moves()
-            if not legal:
-                game.dice = []
-                break
-
-            root = active_mcts.search(game, 0, 0)
-            if root.children:
-                visits = torch.tensor([c.visits for c in root.children], dtype=torch.float)
-                probs = visits / visits.sum() if visits.sum() > 0 else torch.ones(len(visits))/len(visits)
-                chosen_action = root.children[torch.multinomial(probs, 1).item()].action
-            else:
-                chosen_action = random.choice(legal)
-
-            if is_current_turn:
-                board_t, ctx_t = game.get_vector(game.match_scores[1], game.match_scores[-1], device='cpu', canonical=True)
-                target_f, target_t = torch.zeros(26), torch.zeros(26)
-
-                if root.children:
-                    for i, child in enumerate(root.children):
-                        canon_act = game.real_action_to_canonical(child.action)
-                        s, e = move_to_indices(canon_act[0], canon_act[1])
-                        if 0 <= s < 26: target_f[s] += probs[i]
-                        if 0 <= e < 26: target_t[e] += probs[i]
-                
-                history.append((board_t, ctx_t, None, game.turn, False, (target_f, target_t)))
-
-            game.step_atomic(chosen_action)
-            active_mcts.advance_to_child(chosen_action)
-            if game.check_win()[0] != 0: break
-
-        if game.check_win()[0] == 0:
-            game.switch_turn()
-            mcts_current.reset()
-            mcts_baseline.reset()
-
-    # =========================
-    # FINALIZATION
-    # =========================
-    winner, mult = game.check_win()
-    total_points = mult * game.cube
-    current_won = (winner == 1) == current_is_p1
-
-    # centralized finalize_history handles the reward sign and match normalization
-    return finalize_history(history, current_won, total_points), current_won
-
+    # merge into replay buffer
+    for r in results:
+        replay_buffer.extend(r)
 
 # =========================
 # TRAIN LOOP
@@ -182,6 +96,7 @@ def train():
     optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
+    # Load local checkpoints
     cp_latest = load_checkpoint(latest_path, model, optimizer, device)
     train_step = cp_latest['step'] if cp_latest else 0
     current_elo = cp_latest['elo'] if cp_latest else Config.INITIAL_ELO
@@ -189,7 +104,7 @@ def train():
     cp_best = load_checkpoint(best_path, best_model, None, device)
     best_elo = cp_best['elo'] if cp_best else current_elo
 
-    # Load Baseline
+    # Load External Baseline
     baseline_path = os.path.join(os.path.dirname(checkpoint_dir), Config.BASELINE_DIR, Config.BASELINE_MODEL_NAME)
     baseline_config_path = os.path.join(os.path.dirname(checkpoint_dir), Config.BASELINE_DIR, 'config.py')
 
@@ -200,61 +115,120 @@ def train():
         baseline_model, baseline_elo = load_model_with_config(baseline_config_path, baseline_path, device)
         print(f"✅ Baseline loaded: {baseline_path} (ELO: {baseline_elo:.0f})")
         use_baseline = True
+    else:
+        print(f"⚠️ No baseline found at {baseline_path}, proceeding with self-play only.")
 
     replay_buffer = get_replay_buffer(int(Config.BUFFER_SIZE * 0.6), prioritized=True)
     game = BackgammonGame()
 
+    # Determine initial phase
+    if getattr(Config, 'BASELINE_SWITCH_ON_SURPASS', True):
+        phase = "vs_baseline" if (use_baseline and current_elo < baseline_elo) else "self_play"
+    else:
+        phase = "vs_baseline" if use_baseline else "self_play"
+
+    print(f"\n🎮 Training Start: Current ELO={current_elo:.0f}, Best ELO={best_elo:.0f}")
+    if use_baseline:
+        print(f"   Baseline ELO={baseline_elo:.0f}, Phase={phase}")
+
     pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Overall Training")
 
     while train_step < Config.TRAIN_STEPS:
-        # COLLECT
-        model.eval()
-        mcts = MCTS(model, device=device)
+        # -------- COLLECTION PHASE --------
         baseline_ratio = Config.BASELINE_SELF_PLAY_RATIO
 
-        phase = "vs_baseline" if (use_baseline and current_elo < baseline_elo) else "self_play"
-        num_self = int(Config.GAMES_PER_ITERATION * (baseline_ratio if phase == "vs_baseline" else 1.0))
-        num_baseline = Config.GAMES_PER_ITERATION - num_self
+        if phase == "vs_baseline":
+            num_self = int(Config.GAMES_PER_ITERATION * baseline_ratio)
+            num_baseline = Config.GAMES_PER_ITERATION - num_self
+        else:
+            num_self = Config.GAMES_PER_ITERATION
+            num_baseline = 0
 
-        for _ in range(num_self):
-            data, _ = play_one_game(game, mcts, model, device)
-            replay_buffer.extend(data)
+        if num_self > 0:
+            parallel_collect("self", model, None, replay_buffer, num_self)
 
         if use_baseline and num_baseline > 0:
-            for _ in range(num_baseline):
-                data, _ = play_vs_baseline(game, model, baseline_model, mcts, device)
-                replay_buffer.extend(data)
+            parallel_collect("baseline", model, baseline_model, replay_buffer, num_baseline)
 
-        if len(replay_buffer) < Config.BATCH_SIZE: continue
-
-        # TRAIN
+        # -------- TRAINING PHASE --------
         model.train()
         for _ in range(Config.STEPS_PER_ITERATION):
-            # This calls the patched train_batch in trainer.py with NaN protection and Smoothing
             loss, gnorm = train_batch(model, optimizer, replay_buffer, Config.BATCH_SIZE, device, scaler)
             
             train_step += 1
             pbar.update(1)
-            pbar.set_postfix({'loss': f'{loss:.1f}', 'elo': f'{current_elo:.0f}', 'gnorm': f'{gnorm:.3f}'})
+            
+            buf_fill = (len(replay_buffer) / Config.BUFFER_SIZE) * 100
+            pbar.set_postfix({
+                'loss': f'{loss:.2f}', 
+                'elo': f'{current_elo:.0f}', 
+                'gnorm': f'{gnorm:.2f}',
+                'buf': f'{buf_fill:.1f}%'
+            })
 
-            # EVALUATE
+            # -------- EVALUATION PHASE --------
             if train_step % Config.ELO_EVAL_INTERVAL == 0:
+                print(f"\n\n🎯 ELO Evaluation at Step {train_step} (Phase: {phase})")
                 model.eval()
-                wins, total = evaluate_vs_opponent(game, model, best_model, Config.ELO_EVAL_GAMES, device)
-                
-                # Dynamic opponent ELO for calculation
-                opp_elo = (best_elo * 0.5 + baseline_elo * 0.5) if (phase == "vs_baseline") else best_elo
-                current_elo = update_elo(current_elo, opp_elo, wins, total)
+                best_model.eval()
 
+                # Determine Eval split
+                eval_total = Config.ELO_EVAL_GAMES
+                if phase == "vs_baseline":
+                    eval_self = int(eval_total * baseline_ratio)
+                    eval_base = eval_total - eval_self
+                else:
+                    eval_self = eval_total
+                    eval_base = 0
+
+                wins_total, games_total = 0, 0
+                
+                # 1. Eval vs Best
+                if eval_self > 0:
+                    w, t = evaluate_vs_opponent(game, model, best_model, eval_self, device)
+                    wins_total += w
+                    games_total += t
+                    print(f"  → vs Best: {w}/{t} wins ({(w/t)*100:.1f}%)")
+
+                # 2. Eval vs Baseline
+                if eval_base > 0 and baseline_model is not None:
+                    w, t = evaluate_vs_opponent(game, model, baseline_model, eval_base, device)
+                    wins_total += w
+                    games_total += t
+                    print(f"  → vs Baseline: {w}/{t} wins ({(w/t)*100:.1f}%)")
+
+                # Update ELO
+                old_elo = current_elo
+                if phase == "vs_baseline":
+                    # Weighted opponent ELO for the anchor
+                    opp_elo = (best_elo * baseline_ratio) + (baseline_elo * (1 - baseline_ratio))
+                else:
+                    opp_elo = best_elo
+
+                current_elo = update_elo(current_elo, opp_elo, wins_total, games_total)
+                print(f"  📊 Summary: {wins_total}/{games_total} wins | ELO: {old_elo:.0f} -> {current_elo:.0f}")
+
+                # Check for new Best
                 if current_elo > best_elo:
+                    print(f"  🏆 NEW BEST MODEL (ELO: {current_elo:.0f})")
                     best_elo = current_elo
                     load_model_state_dict(best_model, get_model_state_dict(model))
                     save_checkpoint(model, optimizer, train_step, best_elo, loss, best_path)
                 
                 save_checkpoint(model, optimizer, train_step, current_elo, loss, latest_path)
+
+                # Phase transition logic
+                if (phase == "vs_baseline" and current_elo >= baseline_elo and 
+                    getattr(Config, 'BASELINE_SWITCH_ON_SURPASS', True)):
+                    phase = "self_play"
+                    print(f"  🎯 Surpassed baseline! Switching to 100% self-play.")
+
                 model.train()
+                print("-" * 50)
 
     pbar.close()
+    print("\n✅ Training complete!")
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)  # ensure safe multiprocessing
     train()

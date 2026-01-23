@@ -23,6 +23,7 @@ class Config:
 
     # Game
     MATCH_TARGET = 7
+    CUBE_THERESHOLD = 0.15
 
     # Rewards
     R_WIN = 1.0
@@ -31,15 +32,15 @@ class Config:
 
     # Model
     MODEL_TYPE = "transformer"  # "transformer" or "cnn"
-    D_MODEL = 64
+    D_MODEL = 128
     DROPOUT = 0.1
-    VALUE_HIDDEN = 32
+    VALUE_HIDDEN = 64
     MAX_SEQ_LEN = BOARD_SEQ_LEN + 1
     
     # Transformer specific
-    N_HEAD = 4
-    N_LAYERS = 3
-    DIM_FEEDFORWARD = 128
+    N_HEAD = 8
+    N_LAYERS = 5
+    DIM_FEEDFORWARD = 256
     
     # CNN specific
     CNN_BLOCKS = 4
@@ -47,7 +48,7 @@ class Config:
 
     # MCTS
     NUM_SIMULATIONS = 128
-    MCTS_BATCH = 16
+    MCTS_BATCH = 32
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
@@ -57,14 +58,16 @@ class Config:
     ELO_K = 8
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 2500
-    ELO_EVAL_GAMES = 30
+    ELO_EVAL_GAMES = 20
 
     # Training
-    GAMES_PER_ITERATION = 5
+    GAMES_PER_ITERATION = 4
     STEPS_PER_ITERATION = 250
-    BATCH_SIZE = 1024 if torch.cuda.is_available() else 128
-    BUFFER_SIZE = 8192
-    LR = 5e-4
+    BATCH_SIZE = 1024 if torch.cuda.is_available() else 256
+    BUFFER_SIZE = 262144
+    KL_EPSILON = 1e-4
+    LABEL_SMOOTHING = 0.1
+    LR = 1e-4
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-5
     TRAIN_STEPS = 1000000
@@ -78,3 +81,5 @@ class Config:
     CHECKPOINT_DIR = "checkpoints"
     BASELINE_DIR = "checkpoints_v1"
     BASELINE_MODEL_NAME = "best_model.pt"
+    BASELINE_SWITCH_ON_SURPASS = True
+    BASELINE_SELF_PLAY_RATIO = 0.5

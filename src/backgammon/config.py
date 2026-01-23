@@ -58,16 +58,16 @@ class Config:
     ELO_K = 8
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 2500
-    ELO_EVAL_GAMES = 20
+    ELO_EVAL_GAMES = 32
 
     # Training
-    GAMES_PER_ITERATION = 4
+    GAMES_PER_ITERATION = 8
     STEPS_PER_ITERATION = 250
     BATCH_SIZE = 1024 if torch.cuda.is_available() else 256
     BUFFER_SIZE = 262144
-    KL_EPSILON = 1e-4
-    LABEL_SMOOTHING = 0.1
-    LR = 1e-4
+    KL_EPSILON = 1e-5
+    LABEL_SMOOTHING = 0.05
+    LR = 5e-6
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-5
     TRAIN_STEPS = 1000000
@@ -78,7 +78,7 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Checkpoints
-    CHECKPOINT_DIR = "checkpoints"
+    CHECKPOINT_DIR = "checkpoints_v1"
     BASELINE_DIR = "checkpoints_v1"
     BASELINE_MODEL_NAME = "best_model.pt"
     BASELINE_SWITCH_ON_SURPASS = True

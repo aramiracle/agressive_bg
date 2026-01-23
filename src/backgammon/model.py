@@ -259,6 +259,6 @@ def get_model():
     else:
         raise ValueError(f"Unknown MODEL_TYPE: {Config.MODEL_TYPE}")
     
-    print(f"📦 Created {Config.MODEL_TYPE.upper()} model with {model.count_parameters():,} parameters")
+    # print(f"📦 Created {Config.MODEL_TYPE.upper()} model with {model.count_parameters():,} parameters")
     return model
 
