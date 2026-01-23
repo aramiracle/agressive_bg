@@ -1,4 +1,4 @@
-"""ELO rating system for model evaluation."""
+"""ELO rating system for model evaluation with Learned Cubing."""
 
 import torch
 import torch.multiprocessing as mp
@@ -23,100 +23,126 @@ def update_elo(current_elo, opponent_elo, wins, total_games):
     delta = max(-Config.ELO_SCALE, min(Config.ELO_SCALE, delta))
     return current_elo + delta * total_games
 
-def play_single_game(game, mcts_a, mcts_b, a_is_white, max_moves=1000):
-    """
-    Play a single game between two MCTS agents.
-    """
+def get_cube_action(model, game, device, my_score=0, opp_score=0):
+    """Consult the model's learned cube policy."""
+    # Canonical=True ensures the model sees the board from its own perspective
+    board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
+    
+    with torch.no_grad():
+        # Policy head outputs: [Move_Probs, Value, Cube_Logits]
+        _, _, _, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
+        
+        # In evaluation, we take the most confident action (Argmax)
+        # Index 0: No Double / Drop
+        # Index 1: Double / Take
+        action = torch.argmax(cube_logits.squeeze(0)).item()
+    return action
+
+def play_single_game(game, model_a, model_b, mcts_a, mcts_b, a_is_white, device, 
+                     score_a, score_b, max_moves=1000):
+    """Plays a single game within a match context."""
     game.reset()
     mcts_a.reset()
     mcts_b.reset()
     
     move_count = 0
-
     while move_count < max_moves:
-        winner, _ = game.check_win()
-        if winner != 0:
-            if a_is_white:
-                return 1.0 if winner == 1 else 0.0
-            else:
-                return 1.0 if winner == -1 else 0.0
+        winner, points = game.check_win()
+        if winner != 0: break
 
+        # Determine perspective
+        is_a_turn = (game.turn == 1 and a_is_white) or (game.turn == -1 and not a_is_white)
+        p1_score, p2_score = (score_a, score_b) if is_a_turn else (score_b, score_a)
+        
+        active_model = model_a if is_a_turn else model_b
+        opp_model = model_b if is_a_turn else model_a
+        active_mcts = mcts_a if is_a_turn else mcts_b
+
+        # ---------------- 1. Learned Doubling ----------------
+        if game.can_double():
+            if get_cube_action(active_model, game, device, p1_score, p2_score) == 1:
+                game.switch_turn() # Opponent's turn to decide Take/Drop
+                take_decision = get_cube_action(opp_model, game, device, p2_score, p1_score)
+                game.switch_turn() 
+
+                if take_decision == 1:
+                    game.apply_double()
+                else:
+                    # Opponent drops: winner gets current cube value
+                    win_side, cube_val = game.handle_cube_refusal()
+                    return win_side, cube_val
+
+        # ---------------- 2. Movement ----------------
         game.roll_dice()
-
         while game.dice:
             legal = game.get_legal_moves()
-            if not legal:
-                break
-
-            a_turn = (game.turn == 1 and a_is_white) or (game.turn == -1 and not a_is_white)
-            mcts = mcts_a if a_turn else mcts_b
+            if not legal: break
             
-            root = mcts.search(game, 0, 0)
-
-            if root.children:
-                # Fixed: Accessing object attributes .visits and .action
-                best_child = max(root.children, key=lambda node: node.visits)
-                action = best_child.action
-            else:
-                action = legal[0]
-
+            # Pass scores to MCTS so search values reflect match equity
+            root = active_mcts.search(game, p1_score, p2_score) 
+            action = max(root.children, key=lambda n: n.visits).action
+            
             game.step_atomic(action)
-            mcts.advance_to_child(action)
+            active_mcts.advance_to_child(action)
             move_count += 1
-            
-            if game.check_win()[0] != 0:
-                break
+            if game.check_win()[0] != 0: break
 
         if game.check_win()[0] == 0:
             game.switch_turn()
-            mcts_a.reset()
-            mcts_b.reset()
 
-    return 0.5 # Draw/Timeout
+    winner, points = game.check_win()
+    return winner, points * game.cube
 
-def _worker_play_game(game_instance, model_a, model_b, device, i):
-    """
-    Each worker gets a reference to the shared models in RAM.
-    """
-    # 1. Critical for CPU performance: prevent thread oversubscription
+def _worker_play_match(game_instance, model_a, model_b, device, i):
     torch.set_num_threads(1)
-    
-    # 2. Local MCTS initialization
     mcts_a = MCTS(model_a, device=device)
     mcts_b = MCTS(model_b, device=device)
     
+    score_a, score_b = 0, 0
+    target = Config.MATCH_TARGET # e.g., 7 or 11
     a_is_white = (i % 2 == 0)
-    
-    # play_single_game handles game.reset()
-    return play_single_game(game_instance, mcts_a, mcts_b, a_is_white)
+
+    while score_a < target and score_b < target:
+        winner, points = play_single_game(
+            game_instance, model_a, model_b, mcts_a, mcts_b, 
+            a_is_white, device, score_a, score_b
+        )
+        
+        if (winner == 1 and a_is_white) or (winner == -1 and not a_is_white):
+            score_a += points
+        else:
+            score_b += points
+            
+    return 1.0 if score_a >= target else 0.0
 
 def evaluate_vs_opponent(game, model_a, model_b, num_games, device='cpu', num_processes=None):
     if num_processes is None:
         num_processes = mp.cpu_count()
 
-    # CRITICAL: Move models to CPU and move to SHARED MEMORY
-    model_a.to('cpu').eval()
-    model_b.to('cpu').eval()
-    model_a.share_memory()  # No more pickling overhead!
+    # Move models to device and share memory for multiprocessing efficiency
+    model_a.to(device).eval()
+    model_b.to(device).eval()
+    model_a.share_memory()
     model_b.share_memory()
 
-    # Use 'spawn' to ensure a clean state and avoid deadlocks
-    # This is the recommended method for PyTorch multiprocessing
     ctx = mp.get_context('spawn')
-    
-    # Partial freezes the objects that don't change
-    worker_func = partial(_worker_play_game, game, model_a, model_b, 'cpu')
+    worker_func = partial(_worker_play_match, game, model_a, model_b, device)
     
     wins = 0.0
-    with ctx.Pool(processes=num_processes) as pool:
-        # imap_unordered makes the tqdm bar update smoothly
-        results = list(tqdm(
-            pool.imap_unordered(worker_func, range(num_games)), 
-            total=num_games, 
-            desc=f"Parallel ELO ({num_processes} cores)",
-            dynamic_ncols=True,
-            leave=False
-        ))
+    # Create the tqdm object explicitly to update it inside the loop
+    pbar = tqdm(
+        total=num_games, 
+        desc=f"Parallel ELO ({num_processes} cores)",
+        dynamic_ncols=True,
+        leave=False
+    )
 
-    wins = sum(results)
+    with ctx.Pool(processes=num_processes) as pool:
+        for result in pool.imap_unordered(worker_func, range(num_games)):
+            wins += result
+            pbar.update(1)
+            # This updates the right-hand side of the bar with the win ratio
+            pbar.set_postfix({"wins": f"{int(wins)}/{pbar.n}"})
+
+    pbar.close()
     return wins, num_games

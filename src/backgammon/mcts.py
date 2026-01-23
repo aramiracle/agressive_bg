@@ -45,28 +45,48 @@ class MCTS:
             node = self.root
             game.fast_restore(root_snapshot)
 
+            # --- SELECTION PHASE ---
             while node.children:
                 best = None
-                best_score = -1e9
+                best_score = -float('inf') # Use -inf, cleaner than -1e9
                 sqrt_visits = math.sqrt(node.visits + 1)
 
                 for child in node.children:
                     u = self.cpuct * child.prior * sqrt_visits / (1 + child.visits)
                     q = child.value_sum / child.visits if child.visits else 0.0
                     score = q + u
+
+                    # Check for NaNs to prevent poisoning
+                    if math.isnan(score): 
+                        score = -float('inf')
+
                     if score > best_score:
                         best_score = score
                         best = child
-
-                try:
-                    game.step_atomic(best.action)
-                except Exception:
-                    node.children.remove(best)
+                
+                # SAFETY CHECK: If best is still None, break to avoid crash
+                if best is None:
                     break
 
-                node = best
+                # Handle Game Step
+                try:
+                    # Move atomic logic here to separate variable access from game logic
+                    action = best.action 
+                    game.step_atomic(action)
+                    node = best
+                except Exception:
+                    # This catches illegal moves from game logic, not AttributeError
+                    if best in node.children:
+                        node.children.remove(best)
+                    # If we pruned the only child, or selection failed, stop this sim
+                    if not node.children: 
+                        break
+                    continue # Try selecting a different sibling
+
                 if not game.dice:
                     break
+            
+            # ... (Rest of the loop: checking win, backprop, expansion) ... 
 
             winner, _ = game.check_win()
             if winner != 0:

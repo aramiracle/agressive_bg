@@ -1,6 +1,7 @@
 import random
 import numpy as np
 from collections import deque
+from src.backgammon.config import Config
 
 
 class PrioritizedReplayBuffer:
@@ -51,49 +52,49 @@ class PrioritizedReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
     
     def _update(self, idx, priority):
+        # Ensure priority is never exactly 0 to keep the tree searchable
+        priority = max(priority, Config.KL_EPSILON)
         change = priority - self.tree[idx]
         self.tree[idx] = priority
         self._propagate(idx, change)
-    
+
     def sample(self, batch_size):
-        batch = []
-        indices = []
-        priorities = []
-        segment = self._total() / batch_size
+        if self.size < batch_size:
+            return [], [], []
+
+        batch, indices, priorities = [], [], []
+        # Total is the sum of all priorities for valid data only
+        total = self._total()
+        segment = total / batch_size
         
         self.beta = min(1.0, self.beta + self.beta_increment)
-        
+
         for i in range(batch_size):
-            a = segment * i
-            b = segment * (i + 1)
+            a, b = segment * i, segment * (i + 1)
             s = random.uniform(a, b)
             idx = self._retrieve(0, s)
             data_idx = idx - self.capacity + 1
             
-            if self.data[data_idx] is not None:
-                batch.append(self.data[data_idx])
-                indices.append(idx)
-                priorities.append(self.tree[idx])
-        
-        if not batch:
-            return [], [], []
-        
-        # Importance sampling weights
-        total = self._total()
-        min_prob = min(priorities) / total if total > 0 else 1e-8
-        max_weight = (min_prob * self.size) ** (-self.beta)
-        
-        weights = []
-        for p in priorities:
-            prob = p / total if total > 0 else 1e-8
-            weight = (prob * self.size) ** (-self.beta) / max_weight
-            weights.append(weight)
-        
+            # If we hit an uninitialized slot (should not happen with size check)
+            # we force it to the most recent valid entry
+            if self.data[data_idx] is None:
+                data_idx = (self.write_idx - 1) % self.capacity
+                idx = data_idx + self.capacity - 1
+
+            batch.append(self.data[data_idx])
+            indices.append(idx)
+            priorities.append(self.tree[idx])
+
+        # Importance sampling weights calculation
+        probs = np.array(priorities) / total
+        weights = (self.size * probs) ** (-self.beta)
+        weights /= weights.max()  # Normalize for stability
+
         return batch, indices, weights
     
     def update_priorities(self, indices, td_errors):
         for idx, td_error in zip(indices, td_errors):
-            priority = (abs(td_error) + 1e-6) ** self.alpha
+            priority = (abs(td_error) + Config.KL_EPSILON) ** self.alpha
             self.max_priority = max(self.max_priority, priority)
             self._update(idx, priority)
     

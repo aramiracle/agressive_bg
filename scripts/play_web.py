@@ -13,6 +13,7 @@ import io
 import json
 import torch
 import websockets
+import random
 
 from backgammon.engine import BackgammonGame
 from backgammon.mcts import MCTS
@@ -160,7 +161,7 @@ class BackgammonServer:
                 "dice": list(self.game.dice) if self.game.dice else [],
                 "cube_value": self.game.cube,
                 "cube_owner": self.game.cube_owner,
-                "can_double": self.game.can_double() and not self.has_rolled,
+                "can_double": self.can_offer_double(),
                 "legal_moves": legal_moves,
                 "status": status,
                 "game_over": self.game_over,
@@ -245,13 +246,14 @@ class BackgammonServer:
     def double(self):
         if self.game_over:
             return self.serialize("Game is over")
+
         if not self.game.can_double():
             return self.serialize("Cannot double now")
-        
-        if self.game.double():
+
+        if self.game.apply_double():
             return self.serialize(f"Cube doubled to {self.game.cube}")
         else:
-            return self.serialize("Double rejected (Not implemented in UI yet)")
+            return self.serialize("Double rejected")
 
     def end_turn(self):
         if self.game_over:
@@ -305,6 +307,34 @@ class BackgammonServer:
             self.game_mode = mode
             return self.serialize(f"Mode set to {mode}")
         return self.serialize("Invalid mode")
+    
+    def can_offer_double(self):
+        g = self.game
+        player = g.turn
+        opponent = -player
+
+        # No doubling after roll
+        if self.has_rolled:
+            return False
+
+        # Crawford rule
+        if g.crawford_active:
+            return False
+
+        # Ownership rule: 0 = center, 1 = white, -1 = black
+        if g.cube_owner not in (0, player):
+            return False
+
+        # Max cube: cannot double beyond remaining points to win
+        remaining_points = self.match_target - min(
+            g.match_scores.get(player, 0),
+            g.match_scores.get(opponent, 0)
+        )
+
+        if g.cube > remaining_points:
+            return False
+
+        return True
 
     # =====================
     # AI
@@ -319,16 +349,63 @@ class BackgammonServer:
         return False
 
     async def ai_move(self, websocket):
-        """Execute AI move and send state updates"""
+        """Execute AI move with doubling/refusal and send updates."""
         if self.game_over or not self.is_ai_turn():
             return
-        
+
         if not self.model or not self.mcts:
             await websocket.send(json.dumps(
                 self.serialize("⚠️ No model loaded! Please load a model first.")
             ))
             return
-        
+
+        # --------------------
+        # AI considers doubling
+        # --------------------
+        my_score = self.game.match_scores.get(self.game.turn, 0)
+        opp_score = self.game.match_scores.get(-self.game.turn, 0)
+
+        def get_cube_decision_local():
+            board_t, ctx_t = self.game.get_vector(my_score, opp_score, device=DEVICE, canonical=True)
+            with torch.no_grad():
+                _, _, v, cube_logits = self.model(
+                    board_t.unsqueeze(0),
+                    ctx_t.unsqueeze(0)
+                )
+                win_prob = torch.sigmoid(v.squeeze(0)).item()
+
+            cube = max(1, self.game.cube)
+            equity_double = win_prob * (cube * 2) - (1 - win_prob) * (cube * 2)
+            equity_nodouble = win_prob * cube - (1 - win_prob) * cube
+
+            return 1 if (equity_double - equity_nodouble) > Config.CUBE_THERESHOLD else 0
+
+        # If AI can offer double
+        if self.can_offer_double():
+            double_choice = get_cube_decision_local()
+            if double_choice == 1:
+                # Offer double
+                await websocket.send(json.dumps(self.serialize("AI offers double!")))
+                
+                # Simulate opponent decision (use equity as proxy)
+                self.game.switch_turn()
+                take_choice = get_cube_decision_local()
+                self.game.switch_turn()
+
+                if take_choice == 1:
+                    self.game.apply_double()
+                    await websocket.send(json.dumps(self.serialize(f"AI doubled cube to {self.game.cube}")))
+                else:
+                    winner, points = self.game.handle_cube_refusal()
+                    status = f"Opponent refused double. {('White' if winner==1 else 'Black')} wins {points} points!"
+                    self.game_over = True
+                    self.winner = winner
+                    await websocket.send(json.dumps(self.serialize(status)))
+                    return  # Cube refusal ends turn/game
+
+        # --------------------
+        # Roll if not rolled
+        # --------------------
         if not self.game.dice:
             self.game.roll_dice()
             self.has_rolled = True
@@ -336,54 +413,58 @@ class BackgammonServer:
                 self.serialize(f"AI rolled {self.game.dice[0]}, {self.game.dice[1]}")
             ))
             await asyncio.sleep(0.3)
-        
-        # Keep moving until dice are exhausted or no legal moves
+
+        # --------------------
+        # Make moves
+        # --------------------
         while self.game.dice and not self.game_over:
             legal = self.game.get_legal_moves()
             if not legal:
                 break
-            
-            # --- MCTS Step ---
-            # IMPORTANT: Pass a COPY of the game to MCTS.
-            # MCTS simulations modify the board. If we pass self.game, 
-            # the live board gets corrupted (dice consumed), causing crashes 
-            # on subsequent loops or step_atomic calls.
+
+            # --- MCTS on a copy ---
             game_copy = self.game.copy()
-            
-            root = self.mcts.search(
-                game_copy, 
-                self.game.match_scores.get(self.game.turn, 0),
-                self.game.match_scores.get(-self.game.turn, 0)
-            )
-            
+            game_copy.board = list(self.game.board)
+            game_copy.bar = list(self.game.bar)
+            game_copy.off = list(self.game.off)
+            game_copy.turn = self.game.turn
+            game_copy.dice = list(self.game.dice)
+
+            root = self.mcts.search(game_copy, my_score, opp_score)
+            legal_moves = self.game.get_legal_moves()
+
             if root.children:
-                best_move = max(root.children, key=lambda n: n.visits).action
+                legal_children = [c for c in root.children if c.action in legal_moves]
+                if legal_children:
+                    best_move = max(legal_children, key=lambda n: n.visits).action
+                else:
+                    best_move = random.choice(legal_moves)
             else:
-                best_move = legal[0]
-            
-            # --- Apply Move ---
+                best_move = random.choice(legal_moves)
+
             winner, points = self.game.step_atomic(best_move)
-            
             src, dst = best_move
             await websocket.send(json.dumps(
                 self.serialize(f"AI moved {src} → {dst}")
             ))
-            
+
             if winner != 0:
                 status = self._handle_game_win(winner, points)
                 await websocket.send(json.dumps(self.serialize(status)))
                 return
-            
+
             await asyncio.sleep(0.2)
-        
+
+        # --------------------
         # End AI turn
+        # --------------------
         self.game.switch_turn()
         self.has_rolled = False
-        
         turn_name = "White" if self.game.turn == 1 else "Black"
         await websocket.send(json.dumps(
             self.serialize(f"AI finished. {turn_name}'s turn")
         ))
+
 
     # =====================
     # ROUTER

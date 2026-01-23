@@ -16,23 +16,33 @@ from src.backgammon.checkpoint import (
     get_model_state_dict, load_model_state_dict
 )
 from src.backgammon.elo import evaluate_vs_opponent, update_elo
-from src.backgammon.utils import move_to_indices
+from src.backgammon.utils import move_to_indices, smooth_distribution
 from src.backgammon.replay_buffer import get_replay_buffer
 
 # ------------------------------------------------------------
 # Cube decision helper
 # ------------------------------------------------------------
 
-def get_cube_decision(model, game, device, my_score=0, opp_score=0):
+def get_learned_cube_decision(model, game, device, my_score, opp_score, stochastic=True):
     board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
-    with torch.no_grad():
-        _, _, v, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
-        win_prob = torch.sigmoid(v.squeeze(0)).item()
-        cube_choice = torch.argmax(cube_logits, dim=1).item()
 
-    if win_prob < 0.6:
-        return 0
-    return cube_choice
+    with torch.no_grad():
+        # We ignore 'v' here because we want the Policy Head (cube_logits) to decide
+        _, _, _, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
+        
+        # cube_logits should have size 2: [Action_0, Action_1]
+        # For the Doubler: [No Double, Double]
+        # For the Taker:   [Drop, Take]
+        probs = torch.softmax(cube_logits.squeeze(0), dim=0)
+
+    if stochastic:
+        # Sample during self-play for exploration
+        action = torch.multinomial(probs, 1).item()
+    else:
+        # Pick best during evaluation
+        action = torch.argmax(probs).item()
+
+    return action, probs
 
 # ------------------------------------------------------------
 # Self-play / Evaluation game
@@ -69,26 +79,35 @@ def play_one_game(
         opp_s = local_match_scores[-game.turn]
         cached_vector = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
 
-        # ---------------- Cubing ----------------
-        if game.can_double() and game.cube < Config.MATCH_TARGET:
-            double_choice = get_cube_decision(model, game, device, my_s, opp_s)
+        # ---------------- Learned Cubing ----------------
+        if game.can_double() and not game.crawford_active:
+            # Current player's turn: Decide whether to offer a double
+            double_choice, double_probs = get_learned_cube_decision(
+                model, game, device, my_s, opp_s, stochastic=not is_eval
+            )
 
-            if double_choice == 1:
-                game.switch_turn()
-                take_choice = get_cube_decision(model, game, device, opp_s, my_s)
-                game.switch_turn()
+            # Store the state and the probability distribution for training
+            board_t, ctx_t = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
+            history.append((board_t, ctx_t, None, game.turn, True, double_probs))
 
-                if not is_eval:
-                    board_t, ctx_t = cached_vector
-                    # Store as 1.0 (double) or 0.0 (no double) for target
-                    history.append((board_t, ctx_t, double_choice, game.turn, True, None))
+            if double_choice == 1: # Model decided to double
+                game.switch_turn()
+                # Opponent's turn: Decide whether to Take or Drop
+                take_choice, take_probs = get_learned_cube_decision(
+                    model, game, device, opp_s, my_s, stochastic=not is_eval
+                )
+                
+                # Store the opponent's cube decision too
+                board_opp, ctx_opp = game.get_vector(opp_s, my_s, device='cpu', canonical=True)
+                history.append((board_opp, ctx_opp, None, game.turn, True, take_probs))
+                
+                game.switch_turn() # Return turn to active player
 
                 if take_choice == 1:
                     game.apply_double()
                 else:
-                    final_winner, points = game.handle_cube_refusal()
-                    if is_eval: return final_winner, points
-                    return finalize_history(history, final_winner, points), final_winner
+                    winner, points = game.handle_cube_refusal()
+                    return finalize_history(history, winner, points), winner
 
         # ---------------- Movement ----------------
         game.roll_dice()
@@ -149,13 +168,19 @@ def play_one_game(
 # History → training samples
 # ------------------------------------------------------------
 
-def finalize_history(history, winner, total_points):
+def finalize_history(history, current_won, total_points):
+    """
+    history: List of (board, ctx, action_taken, turn, is_cube, policy_probs)
+    """
     data = []
-    for board, ctx, act, turn, is_cube, visit_probs in history:
-        # Normalize reward relative to match target
-        reward = (float(total_points) + Config.MATCH_TARGET) if turn == winner else (-float(total_points) - Config.MATCH_TARGET)
-        reward /= float(Config.MATCH_TARGET)
-        data.append((board, ctx, act, reward, is_cube, visit_probs))
+    # Normalize points by match target
+    reward_magnitude = (float(total_points) + Config.MATCH_TARGET) / Config.MATCH_TARGET
+    final_reward = reward_magnitude if current_won else -reward_magnitude
+
+    for board, ctx, act, turn, is_cube, probs in history:
+        # Since history only contains Current Model decisions, 
+        # the reward is always 'final_reward'
+        data.append((board, ctx, act, final_reward, is_cube, probs))
     return data
 
 
@@ -165,9 +190,9 @@ def finalize_history(history, winner, total_points):
 
 def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     if len(replay_buffer) < batch_size: return 0.0, 0.0
-
     batch, indices, weights = replay_buffer.sample(batch_size)
-    
+    if len(batch) == 0: return 0.0, 0.0
+
     boards = torch.stack([x[0] for x in batch]).to(device)
     contexts = torch.stack([x[1] for x in batch]).to(device)
     rewards = torch.tensor([x[3] for x in batch], dtype=torch.float, device=device)
@@ -176,33 +201,41 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
         p_from, p_to, v, cube_logits = model(boards, contexts)
 
+        # STABILITY FIX: Cast logits to Float32 for KL math (Prevents GPU NaN)
+        p_from, p_to, v, cube_logits = p_from.float(), p_to.float(), v.float(), cube_logits.float()
+
         # Value Loss
         td_errors = torch.abs(v.squeeze(-1) - rewards).detach()
         v_loss = (weights_t * (v.squeeze(-1) - rewards) ** 2).mean()
 
-        p_loss = torch.tensor(0.0, device=device)
-        c_loss = torch.tensor(0.0, device=device)
+        p_loss, c_loss = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
         p_count, c_count = 0, 0
 
-        for i, (_, _, action, reward, is_cube, visit_targets) in enumerate(batch):
+        # Label smoothing value
+        smoothing = Config.LABEL_SMOOTHING
+
+        for i, (_, _, _, _, is_cube, visit_targets) in enumerate(batch):
             w = weights_t[i]
 
             if is_cube:
-                # Cube target: 1 if this move led to a win, 0 otherwise
-                target = torch.tensor([1 if reward > 0 else 0], device=device)
-                c_loss += w * nn.functional.cross_entropy(cube_logits[i:i+1], target)
+                # Apply smoothing to 2-class cube decision [Drop/Take]
+                target = visit_targets.to(device).float()
+                target = smooth_distribution(target, smoothing, 2)
+
+                logp = nn.functional.log_softmax(cube_logits[i], dim=0)
+                c_loss += w * nn.functional.kl_div(logp, target, reduction='batchmean')
                 c_count += 1
             else:
-                if visit_targets is None: continue
-                
-                # PATCH: Use the two 26-sized target vectors
                 target_f, target_t = visit_targets
-                
+                # Apply smoothing to 26-class movement distributions
+                tf = smooth_distribution(target_f.to(device).float(), smoothing, 26)
+                tt = smooth_distribution(target_t.to(device).float(), smoothing, 26)
+
                 logp_f = nn.functional.log_softmax(p_from[i], dim=0)
                 logp_t = nn.functional.log_softmax(p_to[i], dim=0)
 
-                kl_f = nn.functional.kl_div(logp_f, target_f.to(device), reduction='batchmean')
-                kl_t = nn.functional.kl_div(logp_t, target_t.to(device), reduction='batchmean')
+                kl_f = nn.functional.kl_div(logp_f, tf, reduction='batchmean')
+                kl_t = nn.functional.kl_div(logp_t, tt, reduction='batchmean')
 
                 p_loss += w * 0.5 * (kl_f + kl_t)
                 p_count += 1
@@ -211,10 +244,20 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
         if p_count > 0: loss += (p_loss / p_count)
         if c_count > 0: loss += (c_loss / c_count)
 
+    # FINAL NaN GUARD: Skip optimization if loss is corrupted
+    if torch.isnan(loss):
+        optimizer.zero_grad()
+        return 0.0, 0.0
+
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.GRAD_CLIP)
+    
+    if torch.isnan(grad_norm): # Guard against exploding gradients
+        optimizer.zero_grad()
+        return loss.item(), 0.0
+
     scaler.step(optimizer)
     scaler.update()
 

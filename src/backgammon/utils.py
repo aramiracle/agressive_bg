@@ -1,5 +1,6 @@
 """Utility functions for backgammon AI."""
 
+import torch
 from src.backgammon.config import Config
 
 
@@ -75,4 +76,13 @@ def format_board(board, bar, off):
     lines.append(f"Bar: W={bar[0]} B={bar[1]} | Off: W={off[0]} B={off[1]}")
     
     return "\n".join(lines)
+
+def smooth_distribution(target, epsilon, num_classes):
+    """
+    Applies label smoothing to a target distribution.
+    target: tensor of shape (N,)
+    epsilon: smoothing factor (e.g., 0.1)
+    """
+    uniform = torch.ones_like(target) / num_classes
+    return (1.0 - epsilon) * target + epsilon * uniform
 
