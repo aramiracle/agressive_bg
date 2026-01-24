@@ -61,7 +61,7 @@ class Config:
     ELO_EVAL_GAMES = 32
 
     # Training
-    GAMES_PER_ITERATION = 4
+    GAMES_PER_ITERATION = 6
     STEPS_PER_ITERATION = 500
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128
     BUFFER_SIZE = 262144

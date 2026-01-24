@@ -202,7 +202,7 @@ def train():
                 
                 # 1. Eval vs Best
                 if eval_self > 0:
-                    args = game, model, best_model, eval_self, device
+                    args = (game, model, best_model, eval_self, 'cpu', None)
                     w, t = evaluate_vs_opponent(args)
                     wins_total += w
                     games_total += t
@@ -210,7 +210,7 @@ def train():
 
                 # 2. Eval vs Baseline
                 if eval_base > 0 and baseline_model is not None:
-                    args = game, model, baseline_model, eval_base, device
+                    args = (game, model, baseline_model, eval_base, 'cpu', None)
                     w, t = evaluate_vs_opponent(args)
                     wins_total += w
                     games_total += t

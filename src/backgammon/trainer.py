@@ -142,7 +142,7 @@ def train():
                 model.eval()
                 best_model.eval()
 
-                args = (game, model, best_model, Config.ELO_EVAL_GAMES, device)
+                args = (game, model, best_model, Config.ELO_EVAL_GAMES, 'cpu', None)
                 wins, total = evaluate_vs_opponent(args)
                 old_elo = current_elo
                 current_elo = update_elo(current_elo, best_elo, wins, total)

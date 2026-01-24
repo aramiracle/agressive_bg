@@ -2,13 +2,12 @@
 
 import torch
 import torch.multiprocessing as mp
-from functools import partial
 from tqdm import tqdm
 from src.backgammon.config import Config
 from src.backgammon.mcts import MCTS
+from src.backgammon.engine import BackgammonGame
 
 torch.multiprocessing.set_sharing_strategy("file_system")
-
 
 def calculate_expected_score(player_elo, opponent_elo):
     """Calculate expected score using standard ELO formula."""
@@ -97,55 +96,72 @@ def play_single_game(game, model_a, model_b, mcts_a, mcts_b, a_is_white, device,
     return winner, points * game.cube
 
 def _worker_play_match(args):
-    game_instance, model_a, model_b, device, i = args
+    match_idx, model_a, model_b, device = args
+
     torch.set_num_threads(1)
+
+    # Each process must create its own game + MCTS
+    game_instance = BackgammonGame()
     mcts_a = MCTS(model_a, device=device)
     mcts_b = MCTS(model_b, device=device)
-    
+
     score_a, score_b = 0, 0
-    target = Config.MATCH_TARGET # e.g., 7 or 11
-    a_is_white = (i % 2 == 0)
+    target = Config.MATCH_TARGET
+
+    # Alternate colors per match
+    a_is_white = (match_idx % 2 == 0)
 
     while score_a < target and score_b < target:
         winner, points = play_single_game(
-            game_instance, model_a, model_b, mcts_a, mcts_b, 
-            a_is_white, device, score_a, score_b
+            game_instance,
+            model_a,
+            model_b,
+            mcts_a,
+            mcts_b,
+            a_is_white,
+            device,
+            score_a,
+            score_b
         )
-        
+
         if (winner == 1 and a_is_white) or (winner == -1 and not a_is_white):
             score_a += points
         else:
             score_b += points
-            
+
     return 1.0 if score_a >= target else 0.0
 
-def evaluate_vs_opponent(game, model_a, model_b, num_games, device='cpu', num_processes=None):
+def evaluate_vs_opponent(args):
+    game, model_a, model_b, num_games, device, num_processes = args
+
     if num_processes is None:
         num_processes = mp.cpu_count()
 
-    # Move models to device and share memory for multiprocessing efficiency
     model_a.to(device).eval()
     model_b.to(device).eval()
+
     model_a.share_memory()
     model_b.share_memory()
 
-    ctx = mp.get_context('spawn')
-    worker_func = partial(_worker_play_match, game, model_a, model_b, device)
-    
+    ctx = mp.get_context("spawn")
+
     wins = 0.0
-    # Create the tqdm object explicitly to update it inside the loop
     pbar = tqdm(
-        total=num_games, 
+        total=num_games,
         desc=f"Parallel ELO ({num_processes} cores)",
         dynamic_ncols=True,
         leave=False
     )
 
+    worker_args = [
+        (i, model_a, model_b, device)
+        for i in range(num_games)
+    ]
+
     with ctx.Pool(processes=num_processes) as pool:
-        for result in pool.imap_unordered(worker_func, range(num_games)):
+        for result in pool.imap_unordered(_worker_play_match, worker_args):
             wins += result
             pbar.update(1)
-            # This updates the right-hand side of the bar with the win ratio
             pbar.set_postfix({"wins": f"{int(wins)}/{pbar.n}"})
 
     pbar.close()
