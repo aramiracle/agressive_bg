@@ -65,7 +65,7 @@ class Config:
     STEPS_PER_ITERATION = 500
     BATCH_SIZE = 256 if torch.cuda.is_available() else 64
     BUFFER_SIZE = 262144
-    KL_EPSILON = 1e-5
+    KL_EPSILON = 1e-6
     LABEL_SMOOTHING = 0.05
     LR = 5e-6
     GRAD_CLIP = 1.0
