@@ -14,6 +14,8 @@ import json
 import torch
 import websockets
 import random
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import threading
 
 from backgammon.engine import BackgammonGame
 from backgammon.mcts import MCTS
@@ -27,9 +29,11 @@ from backgammon.utils import get_learned_cube_decision
 # =========================
 HOST = "0.0.0.0"
 PORT = 8765
+HTTP_PORT = 8080
 DEVICE = Config.DEVICE
 CHECKPOINTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints")
 MODEL_PATH = os.path.join(CHECKPOINTS_DIR, "best_model.pt")
+UI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui")
 
 
 # =========================
@@ -339,15 +343,48 @@ class BackgammonServer:
 
         return True
 
-    def offer_double(self):
+    async def offer_double(self, websocket):
         """Initiates the doubling process."""
         if not self.can_offer_double():
             return self.serialize("Cannot double right now.")
         
         self.waiting_for_cube_decision = True
         # We switch the 'turn' visually so the UI knows who must decide
-        self.game.turn *= -1 
-        return self.serialize("Double offered! Take or Pass?")
+        self.game.turn *= -1
+        
+        response = self.serialize("Double offered! Take or Pass?")
+        await websocket.send(json.dumps(response))
+        
+        # If AI's turn to decide, let AI decide immediately
+        if self.is_ai_turn():
+            await asyncio.sleep(0.5)  # Small delay for drama
+            await self.ai_cube_decision(websocket)
+    
+        return None  # Already sent response
+
+    async def ai_cube_decision(self, websocket):
+        """AI decides whether to take or pass a double."""
+        if not self.waiting_for_cube_decision:
+            return
+        
+        if not self.model or not self.mcts:
+            # Without model, AI randomly decides
+            import random
+            choice = random.choice([True, False])
+        else:
+            # Use the learned cube decision from utils
+            my_score = self.game.match_scores.get(self.game.turn, 0)
+            opp_score = self.game.match_scores.get(-self.game.turn, 0)
+            
+            take_choice, _ = get_learned_cube_decision(
+                self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
+            )
+            choice = (take_choice == 1)
+        
+        if choice:
+            await websocket.send(json.dumps(self.take_double()))
+        else:
+            await websocket.send(json.dumps(self.refuse_double()))
 
     def take_double(self):
         """Player accepts the double."""
@@ -510,7 +547,8 @@ class BackgammonServer:
             return None
 
         if t == "double":
-            return self.offer_double() # Use our new wrapper
+            await self.offer_double(websocket)
+            return None  # Already sent
 
         if t == "take_double":
             return self.take_double()
@@ -562,18 +600,58 @@ async def handler(websocket):
 
     try:
         async for message in websocket:
-            msg = json.loads(message)
-            response = await server.handle(msg, websocket)
-            if response is not None:
-                await websocket.send(json.dumps(response))
+            try:
+                msg = json.loads(message)
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Invalid JSON received: {e}")
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "error": f"Invalid JSON: {str(e)}"
+                }))
+                continue
+            
+            try:
+                response = await server.handle(msg, websocket)
+                if response is not None:
+                    await websocket.send(json.dumps(response))
+            except Exception as e:
+                print(f"❌ Handler error: {e}")
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "error": f"Server error: {str(e)}"
+                }))
     except websockets.exceptions.ConnectionClosed:
         print("👋 Client disconnected")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+
+
+def start_http_server():
+    """Start HTTP server to serve the HTML UI"""
+    os.chdir(UI_DIR)
+    
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # Suppress HTTP request logs
+    
+    httpd = HTTPServer((HOST, HTTP_PORT), QuietHandler)
+    print(f"🌐 HTTP server: http://localhost:{HTTP_PORT}/html_ui.html")
+    httpd.serve_forever()
 
 
 async def main():
     print(f"🎲 Starting Backgammon AI WebSocket on ws://{HOST}:{PORT}")
     print(f"📁 Model path: {MODEL_PATH}")
     print(f"🖥️  Device: {DEVICE}")
+    
+    # Start HTTP server in background thread
+    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_thread.start()
+    
+    # Suppress websocket handshake errors (from non-WS HTTP requests)
+    import logging
+    logging.getLogger('websockets').setLevel(logging.ERROR)
+    
     async with websockets.serve(handler, HOST, PORT):
         await asyncio.Future()
 

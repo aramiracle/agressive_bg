@@ -880,10 +880,12 @@ const WS_URL = "ws://localhost:8765";
 let socket = null;
 
 /* ============================
+/* ============================
    CUBE DECISION LISTENER
 ============================ */
 const btnTake = document.getElementById("btnTake");
 const btnPass = document.getElementById("btnPass");
+const btnDouble = document.getElementById("btnDouble");
 
 btnTake.onclick = () => {
     send({ type: "take_double" });
@@ -896,12 +898,11 @@ btnPass.onclick = () => {
 };
 
 // Update the existing btnDouble.onclick to be cleaner
-btnDouble.onclick = () => {
+btnDouble.onclick = () => {  // ← ERROR HERE - btnDouble not declared yet!
     if (confirm("Offer to double the stakes?")) {
         send({ type: "double" });
     }
 };
-
 /* ============================
    STATE
 ============================ */
@@ -956,7 +957,6 @@ const bearoffWhite = document.getElementById("bearoffWhite");
 const bearoffBlack = document.getElementById("bearoffBlack");
 
 const btnRoll = document.getElementById("btnRoll");
-const btnDouble = document.getElementById("btnDouble");
 const btnEnd = document.getElementById("btnEnd");
 const btnNew = document.getElementById("btnNew");
 const btnNewMatch = document.getElementById("btnNewMatch");
@@ -970,9 +970,19 @@ const connStatus = document.getElementById("connStatus");
    SOCKET
 ============================ */
 function connectAI() {
-  socket = new WebSocket(WS_URL);
+  console.log("Attempting to connect to:", WS_URL);
+  
+  try {
+    socket = new WebSocket(WS_URL);
+  } catch (err) {
+    console.error("Failed to create WebSocket:", err);
+    status.textContent = "WebSocket creation failed: " + err.message;
+    setTimeout(connectAI, 2000);
+    return;
+  }
 
   socket.onopen = () => {
+    console.log("WebSocket connected!");
     connStatus.textContent = "Connected";
     connStatus.className = "connection connected";
     status.textContent = "Connected to Neural AI";
@@ -980,7 +990,14 @@ function connectAI() {
   };
 
   socket.onmessage = e => {
-    const msg = JSON.parse(e.data);
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch (err) {
+      console.error("Invalid JSON from server:", err);
+      return;
+    }
+    
     if (msg.type === "state") {
       applyState(msg.payload);
     } else if (msg.type === "model_loaded") {
@@ -995,17 +1012,22 @@ function connectAI() {
       modelStatus.textContent = "Error";
       modelStatus.style.color = "#c94a4a";
       alert("Model load error: " + msg.error);
+    } else if (msg.type === "error") {
+      console.error("Server error:", msg.error);
+      status.textContent = "Error: " + msg.error;
     }
   };
 
-  socket.onclose = () => {
+  socket.onclose = (event) => {
+    console.log("WebSocket closed:", event.code, event.reason);
     connStatus.textContent = "Disconnected";
     connStatus.className = "connection disconnected";
     status.textContent = "AI Disconnected - Reconnecting...";
     setTimeout(connectAI, 2000);
   };
 
-  socket.onerror = () => {
+  socket.onerror = (err) => {
+    console.error("WebSocket error:", err);
     connStatus.textContent = "Error";
     connStatus.className = "connection disconnected";
   };
@@ -1225,10 +1247,15 @@ function applyState(s) {
 
   // Clear selection when state changes
   selectedPoint = null;
-  if (isWaitingForCube) {
-    cubeOverlay.style.display = "flex";
-    // Show who needs to decide based on the current turn
-    cubePrompt.textContent = `${turn === 1 ? "White" : "Black"}: Take or Pass?`;
+ if (isWaitingForCube) {
+    // Only show overlay if it's human's turn to decide
+    if (isHumanTurn()) {
+        cubeOverlay.style.display = "flex";
+        cubePrompt.textContent = `${turn === 1 ? "White" : "Black"}: Take or Pass?`;
+    } else {
+        cubeOverlay.style.display = "none";
+        // AI will decide automatically on server side
+    }
     
     // Disable other controls while deciding
     btnRoll.disabled = true;
@@ -1391,7 +1418,7 @@ matchTargetSelect.onchange = () => {
 };
 btnRoll.onclick = () => send({ type: "roll" });
 btnEnd.onclick = () => send({ type: "end_turn" });
-btnDouble.onclick = () => send({ type: "double" });
+// btnDouble.onclick is set above with confirmation dialog
 btnAI.onclick = () => send({ type: "ai_play" });
 
 // Autoplay functions

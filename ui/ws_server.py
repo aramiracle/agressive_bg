@@ -252,7 +252,7 @@ class BackgammonServer:
                     "white": self.game.match_scores.get(1, 0),
                     "black": self.game.match_scores.get(-1, 0)
                 },
-                "crawford": self.game.crawford,
+                "crawford": self.game.crawford_active,
                 "crawford_used": self.game.crawford_used
             }
         }
@@ -269,7 +269,7 @@ class BackgammonServer:
         self.winner = 0
         self.has_rolled = False
         
-        crawford_msg = " (Crawford Game!)" if self.game.crawford else ""
+        crawford_msg = " (Crawford Game!)" if self.game.crawford_active else ""
         return self.serialize(f"New game started!{crawford_msg} Roll dice to begin.")
     
     def _update_crawford_status(self):
@@ -281,18 +281,18 @@ class BackgammonServer:
         # and Crawford hasn't been used yet
         if not self.game.crawford_used:
             if score_w == self.match_target - 1 or score_b == self.match_target - 1:
-                self.game.crawford = True
+                self.game.crawford_active = True
             else:
-                self.game.crawford = False
+                self.game.crawford_active = False
         else:
-            self.game.crawford = False
+            self.game.crawford_active = False
     
     def new_match(self, target=None):
         """Start a completely new match (resets scores)"""
         if target is not None:
             self.match_target = max(1, min(21, int(target)))  # Clamp between 1-21
         self.game.match_scores = {1: 0, -1: 0}
-        self.game.crawford = False
+        self.game.crawford_active = False
         self.game.crawford_used = False
         self.game.reset()
         self.game_over = False
@@ -311,7 +311,7 @@ class BackgammonServer:
             match_winner = winner
         
         # Update crawford status for next game
-        if self.game.crawford:
+        if self.game.crawford_active:
             self.game.crawford_used = True
         
         self.game_over = True
@@ -464,9 +464,9 @@ class BackgammonServer:
                 self.game.match_scores.get(-self.game.turn, 0)
             )
             
-            # Select move with most visits
+            # Select move with most visits (children is a list of MCTSNode objects)
             if root.children:
-                best_move = max(root.children.items(), key=lambda x: x[1].visits)[0]
+                best_move = max(root.children, key=lambda node: node.visits).action
             else:
                 best_move = legal[0]
             
@@ -575,12 +575,30 @@ async def handler(websocket):
 
     try:
         async for message in websocket:
-            msg = json.loads(message)
-            response = await server.handle(msg, websocket)
-            if response is not None:
-                await websocket.send(json.dumps(response))
+            try:
+                msg = json.loads(message)
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Invalid JSON received: {e}")
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "error": f"Invalid JSON: {str(e)}"
+                }))
+                continue
+            
+            try:
+                response = await server.handle(msg, websocket)
+                if response is not None:
+                    await websocket.send(json.dumps(response))
+            except Exception as e:
+                print(f"❌ Handler error: {e}")
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "error": f"Server error: {str(e)}"
+                }))
     except websockets.exceptions.ConnectionClosed:
         print("👋 Client disconnected")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
 
 
 async def main():
