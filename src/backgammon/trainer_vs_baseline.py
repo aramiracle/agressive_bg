@@ -202,14 +202,16 @@ def train():
                 
                 # 1. Eval vs Best
                 if eval_self > 0:
-                    w, t = evaluate_vs_opponent(game, model, best_model, eval_self, device)
+                    args = game, model, best_model, eval_self, device
+                    w, t = evaluate_vs_opponent(args)
                     wins_total += w
                     games_total += t
                     print(f"  → vs Best: {w}/{t} wins ({(w/t)*100:.1f}%)")
 
                 # 2. Eval vs Baseline
                 if eval_base > 0 and baseline_model is not None:
-                    w, t = evaluate_vs_opponent(game, model, baseline_model, eval_base, device)
+                    args = game, model, baseline_model, eval_base, device
+                    w, t = evaluate_vs_opponent(args)
                     wins_total += w
                     games_total += t
                     print(f"  → vs Baseline: {w}/{t} wins ({(w/t)*100:.1f}%)")

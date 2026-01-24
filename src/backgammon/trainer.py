@@ -142,7 +142,8 @@ def train():
                 model.eval()
                 best_model.eval()
 
-                wins, total = evaluate_vs_opponent(game, model, best_model, Config.ELO_EVAL_GAMES, device)
+                args = (game, model, best_model, Config.ELO_EVAL_GAMES, device)
+                wins, total = evaluate_vs_opponent(args)
                 old_elo = current_elo
                 current_elo = update_elo(current_elo, best_elo, wins, total)
                 print(f"  📊 Summary: {wins}/{total} wins | ELO: {old_elo:.0f} -> {current_elo:.0f}")
