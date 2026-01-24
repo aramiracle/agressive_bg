@@ -7,6 +7,9 @@ from tqdm import tqdm
 from src.backgammon.config import Config
 from src.backgammon.mcts import MCTS
 
+torch.multiprocessing.set_sharing_strategy("file_system")
+
+
 def calculate_expected_score(player_elo, opponent_elo):
     """Calculate expected score using standard ELO formula."""
     return 1.0 / (1.0 + 10 ** ((opponent_elo - player_elo) / Config.ELO_SCALE))
@@ -93,7 +96,8 @@ def play_single_game(game, model_a, model_b, mcts_a, mcts_b, a_is_white, device,
     winner, points = game.check_win()
     return winner, points * game.cube
 
-def _worker_play_match(game_instance, model_a, model_b, device, i):
+def _worker_play_match(args):
+    game_instance, model_a, model_b, device, i = args
     torch.set_num_threads(1)
     mcts_a = MCTS(model_a, device=device)
     mcts_b = MCTS(model_b, device=device)

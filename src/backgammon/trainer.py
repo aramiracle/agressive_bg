@@ -24,6 +24,8 @@ from src.backgammon.elo import evaluate_vs_opponent, update_elo
 from src.backgammon.replay_buffer import get_replay_buffer
 from src.backgammon.utils import play_one_game, train_batch
 
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 # ------------------------------------------------------------
 # Worker for multi-core collection
 # ------------------------------------------------------------

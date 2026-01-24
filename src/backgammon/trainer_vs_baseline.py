@@ -24,6 +24,8 @@ from src.backgammon.elo import evaluate_vs_opponent, update_elo
 from src.backgammon.utils import play_one_game,play_vs_baseline, train_batch, load_model_with_config
 from src.backgammon.replay_buffer import get_replay_buffer
 
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 # ------------------------------------------------------------
 # Collection helpers (Self-play + Vs Baseline)
 # ------------------------------------------------------------
