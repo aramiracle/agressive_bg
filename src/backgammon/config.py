@@ -23,7 +23,6 @@ class Config:
 
     # Game
     MATCH_TARGET = 7
-    CUBE_THERESHOLD = 0.15
 
     # Rewards
     R_WIN = 1.0
@@ -61,7 +60,7 @@ class Config:
     ELO_EVAL_GAMES = 32
 
     # Training
-    GAMES_PER_ITERATION = 25
+    GAMES_PER_ITERATION = 50
     COLLECTION_INTERVAL = 1
     TRAIN_UPDATES_PER_ITER = 100
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128
@@ -83,4 +82,4 @@ class Config:
     BASELINE_DIR = "checkpoints_v1"
     BASELINE_MODEL_NAME = "best_model.pt"
     BASELINE_SWITCH_ON_SURPASS = True
-    BASELINE_SELF_PLAY_RATIO = 0.5
+    BASELINE_SELF_PLAY_RATIO = 0.4

@@ -103,11 +103,10 @@ def parallel_collect(mode, model, baseline_model, replay_buffer, total_games, de
 # TRAIN LOOP
 # =========================
 
-def get_opponent_model(phase, baseline_model, best_model):
+def get_strong_opponent(phase, baseline_model, best_model):
     if phase == "vs_baseline":
         return baseline_model
-    else:
-        return best_model
+    return best_model
 
 def train():
     checkpoint_dir, best_path, latest_path = setup_checkpoint_dir()
@@ -177,24 +176,16 @@ def train():
     while train_step < Config.TRAIN_STEPS:
         # -------- COLLECTION PHASE (decoupled) --------
         if train_step % Config.COLLECTION_INTERVAL == 0:
-            baseline_ratio = Config.BASELINE_SELF_PLAY_RATIO
+            num_self = int(Config.GAMES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
+            num_baseline = Config.GAMES_PER_ITERATION - num_self
 
-            if phase == "vs_baseline":
-                num_self = int(Config.GAMES_PER_ITERATION * baseline_ratio)
-                num_baseline = Config.GAMES_PER_ITERATION - num_self
-            else:
-                num_self = Config.GAMES_PER_ITERATION
-                num_baseline = 0
+            strong_opponent = get_strong_opponent(phase, baseline_model, best_model)
 
-            opponent_model = get_opponent_model(phase, baseline_model, best_model)
-
-            # Always collect "self" games
             if num_self > 0:
                 parallel_collect("self", model, None, replay_buffer, num_self)
 
-            # Collect vs opponent (baseline OR best)
-            if opponent_model is not None and num_baseline > 0:
-                parallel_collect("baseline", model, opponent_model, replay_buffer, num_baseline)
+            if strong_opponent is not None and num_baseline > 0:
+                parallel_collect("baseline", model, strong_opponent, replay_buffer, num_baseline)
 
         # -------- TRAINING PHASE (heavy reuse) --------
         model.train()
