@@ -56,7 +56,7 @@ class Config:
     INITIAL_ELO = 200
     ELO_K = 4
     ELO_SCALE = 400.0
-    ELO_EVAL_INTERVAL = 5000
+    ELO_EVAL_INTERVAL = 2000
     ELO_EVAL_GAMES = 32
 
     # Training
