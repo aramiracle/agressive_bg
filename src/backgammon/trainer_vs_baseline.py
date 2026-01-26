@@ -103,6 +103,12 @@ def parallel_collect(mode, model, baseline_model, replay_buffer, total_games, de
 # TRAIN LOOP
 # =========================
 
+def get_opponent_model(phase, baseline_model, best_model):
+    if phase == "vs_baseline":
+        return baseline_model
+    else:
+        return best_model
+
 def train():
     checkpoint_dir, best_path, latest_path = setup_checkpoint_dir()
     device = torch.device(Config.DEVICE)
@@ -180,11 +186,15 @@ def train():
                 num_self = Config.GAMES_PER_ITERATION
                 num_baseline = 0
 
+            opponent_model = get_opponent_model(phase, baseline_model, best_model)
+
+            # Always collect "self" games
             if num_self > 0:
                 parallel_collect("self", model, None, replay_buffer, num_self)
 
-            if use_baseline and num_baseline > 0:
-                parallel_collect("baseline", model, baseline_model, replay_buffer, num_baseline)
+            # Collect vs opponent (baseline OR best)
+            if opponent_model is not None and num_baseline > 0:
+                parallel_collect("baseline", model, opponent_model, replay_buffer, num_baseline)
 
         # -------- TRAINING PHASE (heavy reuse) --------
         model.train()
