@@ -55,14 +55,15 @@ class Config:
 
     # ELO
     INITIAL_ELO = 200
-    ELO_K = 8
+    ELO_K = 4
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 5000
     ELO_EVAL_GAMES = 32
 
     # Training
-    GAMES_PER_ITERATION = 6
-    STEPS_PER_ITERATION = 500
+    GAMES_PER_ITERATION = 25
+    COLLECTION_INTERVAL = 1
+    TRAIN_UPDATES_PER_ITER = 100
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128
     BUFFER_SIZE = 262144
     KL_EPSILON = 1e-6

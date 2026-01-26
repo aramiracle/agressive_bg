@@ -36,7 +36,7 @@ def collection_worker(args):
     """
     model_state, games_per_worker, device = args
 
-    torch.set_num_threads(1)  # avoid oversubscription
+    torch.set_num_threads(1)
 
     game = BackgammonGame()
     model = get_model().to(device)
@@ -51,14 +51,12 @@ def collection_worker(args):
 
     return collected
 
-# ------------------------------------------------------------
-# Parallel self-play collection
-# ------------------------------------------------------------
-
-# Top-level wrapper for multiprocessing (picklable)
 def collect_worker_wrapper(args):
     return collection_worker(args)
 
+# ------------------------------------------------------------
+# Parallel self-play collection
+# ------------------------------------------------------------
 
 def parallel_collect_self_play(model, replay_buffer, total_games, device="cpu"):
     """
@@ -82,7 +80,6 @@ def parallel_collect_self_play(model, replay_buffer, total_games, device="cpu"):
 
     replay_buffer.extend(collected)
 
-
 # ------------------------------------------------------------
 # TRAIN LOOP
 # ------------------------------------------------------------
@@ -94,10 +91,13 @@ def train():
     model = get_model().to(device)
     best_model = get_model().to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=Config.LR,
+        weight_decay=Config.WEIGHT_DECAY
+    )
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
-    # Load local checkpoints
     cp_latest = load_checkpoint(latest_path, model, optimizer, device)
     train_step = cp_latest['step'] if cp_latest else 0
     current_elo = cp_latest['elo'] if cp_latest else Config.INITIAL_ELO
@@ -115,19 +115,32 @@ def train():
     pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Overall Training")
 
     while train_step < Config.TRAIN_STEPS:
-        # -------- COLLECTION PHASE --------
-        parallel_collect_self_play(model, replay_buffer, Config.GAMES_PER_ITERATION)
+        # -------- COLLECTION PHASE (DECOUPLED) --------
+        if train_step % Config.COLLECTION_INTERVAL == 0:
+            parallel_collect_self_play(
+                model,
+                replay_buffer,
+                Config.GAMES_PER_ITERATION
+            )
 
         if len(replay_buffer) < Config.BATCH_SIZE:
             continue
 
-        # -------- TRAINING PHASE --------
+        # -------- TRAINING PHASE (HEAVY REUSE) --------
         model.train()
-        for _ in range(Config.STEPS_PER_ITERATION):
-            loss, gnorm = train_batch(model, optimizer, replay_buffer, Config.BATCH_SIZE, device, scaler)
-            train_step += 1
+        for _ in range(Config.TRAIN_UPDATES_PER_ITER):
+            loss, gnorm = train_batch(
+                model,
+                optimizer,
+                replay_buffer,
+                Config.BATCH_SIZE,
+                device,
+                scaler
+            )
 
+            train_step += 1
             buf_fill = (len(replay_buffer) / Config.BUFFER_SIZE) * 100
+
             pbar.update(1)
             pbar.set_postfix({
                 'loss': f'{loss:.4f}',
@@ -144,11 +157,11 @@ def train():
 
                 args = (game, model, best_model, Config.ELO_EVAL_GAMES, 'cpu', None)
                 wins, total = evaluate_vs_opponent(args)
+
                 old_elo = current_elo
                 current_elo = update_elo(current_elo, best_elo, wins, total)
                 print(f"  📊 Summary: {wins}/{total} wins | ELO: {old_elo:.0f} -> {current_elo:.0f}")
 
-                # Check for new best
                 if current_elo > best_elo:
                     print(f"  🏆 NEW BEST MODEL (ELO: {current_elo:.0f})")
                     best_elo = current_elo
@@ -163,5 +176,5 @@ def train():
     print("\n✅ Training complete!")
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)  # ensure safe multiprocessing
+    mp.set_start_method('spawn', force=True)
     train()
