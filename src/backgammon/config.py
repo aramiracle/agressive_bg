@@ -60,7 +60,7 @@ class Config:
     ELO_EVAL_GAMES = 32
 
     # Training
-    MATCHES_PER_ITERATION = 3
+    MATCHES_PER_ITERATION = 6
     COLLECTION_INTERVAL = 1
     TRAIN_UPDATES_PER_ITER = 200
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128
