@@ -52,27 +52,10 @@ class MCTS:
                 sqrt_visits = math.sqrt(node.visits + 1)
 
                 for child in node.children:
-                    # Force cpuct to float just in case
-                    cpuct = float(self.cpuct)
-                    
-                    # Force prior to float (handle list/tensor/float inputs)
-                    try:
-                        if hasattr(child.prior, 'item'):
-                            # Handle torch tensors or numpy scalars
-                            prior_val = float(child.prior.item())
-                        elif isinstance(child.prior, (list, tuple)):
-                            # Handle accidental list wrapping
-                            prior_val = float(child.prior[0])
-                        else:
-                            prior_val = float(child.prior)
-                    except (TypeError, IndexError, ValueError):
-                        # Fallback if data is corrupted
-                        prior_val = 1.0
-
-                    sqrt_visits = math.sqrt(node.visits + 1)
-                    
-                    # Calculate UCB using local safe variables
-                    u = cpuct * prior_val * sqrt_visits / (1 + child.visits)
+                    # Calculate UCB
+                    # safe check: ensure prior is float to prevent TypeError
+                    prior_score = float(child.prior) 
+                    u = self.cpuct * prior_score * sqrt_visits / (1 + child.visits)
                     q = child.value_sum / child.visits if child.visits > 0 else 0.0
                     score = q + u
 

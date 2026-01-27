@@ -319,10 +319,10 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
     
     # Setup models/MCTS based on seats
     model_p1 = current_model if current_is_p1 else baseline_model
-    mcts_p1 = mcts_current if current_is_p1 else MCTS(baseline_model, device)
-    
     model_p2 = baseline_model if current_is_p1 else current_model
-    mcts_p2 = MCTS(baseline_model, device) if current_is_p1 else mcts_current
+    # Corrected calls in utils.py
+    mcts_p1 = mcts_current if current_is_p1 else MCTS(baseline_model, device=device)
+    mcts_p2 = MCTS(baseline_model, device=device) if current_is_p1 else mcts_current
 
     while scores[1] < Config.MATCH_TARGET and scores[-1] < Config.MATCH_TARGET:
         leader = 1 if scores[1] > scores[-1] else -1
