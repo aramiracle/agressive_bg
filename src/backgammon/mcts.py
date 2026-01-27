@@ -48,55 +48,59 @@ class MCTS:
             # --- SELECTION PHASE ---
             while node.children:
                 best = None
-                best_score = -float('inf') # Use -inf, cleaner than -1e9
+                best_score = -float('inf')
                 sqrt_visits = math.sqrt(node.visits + 1)
 
                 for child in node.children:
-                    u = self.cpuct * child.prior * sqrt_visits / (1 + child.visits)
-                    q = child.value_sum / child.visits if child.visits else 0.0
+                    # Calculate UCB
+                    # safe check: ensure prior is float to prevent TypeError
+                    prior_score = float(child.prior) 
+                    u = self.cpuct * prior_score * sqrt_visits / (1 + child.visits)
+                    q = child.value_sum / child.visits if child.visits > 0 else 0.0
                     score = q + u
 
-                    # Check for NaNs to prevent poisoning
-                    if math.isnan(score): 
+                    if math.isnan(score):
                         score = -float('inf')
 
                     if score > best_score:
                         best_score = score
                         best = child
                 
-                # SAFETY CHECK: If best is still None, break to avoid crash
+                # If selection failed (should not happen if children exist), break
                 if best is None:
                     break
 
-                # Handle Game Step
                 try:
-                    # Move atomic logic here to separate variable access from game logic
-                    action = best.action 
-                    game.step_atomic(action)
+                    game.step_atomic(best.action)
                     node = best
                 except Exception:
-                    # This catches illegal moves from game logic, not AttributeError
+                    # Handle rare cases where a cached move becomes invalid
                     if best in node.children:
                         node.children.remove(best)
-                    # If we pruned the only child, or selection failed, stop this sim
-                    if not node.children: 
+                    if not node.children:
                         break
-                    continue # Try selecting a different sibling
+                    continue
 
+                # Stop selection if turn ends (dice used up)
                 if not game.dice:
                     break
             
-            # ... (Rest of the loop: checking win, backprop, expansion) ... 
-
+            # --- EVALUATION / BACKPROP ---
             winner, _ = game.check_win()
             if winner != 0:
+                # Value is +1 if 'node' player won (current turn), else -1
+                # Note: This logic assumes standard zero-sum perspective relative to node.parent
                 value = 1.0 if winner == game.turn else -1.0
                 self._backpropagate(node, value)
                 continue
 
+            # Expansion
             if not node.children:
                 self._expand_node(node, game)
 
+            # If node is a leaf (just expanded or terminal), queue for evaluation
+            # If expansion failed (no legal moves but no winner?), we treat as draw or loss depending on rules
+            # Here we just evaluate the state value.
             b_t, c_t = game.get_vector(
                 my_score=my_score,
                 opp_score=opp_score,
@@ -106,10 +110,12 @@ class MCTS:
 
             eval_queue.append((node, b_t, c_t))
 
+            # Batch Processing
             if len(eval_queue) >= self.batch_size:
                 self._flush_batch(eval_queue)
                 eval_queue.clear()
 
+        # Flush remaining
         if eval_queue:
             self._flush_batch(eval_queue)
 
@@ -117,12 +123,16 @@ class MCTS:
         return self.root
 
     def _flush_batch(self, batch):
+        if not batch:
+            return
+
         boards = torch.stack([b for _, b, _ in batch]).to(self.device)
         ctxs = torch.stack([c for _, _, c in batch]).to(self.device)
 
         with torch.no_grad():
+            # Standard model forward pass: returns (p_from, p_to, value, cube)
             out = self.model(boards, ctxs)
-            values = out[2].squeeze(-1)
+            values = out[2].squeeze(-1) # Value head is index 2
 
         for i, (node, _, _) in enumerate(batch):
             v = float(values[i].item())
@@ -133,13 +143,20 @@ class MCTS:
         if not legal:
             return
 
-        prior = 1.0 / len(legal)
-        node.children = [MCTSNode(node, mv, prior) for mv in legal]
+        # Uniform prior if not using policy head for selection (simplification)
+        # We ensure prior is strictly a float
+        prior = float(1.0 / len(legal))
+        
+        # KEY FIX: Use keyword arguments to ensure 'action' gets 'mv' and 'prior' gets 'prior'
+        node.children = [
+            MCTSNode(parent=node, action=mv, prior=prior) 
+            for mv in legal
+        ]
 
     def _backpropagate(self, node, value):
         v = value
         while node is not None:
             node.visits += 1
             node.value_sum += v
-            v = -v
+            v = -v # Flip perspective for parent
             node = node.parent

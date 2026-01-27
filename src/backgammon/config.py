@@ -46,7 +46,7 @@ class Config:
     CNN_KERNEL = 3
 
     # MCTS
-    NUM_SIMULATIONS = 128
+    NUM_SIMULATIONS = 100
     MCTS_BATCH = 32
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
@@ -60,11 +60,11 @@ class Config:
     ELO_EVAL_GAMES = 32
 
     # Training
-    GAMES_PER_ITERATION = 50
+    MATCHES_PER_ITERATION = 3
     COLLECTION_INTERVAL = 1
-    TRAIN_UPDATES_PER_ITER = 100
+    TRAIN_UPDATES_PER_ITER = 200
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128
-    BUFFER_SIZE = 262144
+    BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
     LABEL_SMOOTHING = 0.02
     LR = 1e-5

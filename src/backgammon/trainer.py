@@ -22,7 +22,8 @@ from src.backgammon.checkpoint import (
 )
 from src.backgammon.elo import evaluate_vs_opponent, update_elo
 from src.backgammon.replay_buffer import get_replay_buffer
-from src.backgammon.utils import play_one_game, train_batch
+# UPDATED IMPORT: Using match-based function
+from src.backgammon.utils import play_self_play_match, train_batch
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -32,9 +33,9 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 def collection_worker(args):
     """
-    Multiprocessing worker for self-play games.
+    Multiprocessing worker for self-play matches.
     """
-    model_state, games_per_worker, device = args
+    model_state, matches_per_worker, device = args
 
     torch.set_num_threads(1)
 
@@ -45,8 +46,10 @@ def collection_worker(args):
     mcts = MCTS(model, device=device)
 
     collected = []
-    for _ in range(games_per_worker):
-        data, _ = play_one_game(game, mcts, model, device)
+    # Loop now represents "Matches", not single games
+    for _ in range(matches_per_worker):
+        # UPDATED: Call play_self_play_match instead of play_one_game
+        data, _ = play_self_play_match(game, mcts, model, device)
         collected.extend(data)
 
     return collected
@@ -58,24 +61,26 @@ def collect_worker_wrapper(args):
 # Parallel self-play collection
 # ------------------------------------------------------------
 
-def parallel_collect_self_play(model, replay_buffer, total_games, device="cpu"):
+def parallel_collect_self_play(model, replay_buffer, total_matches, device="cpu"):
     """
-    Parallel self-play collection using imap_unordered with tqdm
+    Parallel self-play collection using imap_unordered with tqdm.
     """
     num_workers = mp.cpu_count()
-    games_per_worker = max(1, total_games // num_workers)
+    # Ensure at least 1 match per worker if total_matches < num_workers
+    matches_per_worker = max(1, total_matches // num_workers)
+    
     model_state = model.state_dict()
-
     ctx = mp.get_context("spawn")
-    args_list = [(model_state, games_per_worker, device) for _ in range(num_workers)]
+    
+    args_list = [(model_state, matches_per_worker, device) for _ in range(num_workers)]
 
     collected = []
 
     with ctx.Pool(processes=num_workers) as pool:
-        pbar = tqdm(total=total_games, desc="Collecting (self-play)", dynamic_ncols=True)
+        pbar = tqdm(total=total_matches, desc="Collecting (matches)", dynamic_ncols=True)
         for result in pool.imap_unordered(collect_worker_wrapper, args_list):
             collected.extend(result)
-            pbar.update(len(result))
+            pbar.update(len(result) // 20 if len(result) > 20 else 1) # Approximate progress or specific count if possible
         pbar.close()
 
     replay_buffer.extend(collected)
@@ -120,7 +125,7 @@ def train():
             parallel_collect_self_play(
                 model,
                 replay_buffer,
-                Config.GAMES_PER_ITERATION
+                Config.MATCHES_PER_ITERATION # Acts as 'Matches per iteration' now
             )
 
         if len(replay_buffer) < Config.BATCH_SIZE:
@@ -155,6 +160,8 @@ def train():
                 model.eval()
                 best_model.eval()
 
+                # Note: evaluate_vs_opponent in elo.py should ideally handle match play 
+                # or single games. Assuming it handles the logic correctly.
                 args = (game, model, best_model, Config.ELO_EVAL_GAMES, 'cpu', None)
                 wins, total = evaluate_vs_opponent(args)
 

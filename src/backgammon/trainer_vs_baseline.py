@@ -21,7 +21,8 @@ from src.backgammon.checkpoint import (
     get_model_state_dict, load_model_state_dict
 )
 from src.backgammon.elo import evaluate_vs_opponent, update_elo
-from src.backgammon.utils import play_one_game, play_vs_baseline, train_batch, load_model_with_config
+# UPDATED IMPORTS: Using match-based functions
+from src.backgammon.utils import play_self_play_match, play_vs_baseline_match, train_batch, load_model_with_config
 from src.backgammon.replay_buffer import get_replay_buffer
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -33,9 +34,9 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 def collection_worker(args):
     """
     Torch multiprocessing worker for self-play or vs-baseline.
-    Returns list of samples.
+    Returns list of samples from MATCHES.
     """
-    mode, model_state, baseline_state, games_per_worker, device = args
+    mode, model_state, baseline_state, matches_per_worker, device = args
 
     torch.set_num_threads(1)
 
@@ -53,11 +54,13 @@ def collection_worker(args):
     mcts = MCTS(model, device=device)
     collected = []
 
-    for _ in range(games_per_worker):
+    for _ in range(matches_per_worker):
         if mode == "self":
-            data, _ = play_one_game(game=game, mcts=mcts, model=model, device=device)
+            # UPDATED: Use play_self_play_match
+            data, _ = play_self_play_match(game=game, mcts=mcts, model=model, device=device)
         else:
-            data, _ = play_vs_baseline(
+            # UPDATED: Use play_vs_baseline_match
+            data, _ = play_vs_baseline_match(
                 game=game,
                 current_model=model,
                 baseline_model=baseline_model,
@@ -71,12 +74,12 @@ def collection_worker(args):
 def collect_worker_wrapper(args):
     return collection_worker(args)
 
-def parallel_collect(mode, model, baseline_model, replay_buffer, total_games, device="cpu"):
+def parallel_collect(mode, model, baseline_model, replay_buffer, total_matches, device="cpu"):
     """
-    Collect games in parallel using imap_unordered (like ELO evaluation)
+    Collect matches in parallel using imap_unordered
     """
     num_workers = mp.cpu_count()
-    games_per_worker = max(1, total_games // num_workers)
+    matches_per_worker = max(1, total_matches // num_workers)
 
     model_state = model.state_dict()
     baseline_state = baseline_model.state_dict() if baseline_model else None
@@ -84,17 +87,18 @@ def parallel_collect(mode, model, baseline_model, replay_buffer, total_games, de
     ctx = mp.get_context("spawn")
 
     args_list = [
-        (mode, model_state, baseline_state, games_per_worker, device)
+        (mode, model_state, baseline_state, matches_per_worker, device)
         for _ in range(num_workers)
     ]
 
     collected = []
 
     with ctx.Pool(processes=num_workers) as pool:
-        pbar = tqdm(total=total_games, desc=f"Collecting ({mode})", dynamic_ncols=True)
+        pbar = tqdm(total=total_matches, desc=f"Collecting ({mode})", dynamic_ncols=True)
         for result in pool.imap_unordered(collect_worker_wrapper, args_list):
             collected.extend(result)
-            pbar.update(len(result))
+            # Update progress based on estimated batch size, or just visually
+            pbar.update(len(result) // 20 if len(result) > 20 else 1) 
         pbar.close()
 
     replay_buffer.extend(collected)
@@ -154,7 +158,6 @@ def train():
     else:
         print(f"⚠️ No baseline found at {baseline_path}, proceeding with self-play only.")
 
-    # 🔥 CHANGE 1: use FULL buffer (no 0.6 shrink)
     replay_buffer = get_replay_buffer(
         Config.BUFFER_SIZE,
         prioritized=True
@@ -176,8 +179,8 @@ def train():
     while train_step < Config.TRAIN_STEPS:
         # -------- COLLECTION PHASE (decoupled) --------
         if train_step % Config.COLLECTION_INTERVAL == 0:
-            num_self = int(Config.GAMES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
-            num_baseline = Config.GAMES_PER_ITERATION - num_self
+            num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
+            num_baseline = Config.MATCHES_PER_ITERATION - num_self
 
             strong_opponent = get_strong_opponent(phase, baseline_model, best_model)
 
