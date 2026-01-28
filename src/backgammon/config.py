@@ -80,7 +80,7 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Checkpoints
-    CHECKPOINT_DIR = "checkpoints"
+    CHECKPOINT_DIR = "checkpoints_v1"
     BASELINE_DIR = "checkpoints_v1"
     BASELINE_MODEL_NAME = "best_model.pt"
     BASELINE_SWITCH_ON_SURPASS = True

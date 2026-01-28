@@ -17,7 +17,7 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     boards = torch.stack([x[0] for x in batch]).to(device).float()
     contexts = torch.stack([x[1] for x in batch]).to(device).float()
     rewards = torch.tensor([x[3] for x in batch], dtype=torch.float, device=device)
-    weights_t = torch.tensor(weights, dtype=torch.float, device=device)
+    weights_t = weights.clone().detach().to(device).float()
 
     # Normalize/clamp boards and contexts
     boards = boards / max(Config.CHECKERS_PER_PLAYER, 1)
