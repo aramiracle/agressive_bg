@@ -16,6 +16,9 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     # ------------------------------
     # Stack tensors
     # ------------------------------
+    if batch is None or len(batch) == 0:
+        return 0.0, 0.0
+    
     boards = torch.stack([x[0] for x in batch]).to(device)
     contexts = torch.stack([x[1] for x in batch]).to(device).float()
     rewards = torch.tensor([x[3] for x in batch], dtype=torch.float32, device=device)
