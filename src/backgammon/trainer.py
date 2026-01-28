@@ -15,7 +15,7 @@ from src.backgammon.config import Config
 from src.backgammon.engine import BackgammonGame
 from src.backgammon.model import get_model
 from src.backgammon.mcts import MCTS
-from backgammon.utils.checkpoint import (
+from src.backgammon.utils.checkpoint import (
     setup_checkpoint_dir, save_checkpoint, load_checkpoint,
     get_model_state_dict, load_model_state_dict
 )
