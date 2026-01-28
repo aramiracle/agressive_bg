@@ -21,7 +21,7 @@ from backgammon.engine import BackgammonGame
 from backgammon.mcts import MCTS
 from backgammon.model import get_model
 from backgammon.config import Config
-from backgammon.utils import get_learned_cube_decision
+from backgammon.utils.cube import get_learned_cube_decision
 
 
 # =========================
