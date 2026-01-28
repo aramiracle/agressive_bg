@@ -22,7 +22,7 @@ class Config:
     }
 
     # Game
-    MATCH_TARGET = 7
+    MATCH_TARGET = 1
 
     # Rewards
     R_WIN = 1.0
@@ -62,7 +62,7 @@ class Config:
     ELO_EVAL_GAMES = 32
 
     # Training
-    MATCHES_PER_ITERATION = 3
+    MATCHES_PER_ITERATION = 10
     COLLECTION_INTERVAL = 1
     TRAIN_UPDATES_PER_ITER = 500
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128

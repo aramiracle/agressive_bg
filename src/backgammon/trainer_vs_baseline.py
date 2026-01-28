@@ -1,4 +1,3 @@
-# Full Trainer vs Baseline (Crawford-safe, MCTS-safe, Engine-compatible)
 """
 Train new model vs older baseline version with full cubing, MCTS reuse, and ELO tracking.
 Features: Mixed-opponent collection, detailed evaluation vs both Best and Baseline models.

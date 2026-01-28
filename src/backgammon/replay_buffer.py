@@ -1,7 +1,3 @@
-# =============================
-# TORCH VERSION: NaN-SAFE
-# =============================
-
 import torch
 from typing import List, Tuple, Any
 from src.backgammon.config import Config
@@ -135,7 +131,7 @@ class PrioritizedReplayBuffer:
         return batch, tree_idxs, weights
 
     def update_priorities(self, indices: List[int], td_errors: List[float]):
-        indices = torch.tensor(indices, device=self.device)
+        indices = indices.clone().detach().to(self.device, dtype=torch.long)
         td_errors = torch.tensor(td_errors, device=self.device)
         td_errors = torch.nan_to_num(td_errors, nan=0.0, posinf=1.0, neginf=1.0)
 

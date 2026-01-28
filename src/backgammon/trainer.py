@@ -1,11 +1,9 @@
-# Full Trainer for Backgammon RL (Self-Play Only, ELO tracking, Multi-Core)
 """
 Train a new model using self-play with full cubing support and ELO tracking.
 Features: GradScaler, replay buffer, evaluation vs best model, stable optimization,
 and multi-core self-play collection using torch.multiprocessing.
 """
 
-import os
 import torch
 import torch.optim as optim
 import torch.multiprocessing as mp

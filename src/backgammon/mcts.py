@@ -1,8 +1,3 @@
-# ============================================================
-# MCTS — HARD DEBUG EDITION
-# Will CRASH on first NaN or invalid policy
-# ============================================================
-
 import math
 import torch
 import traceback

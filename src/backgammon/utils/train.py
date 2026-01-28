@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from src.backgammon.config import Config
 from src.backgammon.utils.distribution import smooth_distribution, jensen_shannon_loss
-from src.backgammon.utils.checkpoint import load_checkpoint
 
 
 def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
@@ -25,8 +24,8 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     # ------------------------------
     # HARD TYPE SAFETY (Embedding)
     # ------------------------------
-    if boards.dtype != torch.long:
-        boards = boards.long()
+    boards = boards.long()
+    contexts = contexts.float()
 
     # ------------------------------
     # HARD RANGE SAFETY (Embedding)
@@ -34,12 +33,6 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     vocab = model.embedding.num_embeddings
     if torch.min(boards) < 0 or torch.max(boards) >= vocab:
         raise RuntimeError("Board token out of embedding range")
-
-    # ------------------------------
-    # Continuous input safety
-    # ------------------------------
-    contexts = torch.nan_to_num(contexts, nan=0.0, posinf=1.0, neginf=-1.0)
-    rewards = torch.nan_to_num(rewards, nan=0.0, posinf=10.0, neginf=-10.0)
 
     # ------------------------------
     # Forward pass (AMP disabled for stability)
