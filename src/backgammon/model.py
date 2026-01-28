@@ -3,7 +3,6 @@
 import math
 import torch
 import torch.nn as nn
-from torch.nn.utils.parametrizations import weight_norm
 from src.backgammon.config import Config
 
 
@@ -71,8 +70,8 @@ class BackgammonTransformer(nn.Module):
         self.out_norm = nn.LayerNorm(d)
 
         # Output heads (new stable weight norm API)
-        self.policy_from = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
-        self.policy_to = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
+        self.policy_from = nn.Linear(d, cfg.NUM_ACTIONS)
+        self.policy_to = nn.Linear(d, cfg.NUM_ACTIONS)
 
         self.value_head = nn.Sequential(
             nn.LayerNorm(d),
@@ -205,8 +204,9 @@ class BackgammonCNN(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
         # Output heads (new weight norm API)
-        self.policy_from = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
-        self.policy_to = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
+        self.policy_from = nn.Linear(d, cfg.NUM_ACTIONS)
+        self.policy_to = nn.Linear(d, cfg.NUM_ACTIONS)
+
 
         self.value_head = nn.Sequential(
             nn.LayerNorm(d),
