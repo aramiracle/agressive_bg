@@ -1,3 +1,8 @@
+# =============================
+# MINIMAL, PRECISE NaN-SAFE MODIFICATIONS
+# Structure and behavior preserved
+# =============================
+
 import math
 import torch
 
@@ -11,7 +16,11 @@ class MCTSNode:
         self.children = []
         self.visits = 0
         self.value_sum = 0.0
-        self.prior = prior
+        # --- SAFETY: ensure prior is always finite float ---
+        try:
+            self.prior = float(prior)
+        except Exception:
+            self.prior = 0.0
 
 
 class MCTS:
@@ -45,28 +54,29 @@ class MCTS:
             node = self.root
             game.fast_restore(root_snapshot)
 
-            # --- SELECTION PHASE ---
+            # ---------------- SELECTION ----------------
             while node.children:
                 best = None
-                best_score = -float('inf')
+                best_score = -float("inf")
                 sqrt_visits = math.sqrt(node.visits + 1)
 
                 for child in node.children:
-                    # Calculate UCB
-                    # safe check: ensure prior is float to prevent TypeError
-                    prior_score = float(child.prior) 
-                    u = self.cpuct * prior_score * sqrt_visits / (1 + child.visits)
-                    q = child.value_sum / child.visits if child.visits > 0 else 0.0
-                    score = q + u
+                    # --- SAFETY: protect UCB math ---
+                    prior = child.prior
+                    if not math.isfinite(prior) or prior < 0.0:
+                        prior = 0.0
 
-                    if math.isnan(score):
-                        score = -float('inf')
+                    u = self.cpuct * prior * sqrt_visits / (1 + child.visits)
+                    q = child.value_sum / child.visits if child.visits > 0 else 0.0
+
+                    score = q + u
+                    if not math.isfinite(score):
+                        score = -float("inf")
 
                     if score > best_score:
                         best_score = score
                         best = child
-                
-                # If selection failed (should not happen if children exist), break
+
                 if best is None:
                     break
 
@@ -74,33 +84,28 @@ class MCTS:
                     game.step_atomic(best.action)
                     node = best
                 except Exception:
-                    # Handle rare cases where a cached move becomes invalid
+                    # Invalid cached move: drop child and retry
                     if best in node.children:
                         node.children.remove(best)
                     if not node.children:
                         break
                     continue
 
-                # Stop selection if turn ends (dice used up)
                 if not game.dice:
                     break
-            
-            # --- EVALUATION / BACKPROP ---
+
+            # ---------------- TERMINAL CHECK ----------------
             winner, _ = game.check_win()
             if winner != 0:
-                # Value is +1 if 'node' player won (current turn), else -1
-                # Note: This logic assumes standard zero-sum perspective relative to node.parent
                 value = 1.0 if winner == game.turn else -1.0
                 self._backpropagate(node, value)
                 continue
 
-            # Expansion
+            # ---------------- EXPANSION ----------------
             if not node.children:
                 self._expand_node(node, game)
 
-            # If node is a leaf (just expanded or terminal), queue for evaluation
-            # If expansion failed (no legal moves but no winner?), we treat as draw or loss depending on rules
-            # Here we just evaluate the state value.
+            # ---------------- EVALUATION ----------------
             b_t, c_t = game.get_vector(
                 my_score=my_score,
                 opp_score=opp_score,
@@ -110,12 +115,10 @@ class MCTS:
 
             eval_queue.append((node, b_t, c_t))
 
-            # Batch Processing
             if len(eval_queue) >= self.batch_size:
                 self._flush_batch(eval_queue)
                 eval_queue.clear()
 
-        # Flush remaining
         if eval_queue:
             self._flush_batch(eval_queue)
 
@@ -130,12 +133,17 @@ class MCTS:
         ctxs = torch.stack([c for _, _, c in batch]).to(self.device)
 
         with torch.no_grad():
-            # Standard model forward pass: returns (p_from, p_to, value, cube)
             out = self.model(boards, ctxs)
-            values = out[2].squeeze(-1) # Value head is index 2
+            values = out[2].squeeze(-1)
 
         for i, (node, _, _) in enumerate(batch):
             v = float(values[i].item())
+
+            # --- SAFETY: clamp value head ---
+            if not math.isfinite(v):
+                v = 0.0
+            v = max(-1.0, min(1.0, v))
+
             self._backpropagate(node, v)
 
     def _expand_node(self, node, game):
@@ -143,20 +151,23 @@ class MCTS:
         if not legal:
             return
 
-        # Uniform prior if not using policy head for selection (simplification)
-        # We ensure prior is strictly a float
-        prior = float(1.0 / len(legal))
-        
-        # KEY FIX: Use keyword arguments to ensure 'action' gets 'mv' and 'prior' gets 'prior'
+        # Uniform prior (unchanged behavior)
+        prior = 1.0 / len(legal)
+
         node.children = [
-            MCTSNode(parent=node, action=mv, prior=prior) 
+            MCTSNode(parent=node, action=mv, prior=prior)
             for mv in legal
         ]
 
     def _backpropagate(self, node, value):
-        v = value
+        v = float(value)
+        # --- SAFETY: sanitize backprop value ---
+        if not math.isfinite(v):
+            v = 0.0
+        v = max(-1.0, min(1.0, v))
+
         while node is not None:
             node.visits += 1
             node.value_sum += v
-            v = -v # Flip perspective for parent
+            v = -v
             node = node.parent

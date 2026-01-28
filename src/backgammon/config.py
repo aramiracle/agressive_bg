@@ -51,6 +51,8 @@ class Config:
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
+    MIN_PRIOR = 1e-4
+    MAX_PRIOR = 1e4
 
     # ELO
     INITIAL_ELO = 200
@@ -60,9 +62,9 @@ class Config:
     ELO_EVAL_GAMES = 32
 
     # Training
-    MATCHES_PER_ITERATION = 6
+    MATCHES_PER_ITERATION = 3
     COLLECTION_INTERVAL = 1
-    TRAIN_UPDATES_PER_ITER = 200
+    TRAIN_UPDATES_PER_ITER = 500
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128
     BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
