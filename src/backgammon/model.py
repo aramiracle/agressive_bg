@@ -1,8 +1,9 @@
-"""Neural network models for backgammon AI (NaN-hardened)."""
+"""Neural network models for backgammon AI (NaN-hardened, no deprecated APIs)."""
 
 import math
 import torch
 import torch.nn as nn
+from torch.nn.utils.parametrizations import weight_norm
 from src.backgammon.config import Config
 
 
@@ -69,9 +70,9 @@ class BackgammonTransformer(nn.Module):
 
         self.out_norm = nn.LayerNorm(d)
 
-        # Output heads
-        self.policy_from = nn.utils.weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
-        self.policy_to = nn.utils.weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
+        # Output heads (new stable weight norm API)
+        self.policy_from = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
+        self.policy_to = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
 
         self.value_head = nn.Sequential(
             nn.LayerNorm(d),
@@ -153,7 +154,7 @@ class ResidualBlock1D(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
 
-        self.res_scale = 0.5  # residual dampening
+        self.res_scale = 0.5
 
     def forward(self, x):
         residual = x
@@ -203,8 +204,9 @@ class BackgammonCNN(nn.Module):
 
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-        self.policy_from = nn.utils.weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
-        self.policy_to = nn.utils.weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
+        # Output heads (new weight norm API)
+        self.policy_from = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
+        self.policy_to = weight_norm(nn.Linear(d, cfg.NUM_ACTIONS))
 
         self.value_head = nn.Sequential(
             nn.LayerNorm(d),
