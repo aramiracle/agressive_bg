@@ -1,22 +1,32 @@
 import torch
+import random
+import math
 from typing import List, Tuple, Any
 from src.backgammon.config import Config
 
-
 # -------------------------------------------------
-# FastSumTree (TORCH)
+# FastSumTree (PURE PYTHON - Optimized for speed)
 # -------------------------------------------------
 class FastSumTree:
-    def __init__(self, capacity: int, device: str = "cpu"):
-        self.device = device
+    def __init__(self, capacity: int):
         self.capacity = 1
         while self.capacity < capacity:
             self.capacity *= 2
 
-        self.tree = torch.zeros(2 * self.capacity - 1, dtype=torch.float32, device=self.device)
+        # Standard list is faster than torch.tensor for scalar updates
+        self.tree = [0.0] * (2 * self.capacity - 1)
         self.data = [None] * self.capacity
         self.write_idx = 0
         self.count = 0
+
+    def update(self, idx: int, priority: float):
+        priority = max(priority, 1e-6) # Safety floor
+        change = priority - self.tree[idx]
+        self.tree[idx] = priority
+        
+        while idx != 0:
+            idx = (idx - 1) // 2
+            self.tree[idx] += change
 
     def add(self, data: Any, priority: float):
         idx = self.write_idx + self.capacity - 1
@@ -25,128 +35,97 @@ class FastSumTree:
         self.write_idx = (self.write_idx + 1) % self.capacity
         self.count = min(self.count + 1, self.capacity)
 
-    def update(self, idx: int, priority: float):
-        priority = float(priority)
-        if not torch.isfinite(torch.tensor(priority)):
-            priority = 0.0
-        priority = max(priority, Config.MIN_PRIOR)
-
-        change = priority - self.tree[idx].item()
-        self.tree[idx] = priority
-
-        while idx != 0:
-            idx = (idx - 1) // 2
-            self.tree[idx] += change
-
-    def update_batch(self, indices: torch.Tensor, priorities: torch.Tensor):
-        priorities = torch.nan_to_num(priorities, nan=0.0, posinf=1.0, neginf=1.0)
-        priorities = torch.clamp(priorities, Config.MIN_PRIOR, Config.MAX_PRIOR)
-
-        changes = priorities - self.tree[indices]
-        self.tree[indices] = priorities
-
-        while True:
-            indices = (indices - 1) // 2
-            self.tree.index_add_(0, indices, changes)
-            if indices[0] == 0:
-                break
-
-    def get(self, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        idx = torch.zeros(len(s), dtype=torch.int64, device=self.device)
+    def get(self, s: float) -> Tuple[int, float, Any]:
+        idx = 0
         leaf_start = self.capacity - 1
-
-        while idx[0] < leaf_start:
+        
+        while idx < leaf_start:
             left = 2 * idx + 1
             right = left + 1
-            left_vals = self.tree[left]
-
-            go_right = s > left_vals
-            s[go_right] -= left_vals[go_right]
-
-            idx[go_right] = right[go_right]
-            idx[~go_right] = left[~go_right]
-
-        data_idxs = idx - self.capacity + 1
-        data_idxs = torch.clamp(data_idxs, 0, self.count - 1)
-        return idx, self.tree[idx], data_idxs
+            if left >= len(self.tree): break
+            
+            if s <= self.tree[left]:
+                idx = left
+            else:
+                s -= self.tree[left]
+                idx = right
+                
+        data_idx = idx - self.capacity + 1
+        data_idx = max(0, min(data_idx, self.count - 1))
+        return idx, self.tree[idx], self.data[data_idx]
 
     @property
-    def total_priority(self) -> float:
-        total = float(self.tree[0].item())
-        if not torch.isfinite(torch.tensor(total)) or total <= 0.0:
-            return Config.MIN_PRIOR
-        return total
-
+    def total_priority(self):
+        return max(self.tree[0], 1e-6)
 
 # -------------------------------------------------
-# PrioritizedReplayBuffer (TORCH)
+# PrioritizedReplayBuffer (Fixed & Complete)
 # -------------------------------------------------
 class PrioritizedReplayBuffer:
-    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment: float = 0.001, device: str = "cpu"):
+    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, device: str = "cpu"):
+        self.tree = FastSumTree(capacity)
         self.alpha = alpha
         self.beta = beta
-        self.beta_increment = beta_increment
-        self.tree = FastSumTree(capacity, device=device)
         self.max_priority = 1.0
         self.device = device
 
     def add(self, data: Any, priority: float = None):
         if priority is None:
             priority = self.max_priority
-
-        priority = float(priority)
-        if not torch.isfinite(torch.tensor(priority)):
-            priority = self.max_priority
-
-        priority = max(priority, 1e-6) ** self.alpha
-        self.tree.add(data, priority)
+        
+        p = (abs(priority) + 1e-5) ** self.alpha
+        self.tree.add(data, p)
 
     def extend(self, data_list: List[Any]):
+        """Added back to fix the AttributeError"""
         for data in data_list:
             self.add(data)
 
     def sample(self, batch_size: int) -> Tuple[List[Any], torch.Tensor, torch.Tensor]:
         if self.tree.count < batch_size:
-            return [], torch.tensor([]), torch.tensor([])
+            return None, None, None
 
-        total_p = self.tree.total_priority
-        segment = total_p / batch_size
+        batch, tree_idxs, priorities = [], [], []
+        segment = self.tree.total_priority / batch_size
+        
+        # Priority-based sampling
+        for i in range(batch_size):
+            s = random.uniform(segment * i, segment * (i + 1))
+            idx, p, data = self.tree.get(s)
+            batch.append(data)
+            tree_idxs.append(idx)
+            priorities.append(p)
 
-        s = torch.rand(batch_size, device=self.device) * segment
-        s += torch.arange(batch_size, device=self.device) * segment
+        # Calculate importance sampling weights
+        # Prob = priority / total_priority
+        probs = [p / self.tree.total_priority for p in priorities]
+        weights = [(self.tree.count * pr) ** -self.beta for pr in probs]
+        
+        # Max weight normalization for stability
+        max_w = max(weights) if weights else 1.0
+        weights_t = torch.tensor([w / max_w for w in weights], dtype=torch.float32, device=self.device)
+        indices_t = torch.tensor(tree_idxs, dtype=torch.long, device=self.device)
 
-        tree_idxs, priorities, data_idxs = self.tree.get(s)
+        return batch, indices_t, weights_t
 
-        probs = priorities / total_p
+    def update_priorities(self, indices: torch.Tensor, td_errors: Any):
+        """Added back to update MCTS error/loss after training steps"""
+        # Convert to list for fast iteration
+        if isinstance(td_errors, torch.Tensor):
+            td_errors = td_errors.detach().cpu().tolist()
+        
+        indices_list = indices.detach().cpu().tolist()
+        
+        for idx, error in zip(indices_list, td_errors):
+            p = (abs(error) + 1e-5) ** self.alpha
+            self.tree.update(idx, p)
+            self.max_priority = max(self.max_priority, p)
 
-        self.beta = min(1.0, self.beta + self.beta_increment)
-
-        weights = (self.tree.count * probs) ** -self.beta
-        weights /= max(weights.max().item(), Config.MIN_PRIOR)
-
-        if not torch.isfinite(weights).all():
-            return [], torch.tensor([]), torch.tensor([])
-
-        batch = [self.tree.data[i] for i in data_idxs.tolist()]
-        return batch, tree_idxs, weights
-
-    def update_priorities(self, indices: List[int], td_errors: List[float]):
-        indices = indices.clone().detach().to(self.device, dtype=torch.long)
-        td_errors = torch.tensor(td_errors, device=self.device)
-        td_errors = torch.nan_to_num(td_errors, nan=0.0, posinf=1.0, neginf=1.0)
-
-        priorities = (td_errors.abs() + Config.KL_EPSILON) ** self.alpha
-        priorities = torch.clamp(priorities, Config.MIN_PRIOR, Config.MAX_PRIOR)
-
-        self.max_priority = max(self.max_priority, priorities.max().item())
-        self.tree.update_batch(indices, priorities)
-
-    def __len__(self) -> int:
+    def __len__(self):
         return self.tree.count
 
-
 # -------------------------------------------------
-# SimpleReplayBuffer (TORCH, minimal)
+# SimpleReplayBuffer
 # -------------------------------------------------
 class SimpleReplayBuffer:
     def __init__(self, capacity: int):
@@ -165,24 +144,14 @@ class SimpleReplayBuffer:
             self.add(data)
 
     def sample(self, batch_size: int):
-        if self.size < batch_size:
-            return [], torch.tensor([]), torch.tensor([])
-
-        indices = torch.randint(0, self.size, (batch_size,))
-        batch = [self.data[i] for i in indices.tolist()]
-        weights = torch.ones(batch_size, dtype=torch.float32)
-        return batch, indices, weights
-
-    def update_priorities(self, indices, td_errors):
-        pass
+        if self.size < batch_size: return None, None, None
+        indices = [random.randint(0, self.size - 1) for _ in range(batch_size)]
+        batch = [self.data[i] for i in indices]
+        return batch, torch.tensor(indices), torch.ones(batch_size)
 
     def __len__(self):
         return self.size
 
-
-# -------------------------------------------------
-# Factory (UNCHANGED)
-# -------------------------------------------------
 def get_replay_buffer(capacity: int, prioritized: bool = True, **kwargs):
     if prioritized:
         return PrioritizedReplayBuffer(capacity, **kwargs)

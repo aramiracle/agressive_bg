@@ -35,22 +35,58 @@ def collection_worker(args):
     """
     model_state, matches_per_worker, device = args
 
+    # CRITICAL: Ensure single thread per worker to prevent CPU thrashing
     torch.set_num_threads(1)
 
     game = BackgammonGame()
     model = get_model().to(device)
     model.load_state_dict(model_state)
     model.eval()
-    mcts = MCTS(model, device=device)
+    
+    # Initialize Optimized MCTS
+    # Note: Reduced simulations and batch size come from Config
+    mcts = MCTS(
+        model, 
+        cpuct=Config.C_PUCT, 
+        num_sims=Config.NUM_SIMULATIONS, 
+        device=device,
+        batch_size=Config.MCTS_BATCH
+    )
 
     collected = []
-    # Loop now represents "Matches", not single games
     for _ in range(matches_per_worker):
-        # UPDATED: Call play_self_play_match instead of play_one_game
         data, _ = play_self_play_match(game, mcts, model, device)
         collected.extend(data)
 
     return collected
+
+def parallel_collect_self_play(model, replay_buffer, total_matches, device="cpu"):
+    # Use Config.SELF_PLAY_DEVICE if you want to force CPU for collection
+    # while training on GPU
+    collection_device = getattr(Config, 'SELF_PLAY_DEVICE', device)
+    
+    num_workers = mp.cpu_count()
+    # Ensure reasonable work per worker
+    matches_per_worker = max(1, total_matches // num_workers)
+    
+    # Adjust total matches to match worker distribution
+    actual_matches = matches_per_worker * num_workers
+    
+    model_state = model.state_dict()
+    ctx = mp.get_context("spawn")
+    
+    args_list = [(model_state, matches_per_worker, collection_device) for _ in range(num_workers)]
+
+    collected = []
+
+    with ctx.Pool(processes=num_workers) as pool:
+        pbar = tqdm(total=actual_matches, desc="Collecting (matches)", dynamic_ncols=True)
+        for result in pool.imap_unordered(collect_worker_wrapper, args_list):
+            collected.extend(result)
+            pbar.update(len(result) // 20 if len(result) > 20 else 1) 
+        pbar.close()
+
+    replay_buffer.extend(collected)
 
 def collect_worker_wrapper(args):
     return collection_worker(args)

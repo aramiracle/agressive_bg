@@ -111,7 +111,7 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
                 js_f = jensen_shannon_loss(logp_f, tf)
                 js_t = jensen_shannon_loss(logp_t, tt)
 
-                if torch.isfinite(js_f) and torch.isfinite(js_t):
+                if torch.isfinite(js_f).all() and torch.isfinite(js_t).all():
                     p_loss += weight * 0.5 * (js_f + js_t)
                     p_count += 1
 
@@ -142,7 +142,7 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     if torch.isfinite(grad_norm):
         scaler.step(optimizer)
         scaler.update()
-        replay_buffer.update_priorities(indices, td_errors.cpu().numpy())
+        replay_buffer.update_priorities(indices, td_errors)
     else:
         scaler.update()
         return loss.item(), 0.0

@@ -157,10 +157,7 @@ def train():
     else:
         print(f"⚠️ No baseline found at {baseline_path}, proceeding with self-play only.")
 
-    replay_buffer = get_replay_buffer(
-        Config.BUFFER_SIZE,
-        prioritized=True
-    )
+    replay_buffer = get_replay_buffer(Config.BUFFER_SIZE, prioritized=True)
 
     game = BackgammonGame()
 
