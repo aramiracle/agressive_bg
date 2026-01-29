@@ -64,7 +64,6 @@ class Config:
     # Training
     # OPTIMIZATION: Increased data generation, reduced overfitting loop
     MATCHES_PER_ITERATION = 10
-    COLLECTION_INTERVAL = 200
     TRAIN_UPDATES_PER_ITER = 100
     
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128

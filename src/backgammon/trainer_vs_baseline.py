@@ -174,17 +174,16 @@ def train():
 
     while train_step < Config.TRAIN_STEPS:
         # -------- COLLECTION PHASE (decoupled) --------
-        if train_step % Config.COLLECTION_INTERVAL == 0:
-            num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
-            num_baseline = Config.MATCHES_PER_ITERATION - num_self
+        num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
+        num_baseline = Config.MATCHES_PER_ITERATION - num_self
 
-            strong_opponent = get_strong_opponent(phase, baseline_model, best_model)
+        strong_opponent = get_strong_opponent(phase, baseline_model, best_model)
 
-            if num_self > 0:
-                parallel_collect("self", model, None, replay_buffer, num_self)
+        if num_self > 0:
+            parallel_collect("self", model, None, replay_buffer, num_self)
 
-            if strong_opponent is not None and num_baseline > 0:
-                parallel_collect("baseline", model, strong_opponent, replay_buffer, num_baseline)
+        if strong_opponent is not None and num_baseline > 0:
+            parallel_collect("baseline", model, strong_opponent, replay_buffer, num_baseline)
 
         # -------- TRAINING PHASE (heavy reuse) --------
         model.train()

@@ -155,12 +155,11 @@ def train():
 
     while train_step < Config.TRAIN_STEPS:
         # -------- COLLECTION PHASE (DECOUPLED) --------
-        if train_step % Config.COLLECTION_INTERVAL == 0:
-            parallel_collect_self_play(
-                model,
-                replay_buffer,
-                Config.MATCHES_PER_ITERATION # Acts as 'Matches per iteration' now
-            )
+        parallel_collect_self_play(
+            model,
+            replay_buffer,
+            Config.MATCHES_PER_ITERATION # Acts as 'Matches per iteration' now
+        )
 
         if len(replay_buffer) < Config.BATCH_SIZE:
             continue
