@@ -22,7 +22,7 @@ class Config:
     }
 
     # Game
-    MATCH_TARGET = 1
+    MATCH_TARGET = 3
 
     # Rewards
     R_WIN = 1.0
@@ -46,8 +46,8 @@ class Config:
     CNN_KERNEL = 3
 
     # MCTS
-    NUM_SIMULATIONS = 32
-    MCTS_BATCH = 8
+    NUM_SIMULATIONS = 64
+    MCTS_BATCH = 16
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
@@ -63,16 +63,16 @@ class Config:
 
     # Training
     # OPTIMIZATION: Increased data generation, reduced overfitting loop
-    MATCHES_PER_ITERATION = 5
+    MATCHES_PER_ITERATION = 10
     TRAIN_UPDATES_PER_ITER = 100
     
-    BATCH_SIZE = 512 if torch.cuda.is_available() else 64
+    BATCH_SIZE = 512 if torch.cuda.is_available() else 128
     BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
     LABEL_SMOOTHING = 0.02
     
     # OPTIMIZATION: Increased LR for faster convergence
-    LR = 1e-3                       # Was 1e-5
+    LR = 1e-6                       # Was 1e-5
     
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-4
@@ -84,7 +84,7 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Checkpoints
-    CHECKPOINT_DIR = "checkpoints_v1"
+    CHECKPOINT_DIR = "checkpoints"
     BASELINE_DIR = "checkpoints_v1"
     BASELINE_MODEL_NAME = "best_model.pt"
     BASELINE_SWITCH_ON_SURPASS = True
