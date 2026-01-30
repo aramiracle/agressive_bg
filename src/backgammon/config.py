@@ -46,13 +46,13 @@ class Config:
     CNN_KERNEL = 3
 
     # MCTS
-    NUM_SIMULATIONS = 50
-    MCTS_BATCH = 16
+    NUM_SIMULATIONS = 32
+    MCTS_BATCH = 8
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
-    MIN_PRIOR = 1e-4
-    MAX_PRIOR = 1e4
+    MIN_PRIOR = 1e-5
+    MAX_PRIOR = 1e5
 
     # ELO
     INITIAL_ELO = 200
@@ -63,10 +63,10 @@ class Config:
 
     # Training
     # OPTIMIZATION: Increased data generation, reduced overfitting loop
-    MATCHES_PER_ITERATION = 10
+    MATCHES_PER_ITERATION = 5
     TRAIN_UPDATES_PER_ITER = 100
     
-    BATCH_SIZE = 512 if torch.cuda.is_available() else 128
+    BATCH_SIZE = 512 if torch.cuda.is_available() else 64
     BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
     LABEL_SMOOTHING = 0.02
