@@ -3,7 +3,8 @@
 import os
 import torch
 from src.backgammon.config import Config
-
+import importlib.util
+from src.backgammon.model import BackgammonTransformer, BackgammonCNN
 
 def setup_checkpoint_dir():
     """
@@ -103,3 +104,39 @@ def load_model_state_dict(model, state_dict):
     else:
         model.load_state_dict(state_dict)
 
+def load_model_with_config(config_path, model_path, device):
+    """
+    Dynamically loads a baseline model using its own saved config file.
+    This ensures architecture compatibility even if the main Config has changed.
+    """
+    # 1. Dynamically load the baseline's Config class
+    spec = importlib.util.spec_from_file_location("baseline_config", config_path)
+    base_cfg_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(base_cfg_mod)
+    BConfig = base_cfg_mod.Config
+
+    # 2. Instantiate the correct model type based on the baseline's config
+    if BConfig.MODEL_TYPE == "transformer":
+        model = BackgammonTransformer(config=BConfig)
+    elif BConfig.MODEL_TYPE == "cnn":
+        model = BackgammonCNN(config=BConfig)
+    else:
+        raise ValueError(f"Unknown MODEL_TYPE in baseline: {BConfig.MODEL_TYPE}")
+
+    model = model.to(device)
+
+    # 3. Load the checkpoint
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    
+    # Handle full checkpoints (dict) vs raw state_dicts
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+        elo = checkpoint.get('elo', 200)
+    else:
+        state_dict = checkpoint
+        elo = 200
+
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    return model, elo

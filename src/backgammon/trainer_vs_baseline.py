@@ -16,11 +16,11 @@ from src.backgammon.model import get_model
 from src.backgammon.mcts import MCTS
 from src.backgammon.utils.checkpoint import (
     setup_checkpoint_dir, save_checkpoint, load_checkpoint,
-    get_model_state_dict, load_model_state_dict
+    get_model_state_dict, load_model_state_dict, load_model_with_config
 )
 from src.backgammon.utils.elo import evaluate_vs_opponent, update_elo
 # UPDATED IMPORTS: Using match-based functions
-from src.backgammon.utils.train import train_batch, load_model_with_config
+from src.backgammon.utils.train import train_batch
 from src.backgammon.utils.game import play_self_play_match, play_vs_baseline_match
 from src.backgammon.replay_buffer import get_replay_buffer
 
