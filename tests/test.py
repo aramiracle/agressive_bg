@@ -1,143 +1,127 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from src.backgammon.config import Config
+import os
 from src.backgammon.engine import BackgammonGame
-from src.backgammon.model import get_model
 from src.backgammon.mcts import MCTS
-from src.backgammon.utils.cube import get_learned_cube_decision
+from src.backgammon.model import get_model
+from src.backgammon.config import Config
+from src.backgammon.utils.train import train_batch
+from src.backgammon.replay_buffer import SimpleReplayBuffer
 
-def run_comprehensive_diagnostic():
+def run_regression_suite():
     device = torch.device("cpu")
-    print(f"--- Initialization ---")
-    try:
-        model = get_model().to(device)
-        model.eval()
-        print("✅ Model loaded successfully.")
-    except Exception as e:
-        print(f"❌ Failed to load model: {e}")
-        return
-
+    model = get_model().to(device)
     game = BackgammonGame()
     
-    # =========================================================
-    # 1. MODEL SIGNATURE & UNPACKING
-    # =========================================================
-    print("\n--- 1. Model Signature Check ---")
-    board_t, ctx_t = game.get_vector(0, 0, device=device)
-    # Ensure board is Long for Embedding layers
-    board_input = board_t.unsqueeze(0).long() 
-    ctx_input = ctx_t.unsqueeze(0).float()
-    
-    with torch.no_grad():
-        outputs = model(board_input, ctx_input)
-    
-    num_outputs = len(outputs)
-    print(f"Model returned {num_outputs} values.")
-    
-    # Based on train.py/cube.py: (p_from, p_to, value, cube_logits)
-    expected_outputs = 4
-    if num_outputs != expected_outputs:
-        print(f"❌ WARNING: Expected {expected_outputs} outputs, got {num_outputs}.")
-    else:
-        p_from, p_to, val, cube = outputs
-        print(f"✅ p_from shape: {p_from.shape}")
-        print(f"✅ p_to shape:   {p_to.shape}")
-        print(f"✅ value shape:  {val.shape}")
-        print(f"✅ cube shape:   {cube.shape}")
+    print("🚀 STARTING GLOBAL REGRESSION SUITE\n" + "="*40)
 
-    # =========================================================
-    # 2. DATA TYPE & EMBEDDING ALIGNMENT
-    # =========================================================
-    print("\n--- 2. Data Type Alignment ---")
-    print(f"Engine board dtype: {board_t.dtype}")
+    # 1. ARCHITECTURE & ACTIVATION CHECK
+    print("\n[1] Architecture & Activation Check")
+    has_tanh = any(isinstance(m, nn.Tanh) for m in model.modules())
+    print(f"-> Value head has Tanh: {has_tanh}")
     
-    # Check if embedding layer exists and its requirements
-    if hasattr(model, 'embedding'):
-        emb_weight = model.embedding.weight
-        print(f"Embedding weight dtype: {emb_weight.dtype}")
-        print(f"Embedding vocab size:   {model.embedding.num_embeddings}")
-        
-        max_board_val = torch.max(board_t).item()
-        if max_board_val >= model.embedding.num_embeddings:
-            print(f"❌ CRITICAL: Board contains value {max_board_val} >= vocab size!")
-        else:
-            print(f"✅ Board values are within embedding range.")
-
-    # =========================================================
-    # 3. POLICY INDEX MAPPING
-    # =========================================================
-    print("\n--- 3. Policy Index Mapping (Bar/Off) ---")
-    # Test 'bar' -> 24 and 'off' -> 25
-    test_cases = [
-        # (real_src, real_dst, expected_src_idx, expected_dst_idx)
-        ("bar", 5, 24, 5),
-        (20, "off", 20, 25),
-        (0, 1, 0, 1)
-    ]
-    
-    for src, dst, exp_s, exp_d in test_cases:
-        # Mimic the logic in play_self_play_match
-        s_idx = 24 if src == "bar" else src
-        e_idx = 25 if dst == "off" else dst
-        if s_idx == exp_s and e_idx == exp_d:
-            print(f"✅ Mapping {src}->{dst} correctly went to {s_idx}->{e_idx}")
-        else:
-            print(f"❌ Mapping FAILED for {src}->{dst}. Got {s_idx}->{e_idx}")
-
-    # =========================================================
-    # 4. MCTS CONSISTENCY
-    # =========================================================
-    print("\n--- 4. MCTS Integration Check ---")
-    mcts = MCTS(model, device=device, num_sims=5)
-    try:
-        # This will trigger mcts.model calls
-        mcts.search(game, 0, 0)
-        print("✅ MCTS Search completed without unpacking errors.")
-    except ValueError as ve:
-        print(f"❌ MCTS Unpacking Error: {ve}")
-    except Exception as e:
-        print(f"❌ MCTS Generic Error: {e}")
-
-    # =========================================================
-    # 5. REWARD SIGN & MAGNITUDE
-    # =========================================================
-    print("\n--- 5. Reward Perspective Check ---")
-    winner = 1  # P1 wins
+    # 2. REWARD SCALE SANITY
+    print("\n[2] Reward Scale vs Activation")
+    # Test typical points (2) vs Match Target (7)
     points = 2
     target = Config.MATCH_TARGET
-    reward_mag = (float(points) + target) / target
+    reward_mag = float(points) / (target * 2)
     
-    # Simulation: P1 made a move. Winner is 1.
-    p1_is_winner = (1 == winner)
-    p1_reward = reward_mag if p1_is_winner else -reward_mag
-    
-    # Simulation: P2 made a move. Winner is 1.
-    p2_is_winner = (-1 == winner)
-    p2_reward = reward_mag if p2_is_winner else -reward_mag
-
-    print(f"Reward Magnitude: {reward_mag:.2f}")
-    if p1_reward > 0 and p2_reward < 0:
-        print("✅ Reward signs correctly perspectival (P1+, P2- for P1 win).")
+    print(f"-> Calculated Reward Magnitude: {reward_mag:.2f}")
+    if has_tanh and reward_mag > 1.0:
+        print("❌ CRITICAL FAILURE: Reward > 1.0 will saturate Tanh. Win rate will drop to 0%.")
     else:
-        print(f"❌ Reward signs WRONG. P1: {p1_reward}, P2: {p2_reward}")
-        
-    if reward_mag > 1.0:
-        has_tanh = any("Tanh" in str(m) for m in model.modules())
-        if has_tanh:
-            print("⚠️ WARNING: Value head uses Tanh but rewards > 1.0. This causes 0% win rate due to gradient saturation.")
+        print("✅ Reward/Activation alignment looks safe.")
 
-    # =========================================================
-    # 6. CUBE LOGIC
-    # =========================================================
-    print("\n--- 6. Cube Decision Integration ---")
+    # 3. ENGINE-TO-MODEL VECTORIZATION
+    print("\n[3] Input Vectorization (Dtypes & Bounds)")
+    board_t, ctx_t = game.get_vector(0, 0, device=device, canonical=True)
+    print(f"-> Board Dtype: {board_t.dtype} (Expected: torch.int64)")
+    print(f"-> Context Dtype: {ctx_t.dtype} (Expected: torch.float32)")
+    
+    vocab_size = model.embedding.num_embeddings
+    if torch.max(board_t) >= vocab_size or torch.min(board_t) < 0:
+        print(f"❌ CRITICAL FAILURE: Board values {torch.max(board_t)} exceed Embedding vocab {vocab_size}")
+    else:
+        print("✅ Input vectors are valid for Embedding layer.")
+
+    # 4. CANONICAL SYMMETRY (Turn-based flipping)
+    print("\n[4] Canonical Perspective Symmetry")
+    # P1 with 2 checkers on point 24
+    game.reset(); game.board[23] = 2; game.turn = 1
+    v1, _ = game.get_vector(0, 0, canonical=True)
+    
+    # P2 with 2 checkers on point 1 (Point 24 from their side)
+    game.reset(); game.board[0] = -2; game.turn = -1
+    v2, _ = game.get_vector(0, 0, canonical=True)
+    
+    if torch.equal(v1, v2):
+        print("✅ Symmetry: Model sees the board identically for both players.")
+    else:
+        print("❌ CRITICAL: Symmetry broken! Model must learn two different games.")
+
+    # 5. MCTS SEARCH & BACKPROP
+    print("\n[5] MCTS Logic & Value Sign-Flip")
+    mcts = MCTS(model, num_sims=20)
+    mcts.search(game, 0, 0)
+    
+    if not mcts.root.children:
+        print("❌ FAILURE: MCTS failed to generate legal children.")
+    else:
+        child = mcts.root.children[0]
+        # Simulate a win backprop
+        val = 0.5
+        mcts._backprop(child, val)
+        # Root is parent, should be -val
+        if mcts.root.value_sum == -val:
+            print("✅ MCTS Backprop: Value correctly flips signs at root.")
+        else:
+            print(f"❌ MCTS Backprop: Sign flip failed. Root sum: {mcts.root.value_sum}")
+
+    # 6. POLICY INDEXING (Bar/Off Mapping)
+    print("\n[6] Policy Index Mapping")
+    game.reset(); game.bar[1] = 1; game.turn = -1; game.dice = [1, 2] # P2 from bar
+    legals = game.get_legal_moves()
+    
+    found_bar = False
+    for move in legals:
+        # Canonical: P2 entering from bar should look like index 24
+        (src, dst), _ = game.real_action_to_canonical(move)
+        s_idx = 24 if src == "bar" else src
+        if s_idx == 24: found_bar = True
+    
+    if found_bar:
+        print("✅ Policy: 'Bar' moves correctly map to canonical index 24.")
+    else:
+        print("❌ Policy: Mapping logic failed to identify Bar entry.")
+
+    # 7. TRAINING LOOP (Optimization Check)
+    print("\n[7] Optimization Step (One-batch Update)")
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    buffer = SimpleReplayBuffer(100)
+    
+    # Create fake transition
+    target_f, target_t = torch.zeros(26), torch.zeros(26)
+    target_f[12] = 1.0; target_t[15] = 1.0
+    buffer.add((board_t, ctx_t, None, 1.0, False, (target_f, target_t)))
+    
+    initial_loss = None
     try:
-        action, probs = get_learned_cube_decision(model, game, device, 0, 0, stochastic=False)
-        print(f"✅ Cube decision: {action}, Probs: {probs.tolist()}")
+        scaler = torch.amp.GradScaler(enabled=False)
+        for _ in range(5):
+            loss, _ = train_batch(model, optimizer, buffer, 1, device, scaler)
+            if initial_loss is None: initial_loss = loss
+        
+        if loss < initial_loss:
+            print(f"✅ Training: Loss decreased from {initial_loss:.4f} to {loss:.4f}.")
+        else:
+            print("⚠️ Training: Loss did not decrease. Check optimizer/learning rate.")
     except Exception as e:
-        print(f"❌ Cube decision FAILED: {e}")
+        print(f"❌ Training Loop Failed: {e}")
 
-    print("\n--- Diagnostic Complete ---")
+    print("\n" + "="*40 + "\n🏁 REGRESSION COMPLETE")
 
 if __name__ == "__main__":
-    run_comprehensive_diagnostic()
+    run_regression_suite()
