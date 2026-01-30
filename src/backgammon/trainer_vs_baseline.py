@@ -31,12 +31,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 # ------------------------------------------------------------
 
 def collection_worker(args):
-    """
-    Torch multiprocessing worker for self-play or vs-baseline.
-    Returns list of samples from MATCHES.
-    """
     mode, model_state, baseline_state, matches_per_worker, device = args
-
     torch.set_num_threads(1)
 
     game = BackgammonGame()
@@ -44,30 +39,29 @@ def collection_worker(args):
     model.load_state_dict(model_state)
     model.eval()
 
+    # Pass config parameters to maintain consistency with the baseline script
+    mcts_current = MCTS(model, cpuct=Config.C_PUCT, num_sims=Config.NUM_SIMULATIONS, device=device)
+
     baseline_model = None
     if baseline_state:
         baseline_model = get_model().to(device)
         baseline_model.load_state_dict(baseline_state)
         baseline_model.eval()
 
-    mcts = MCTS(model, device=device)
     collected = []
-
     for _ in range(matches_per_worker):
+        game.reset() # Standardize reset
         if mode == "self":
-            # UPDATED: Use play_self_play_match
-            data, _ = play_self_play_match(game=game, mcts=mcts, model=model, device=device)
+            data, _ = play_self_play_match(game=game, mcts=mcts_current, model=model, device=device)
         else:
-            # UPDATED: Use play_vs_baseline_match
             data, _ = play_vs_baseline_match(
                 game=game,
                 current_model=model,
                 baseline_model=baseline_model,
-                mcts_current=mcts,
+                mcts_current=mcts_current,
                 device=device
             )
         collected.extend(data)
-
     return collected
 
 def collect_worker_wrapper(args):
