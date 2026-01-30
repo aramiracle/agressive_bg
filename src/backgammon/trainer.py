@@ -30,31 +30,21 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 # ------------------------------------------------------------
 
 def collection_worker(args):
-    """
-    Multiprocessing worker for self-play matches.
-    """
     model_state, matches_per_worker, device = args
-
-    # CRITICAL: Ensure single thread per worker to prevent CPU thrashing
     torch.set_num_threads(1)
 
+    # Initialize once per worker
     game = BackgammonGame()
     model = get_model().to(device)
     model.load_state_dict(model_state)
     model.eval()
     
-    # Initialize Optimized MCTS
-    # Note: Reduced simulations and batch size come from Config
-    mcts = MCTS(
-        model, 
-        cpuct=Config.C_PUCT, 
-        num_sims=Config.NUM_SIMULATIONS, 
-        device=device,
-        batch_size=Config.MCTS_BATCH
-    )
+    mcts = MCTS(model, cpuct=Config.C_PUCT, num_sims=Config.NUM_SIMULATIONS, device=device)
 
     collected = []
     for _ in range(matches_per_worker):
+        game.reset() # CRITICAL: Reset engine state for new match
+        # play_self_play_match should handle the internal game loop
         data, _ = play_self_play_match(game, mcts, model, device)
         collected.extend(data)
 
@@ -90,34 +80,6 @@ def parallel_collect_self_play(model, replay_buffer, total_matches, device="cpu"
 
 def collect_worker_wrapper(args):
     return collection_worker(args)
-
-# ------------------------------------------------------------
-# Parallel self-play collection
-# ------------------------------------------------------------
-
-def parallel_collect_self_play(model, replay_buffer, total_matches, device="cpu"):
-    """
-    Parallel self-play collection using imap_unordered with tqdm.
-    """
-    num_workers = mp.cpu_count()
-    # Ensure at least 1 match per worker if total_matches < num_workers
-    matches_per_worker = max(1, total_matches // num_workers)
-    
-    model_state = model.state_dict()
-    ctx = mp.get_context("spawn")
-    
-    args_list = [(model_state, matches_per_worker, device) for _ in range(num_workers)]
-
-    collected = []
-
-    with ctx.Pool(processes=num_workers) as pool:
-        pbar = tqdm(total=total_matches, desc="Collecting (matches)", dynamic_ncols=True)
-        for result in pool.imap_unordered(collect_worker_wrapper, args_list):
-            collected.extend(result)
-            pbar.update(len(result) // 20 if len(result) > 20 else 1) # Approximate progress or specific count if possible
-        pbar.close()
-
-    replay_buffer.extend(collected)
 
 # ------------------------------------------------------------
 # TRAIN LOOP

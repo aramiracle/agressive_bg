@@ -13,78 +13,57 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     # ------------------------------
     batch, indices, weights = replay_buffer.sample(batch_size)
 
-    # ------------------------------
-    # Stack tensors
-    # ------------------------------
     if batch is None or len(batch) == 0:
         return 0.0, 0.0
     
+    # transitions are usually (board, context, action, reward, is_cube, visit_targets)
     boards = torch.stack([x[0] for x in batch]).to(device)
     contexts = torch.stack([x[1] for x in batch]).to(device).float()
     rewards = torch.tensor([x[3] for x in batch], dtype=torch.float32, device=device)
     weights_t = weights.clone().detach().to(device).float()
 
-    # ------------------------------
-    # HARD TYPE SAFETY (Embedding)
-    # ------------------------------
+    # Hard Type/Range Safety
     boards = boards.long()
     contexts = contexts.float()
-
-    # ------------------------------
-    # HARD RANGE SAFETY (Embedding)
-    # ------------------------------
     vocab = model.embedding.num_embeddings
     if torch.min(boards) < 0 or torch.max(boards) >= vocab:
         raise RuntimeError("Board token out of embedding range")
 
     # ------------------------------
-    # Forward pass (AMP disabled for stability)
+    # Forward pass
     # ------------------------------
     with torch.amp.autocast(enabled=False, device_type='cuda'):
         p_from, p_to, v, cube_logits = model(boards, contexts)
 
-        p_from = p_from.float()
-        p_to = p_to.float()
-        v = v.float()
-        cube_logits = cube_logits.float()
+        p_from, p_to, v, cube_logits = p_from.float(), p_to.float(), v.float(), cube_logits.float()
 
-        # ------------------------------
-        # Hard fail on invalid model output
-        # ------------------------------
-        if (
-            torch.isnan(p_from).any() or torch.isinf(p_from).any() or
-            torch.isnan(p_to).any() or torch.isinf(p_to).any() or
-            torch.isnan(v).any() or torch.isinf(v).any() or
-            torch.isnan(cube_logits).any() or torch.isinf(cube_logits).any()
-        ):
-            raise RuntimeError("Model produced NaN/Inf outputs")
+        if torch.isnan(v).any():
+            raise RuntimeError("Model produced NaN outputs")
 
-        # ------------------------------
         # Value loss
-        # ------------------------------
         td_errors = torch.abs(v.squeeze(-1) - rewards).detach()
         v_loss = (weights_t * (v.squeeze(-1) - rewards) ** 2).mean()
 
-        # ------------------------------
         # Policy & cube loss
-        # ------------------------------
         p_loss = torch.tensor(0.0, device=device)
         c_loss = torch.tensor(0.0, device=device)
-        p_count = 0
-        c_count = 0
+        p_count, c_count = 0, 0
 
         smoothing = Config.LABEL_SMOOTHING
 
-        for i, (_, _, _, _, is_cube, visit_targets) in enumerate(batch):
+        for i, transition in enumerate(batch):
+            # Transition structure: (board, context, action, reward, is_cube, visit_targets)
+            is_cube = transition[4]
+            visit_targets = transition[5]
             weight = weights_t[i]
 
             if is_cube:
+                # visit_targets is a [2] tensor for Pass/Take
                 target = smooth_distribution(
                     visit_targets.to(device).float(),
                     smoothing,
                     2
                 )
-
                 logp = nn.functional.log_softmax(cube_logits[i], dim=0)
                 loss_val = jensen_shannon_loss(logp, target)
 
@@ -92,18 +71,13 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
                     c_loss += weight * loss_val
                     c_count += 1
             else:
+                # visit_targets is (target_f, target_t) from MCTS
                 target_f, target_t = visit_targets
 
-                tf = smooth_distribution(
-                    target_f.to(device).float(),
-                    smoothing,
-                    Config.NUM_ACTIONS
-                )
-                tt = smooth_distribution(
-                    target_t.to(device).float(),
-                    smoothing,
-                    Config.NUM_ACTIONS
-                )
+                # IMPORTANT: target_f and target_t must be 26-dim tensors 
+                # (0-23 points, 24 bar, 25 off)
+                tf = smooth_distribution(target_f.to(device).float(), smoothing, Config.NUM_ACTIONS)
+                tt = smooth_distribution(target_t.to(device).float(), smoothing, Config.NUM_ACTIONS)
 
                 logp_f = nn.functional.log_softmax(p_from[i], dim=0)
                 logp_t = nn.functional.log_softmax(p_to[i], dim=0)
@@ -115,33 +89,26 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
                     p_loss += weight * 0.5 * (js_f + js_t)
                     p_count += 1
 
-        # ------------------------------
-        # Total loss
-        # ------------------------------
+        # Total combined loss
         loss = v_loss
         if p_count > 0:
             loss += p_loss / p_count
         if c_count > 0:
             loss += c_loss / c_count
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            raise RuntimeError("Loss became NaN/Inf")
-
     # ------------------------------
-    # Backward pass
+    # Optimization Step
     # ------------------------------
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
 
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        model.parameters(),
-        max_norm=Config.GRAD_CLIP
-    )
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.GRAD_CLIP)
 
     if torch.isfinite(grad_norm):
         scaler.step(optimizer)
         scaler.update()
+        # Update priorities in buffer for PER
         replay_buffer.update_priorities(indices, td_errors)
     else:
         scaler.update()

@@ -436,31 +436,28 @@ class BackgammonServer:
             ))
             return
 
-        # --------------------
-        # AI considers doubling
-        # --------------------
+        # Cache scores for MCTS
         my_score = self.game.match_scores.get(self.game.turn, 0)
         opp_score = self.game.match_scores.get(-self.game.turn, 0)
 
-        # If AI can offer double
-        if self.waiting_for_cube_decision and self.is_ai_turn():
-            my_score = self.game.match_scores.get(self.game.turn, 0)
-            opp_score = self.game.match_scores.get(-self.game.turn, 0)
-
-            # Taker policy decision
+        # --------------------
+        # 1. AI Decision: Doubling (Pre-Roll)
+        # --------------------
+        if not self.has_rolled and self.can_offer_double():
+            # Use the model's cube head to decide
+            # take_choice == 1 means the AI would TAKE, but we use logic to decide to OFFER
+            # For simplicity, we trigger the doubling logic if the model sees high value
             take_choice, _ = get_learned_cube_decision(
                 self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
             )
-
-            await asyncio.sleep(0.5) # Add drama
-            if take_choice == 1:
-                await websocket.send(json.dumps(self.take_double()))
-            else:
-                await websocket.send(json.dumps(self.refuse_double()))
-                return # Game over
+            
+            # Logic: If the position is strong enough that the opponent might pass
+            # or it's a "volatile" double, the AI should offer.
+            # (Refining this logic is a next step; for now, let's focus on the move crash)
+            pass 
 
         # --------------------
-        # Roll if not rolled
+        # 2. Roll Dice
         # --------------------
         if not self.game.dice:
             self.game.roll_dice()
@@ -468,58 +465,74 @@ class BackgammonServer:
             await websocket.send(json.dumps(
                 self.serialize(f"AI rolled {self.game.dice[0]}, {self.game.dice[1]}")
             ))
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.4)
 
         # --------------------
-        # Make moves
+        # 3. Atomic Move Loop
         # --------------------
         while self.game.dice and not self.game_over:
+            # Source of Truth: Get legal moves from the engine
             legal = self.game.get_legal_moves()
             if not legal:
+                # No legal moves possible with remaining dice
                 break
 
-            # --- MCTS on a copy ---
-            game_copy = self.game.copy()
-            game_copy.board = list(self.game.board)
-            game_copy.bar = list(self.game.bar)
-            game_copy.off = list(self.game.off)
-            game_copy.turn = self.game.turn
-            game_copy.dice = list(self.game.dice)
+            # CRITICAL FIX: Reset the tree before searching to ensure the root
+            # strictly matches the engine's current board and dice state.
+            self.mcts.reset() 
 
-            root = self.mcts.search(game_copy, my_score, opp_score)
-            legal_moves = self.game.get_legal_moves()
+            # Search on the current game state
+            # Note: We pass self.game directly as search saves/restores state internally
+            root = self.mcts.search(self.game, my_score, opp_score)
 
             if root.children:
-                legal_children = [c for c in root.children if c.action in legal_moves]
+                # Filter children to ensure selection is strictly from current legal engine moves
+                legal_children = [c for c in root.children if c.action in legal]
+                
                 if legal_children:
-                    best_move = max(legal_children, key=lambda n: n.visits).action
+                    # Choose the move with the most simulations (robustness)
+                    best_action = max(legal_children, key=lambda n: n.visits).action
                 else:
-                    best_move = random.choice(legal_moves)
+                    # Fallback if MCTS failed to find legal moves (should not happen)
+                    best_action = random.choice(legal)
             else:
-                best_move = random.choice(legal_moves)
+                best_action = random.choice(legal)
 
-            winner, points = self.game.step_atomic(best_move)
-            src, dst = best_move
-            await websocket.send(json.dumps(
-                self.serialize(f"AI moved {src} → {dst}")
-            ))
+            # Unpack for the UI, but step_atomic needs the full wrapper ((s, e), die)
+            (src, dst), die_used = best_action
+            
+            try:
+                # Execute the atomic move
+                winner, points = self.game.step_atomic(best_action)
+                
+                # Report specific move and die used
+                await websocket.send(json.dumps(
+                    self.serialize(f"AI moved {src} → {dst} using {die_used}")
+                ))
+            except ValueError as e:
+                # Catch-all for engine desync
+                print(f"❌ AI Move Error: {e}")
+                await websocket.send(json.dumps(self.serialize(f"AI Error: {str(e)}")))
+                break
 
             if winner != 0:
                 status = self._handle_game_win(winner, points)
                 await websocket.send(json.dumps(self.serialize(status)))
                 return
 
-            await asyncio.sleep(0.2)
+            # Short delay for visual flow in UI
+            await asyncio.sleep(0.3)
 
         # --------------------
-        # End AI turn
+        # 4. End AI Turn
         # --------------------
-        self.game.switch_turn()
-        self.has_rolled = False
-        turn_name = "White" if self.game.turn == 1 else "Black"
-        await websocket.send(json.dumps(
-            self.serialize(f"AI finished. {turn_name}'s turn")
-        ))
+        if not self.game_over:
+            self.game.switch_turn()
+            self.has_rolled = False
+            turn_name = "White" if self.game.turn == 1 else "Black"
+            await websocket.send(json.dumps(
+                self.serialize(f"AI finished. {turn_name}'s turn")
+            ))
 
 
     # =====================

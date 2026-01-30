@@ -116,10 +116,22 @@ def _play_single_game(
                 target_f, target_t = torch.zeros(26), torch.zeros(26)
                 
                 for i, child in enumerate(children):
+                    # 1. Convert real engine move to canonical (from player's perspective)
                     c_act = game.real_action_to_canonical(child.action)
-                    s_idx, e_idx = move_to_indices(c_act[0], c_act[1])
-                    if 0 <= s_idx < 26: target_f[s_idx] += probs[i]
-                    if 0 <= e_idx < 26: target_t[e_idx] += probs[i]
+                    
+                    # 2. UNPACK ATOMIC WRAPPER: c_act is ((src, dst), die)
+                    (src, dst), _ = c_act
+                    
+                    # 3. Map board locations to policy indices (0-25)
+                    # "bar" is usually mapped to 24, "off" to 25
+                    s_idx = 24 if src == "bar" else src
+                    e_idx = 25 if dst == "off" else dst
+                    
+                    # 4. Aggregate visit probabilities into the target tensors
+                    if 0 <= s_idx < 26: 
+                        target_f[s_idx] += probs[i]
+                    if 0 <= e_idx < 26: 
+                        target_t[e_idx] += probs[i]
                 
                 history.append({
                     'board': board_t, 'ctx': ctx_t, 'action': None,
@@ -127,6 +139,7 @@ def _play_single_game(
                     'is_p1': (game.turn == 1)
                 })
 
+            # Execute the action using the wrapper
             game.step_atomic(chosen_action)
             current_mcts.advance_to_child(chosen_action)
             if game.check_win()[0] != 0: break

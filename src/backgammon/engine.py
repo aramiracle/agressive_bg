@@ -130,6 +130,11 @@ class BackgammonGame:
         """
         Generates strictly legal unique next atomic moves.
         Enforces Maximality Rule: Must play as many dice as possible.
+        
+        Returns:
+            List of ((start, end), die_used) tuples.
+            Including 'die_used' is CRITICAL to resolve ambiguous bear-offs
+            where the same move can be done by different dice, affecting future moves.
         """
         if not self.dice:
             return []
@@ -142,8 +147,7 @@ class BackgammonGame:
         if not valid_paths:
             return []
 
-
-        # 1. Must use maximum number of dice
+        # 1. Must use maximum number of dice (Maximality Rule)
         max_len = max(len(p) for p in valid_paths)
         longest_paths = [p for p in valid_paths if len(p) == max_len]
 
@@ -160,21 +164,22 @@ class BackgammonGame:
                     best.append(p)
             longest_paths = best
 
-        # Only return FIRST atomic action from each valid sequence
+        # Return unique FIRST atomic actions with the specific die used
+        # Structure: ((start, end), die)
         unique_actions = set()
         for p in longest_paths:
-            unique_actions.add(p[0][0])
+            # p[0] is ((start, end), die)
+            unique_actions.add(p[0])
 
-        return sorted(unique_actions, key=lambda x: str(x))
+        return sorted(list(unique_actions), key=lambda x: str(x))
 
     # =========================
-    # DFS CORE (FIXED)
+    # DFS CORE
     # =========================
 
     def _find_move_paths(self, board, bar, off, dice, current_path, results):
         """
         DFS to find all legal chains of moves.
-        IMPORTANT: Iterate by index, not set(dice), so duplicate dice are handled correctly.
         """
         can_move = False
         can_bear = self._can_bear_off(board, bar, self.turn)
@@ -220,6 +225,7 @@ class BackgammonGame:
         # 1. Must enter from bar
         if bar[p_idx] > 0:
             target = (Config.NUM_POINTS - die) if player == 1 else (die - 1)
+            # Fix: Must check if target is valid AND strictly if open
             if 0 <= target < Config.NUM_POINTS and self._is_open(board, target, player):
                 return [("bar", target)]
             return []
@@ -239,8 +245,12 @@ class BackgammonGame:
                 if (player == 1 and target < 0) or (player == -1 and target >= Config.NUM_POINTS):
                     if can_bear_off_cached:
                         dist_to_edge = (i + 1) if player == 1 else (Config.NUM_POINTS - i)
+                        
+                        # Exact bear off
                         if dist_to_edge == die:
                             moves.append((i, "off"))
+                        
+                        # Overshoot (Furthest checker rule)
                         elif dist_to_edge < die:
                             is_furthest = True
                             check_range = (
@@ -278,10 +288,12 @@ class BackgammonGame:
             return False
 
         if player == 1:
+            # Check range 6 to 23 (indices where checkers block bearoff)
             for i in range(Config.HOME_SIZE, Config.NUM_POINTS):
                 if board[i] > 0:
                     return False
         else:
+            # Check range 0 to 17
             for i in range(0, Config.NUM_POINTS - Config.HOME_SIZE):
                 if board[i] < 0:
                     return False
@@ -289,89 +301,46 @@ class BackgammonGame:
         return True
 
     # =========================
-    # STRICT VALIDATION
-    # =========================
-
-    def _is_atomic_move_legal_for_die(self, action, die):
-        start, end = action
-
-        p_idx = 0 if self.turn == 1 else 1
-        if self.bar[p_idx] > 0 and start != "bar":
-            return False
-
-        can_bear = self._can_bear_off(self.board, self.bar, self.turn)
-        legal = self._get_single_moves(
-            self.board,
-            self.bar,
-            self.turn,
-            die,
-            can_bear
-        )
-        return action in legal
-
-    # =========================
     # ACTION APPLICATION
     # =========================
 
-    def step_atomic(self, action):
-        """
-        Execute a single action and update state/dice.
-        STRICT: Only allow actions from get_legal_moves().
-        """
-        legal_actions = set(self.get_legal_moves())
-        if action not in legal_actions:
-            raise ValueError(
-                f"Illegal atomic action {action} "
-                f"for dice {self.dice}. "
-                f"Allowed: {sorted(list(legal_actions))}"
-            )
+    def step_atomic(self, action_wrapper):
+            """
+            Execute a single action and update state/dice.
+            Args:
+                action_wrapper: Tuple of ((start, end), die_used)
+            """
+            # 1. Unpack
+            try:
+                (start, end), die_used = action_wrapper
+            except (ValueError, TypeError):
+                raise ValueError(f"step_atomic expects ((start, end), die), got {action_wrapper}")
 
-        die_to_remove = self._identify_die_used(*action)
-        if die_to_remove is None:
-            raise ValueError(
-                f"Illegal move {action} with dice {self.dice} - die mismatch"
-            )
+            # 2. Deep Validation: Does the die used actually match the move?
+            # This prevents the AI from 'cheating' by moving 5 pips while removing a 1-die.
+            if start != "bar" and end != "off":
+                dist = abs(start - end)
+                if dist != die_used:
+                    raise ValueError(f"Die mismatch: Action moves {dist} pips but claims to use die {die_used}")
 
-        self._apply_single_move_logic(
-            self.board,
-            self.bar,
-            self.off,
-            self.turn,
-            action[0],
-            action[1]
-        )
+            # 3. Membership Validation
+            # We call get_legal_moves to ensure Maximality Rules (must use highest dice) are met
+            legal_actions = self.get_legal_moves()
+            if action_wrapper not in legal_actions:
+                raise ValueError(
+                    f"Illegal atomic action {action_wrapper}. "
+                    f"Dice available: {self.dice}. "
+                    f"Legal now: {legal_actions}"
+                )
 
-        self.dice.remove(die_to_remove)
-        return self.check_win()
+            # 4. Apply Logic
+            self._apply_single_move_logic(self.board, self.bar, self.off, self.turn, start, end)
 
-    def _identify_die_used(self, start, end):
-        if start == "bar":
-            dist = (
-                Config.NUM_POINTS - end
-                if self.turn == 1 else
-                end + 1
-            )
-        elif end == "off":
-            dist = (
-                start + 1
-                if self.turn == 1 else
-                Config.NUM_POINTS - start
-            )
-        else:
-            dist = abs(start - end)
+            # 5. Consume Die
+            # Use remove() to ensure only ONE instance of the die is consumed (crucial for doubles)
+            self.dice.remove(die_used)
 
-        # Exact die
-        if dist in self.dice:
-            if self._is_atomic_move_legal_for_die((start, end), dist):
-                return dist
-
-        # Overshoot bear-off
-        candidates = sorted(d for d in self.dice if d > dist)
-        for d in candidates:
-            if self._is_atomic_move_legal_for_die((start, end), d):
-                return d
-
-        return None
+            return self.check_win()
 
     def _apply_single_move_logic(self, board, bar, off, player, start, end):
         p_idx = 0 if player == 1 else 1
@@ -498,11 +467,27 @@ class BackgammonGame:
     # =========================
 
     def real_action_to_canonical(self, action):
+        """
+        Translates a move from the current player's perspective to 
+        a normalized board representation.
+        """
+        # UNPACK: Check if action is the new atomic wrapper ((s, e), d) 
+        # or the old (s, e)
+        if isinstance(action[0], tuple):
+            (start, end), die = action
+        else:
+            start, end = action
+
         if self.turn == 1:
-            return action
-        start, end = action
+            return (start, end), die if isinstance(action[0], tuple) else (start, end)
+            
+        # Transformation for Player -1 (Negative)
         s_c = "bar" if start == "bar" else Config.NUM_POINTS - 1 - start
         e_c = "off" if end == "off" else Config.NUM_POINTS - 1 - end
+        
+        # Return in the same format it arrived in
+        if isinstance(action[0], tuple):
+            return (s_c, e_c), die
         return s_c, e_c
 
     def canonical_action_to_real(self, action):
