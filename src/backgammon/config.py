@@ -22,7 +22,7 @@ class Config:
     }
 
     # Game
-    MATCH_TARGET = 3
+    MATCH_TARGET = 7
 
     # Rewards
     R_WIN = 1.0
@@ -47,7 +47,7 @@ class Config:
 
     # MCTS
     NUM_SIMULATIONS = 64
-    MCTS_BATCH = 16
+    MCTS_BATCH = 8
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
@@ -55,7 +55,7 @@ class Config:
     MAX_PRIOR = 1e5
 
     # ELO
-    INITIAL_ELO = 200
+    INITIAL_ELO = 100
     ELO_K = 4
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 2000
@@ -72,8 +72,7 @@ class Config:
     LABEL_SMOOTHING = 0.02
     
     # OPTIMIZATION: Increased LR for faster convergence
-    LR = 1e-6                       # Was 1e-5
-    
+    LR = 1e-6
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-4
     TRAIN_STEPS = 1000000
