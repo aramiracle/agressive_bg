@@ -50,13 +50,13 @@ class MCTS:
                 # --- 1. SELECTION ---
                 # Follow the tree until we hit a leaf or the turn ends (no dice left)
                 while node.children and game.dice:
-                    sqrt_n = math.sqrt(node.visits + 1e-6)
-                    best_score = -1e9
+                    sqrt_n = math.sqrt(node.visits + Config.MIN_PRIOR)
+                    best_score = -math.inf
                     best_child = None
                     
                     for child in node.children:
                         # UCB1 Calculation
-                        q = child.value_sum / (child.visits + 1e-6)
+                        q = child.value_sum / (child.visits + Config.MIN_PRIOR)
                         u = self.cpuct * child.prior * sqrt_n / (1 + child.visits)
                         score = q + u
                         if score > best_score:

@@ -1,151 +1,254 @@
 import torch
 import random
-import math
 from typing import List, Tuple, Any
 from src.backgammon.config import Config
 
 # -------------------------------------------------
-# FastSumTree (Optimized for Strict Capacity)
+# FastSumTree (Pure PyTorch)
 # -------------------------------------------------
 class FastSumTree:
-    """
-    A binary tree where each node is the sum of its children.
-    Leaf nodes store the priorities.
-    """
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, device: str = "cpu"):
         self.max_size = max_size
+        self.device = torch.device(device)
         
-        # Tree capacity must be a power of 2 for the binary search logic
+        # Calculate capacity as power of 2
         self.tree_capacity = 1
         while self.tree_capacity < max_size:
             self.tree_capacity *= 2
 
-        # Nodes: 2 * tree_capacity - 1
-        # Indices 0 to (tree_capacity - 2) are internal nodes
-        # Indices (tree_capacity - 1) onwards are leaf nodes
-        self.tree = [0.0] * (2 * self.tree_capacity - 1)
+        # THE TREE IS NOW A TENSOR
+        # We use a float tensor for the tree sums
+        self.tree = torch.zeros(2 * self.tree_capacity - 1, dtype=torch.float32, device=self.device)
+        
+        # We keep data in a standard list because storage requirements for "Data" 
+        # vary wildly (objects, dicts, tuples), making tensors hard to manage for storage.
+        # However, the *indices* will be managed entirely in tensors.
         self.data = [None] * self.max_size
         
         self.write_ptr = 0
         self.current_count = 0
-
-    def update(self, tree_idx: int, priority: float):
-        """Updates a priority and propagates the change up the tree."""
-        priority = max(float(priority), 1e-6)
-        change = priority - self.tree[tree_idx]
-        self.tree[tree_idx] = priority
         
-        # Propagate change to root
-        while tree_idx != 0:
-            tree_idx = (tree_idx - 1) // 2
-            self.tree[tree_idx] += change
+        # Pre-compute tree depth for the sampling loop
+        # bit_length() is fast, used to determine loop depth
+        self.depth = (self.tree_capacity).bit_length() - 1
 
-    def add(self, data: Any, priority: float):
-        """Adds data with a priority, overwriting the oldest if full."""
-        # Find the leaf index corresponding to our circular pointer
-        tree_idx = self.write_ptr + self.tree_capacity - 1
-        
-        self.data[self.write_ptr] = data
-        self.update(tree_idx, priority)
-        
-        # FIFO Logic: Wrap pointer around at exactly max_size
-        self.write_ptr = (self.write_ptr + 1) % self.max_size
-        self.current_count = min(self.current_count + 1, self.max_size)
+    def add_batch(self, data_list: List[Any], priorities: torch.Tensor):
+        """
+        Adds a batch of transitions. 
+        Priorities must be a Tensor (on device preferably).
+        """
+        count = len(data_list)
+        if count == 0:
+            return
 
-    def get(self, s: float) -> Tuple[int, float, Any]:
-        """Prefix sum search to find a leaf node for a value s."""
-        idx = 0
-        while idx < self.tree_capacity - 1:
+        # 1. Store Data (Python List - Unavoidable overhead for complex objects)
+        end_ptr = self.write_ptr + count
+        if end_ptr <= self.max_size:
+            self.data[self.write_ptr:end_ptr] = data_list
+            write_idxs = torch.arange(self.write_ptr, end_ptr, device=self.device)
+        else:
+            overflow = end_ptr - self.max_size
+            self.data[self.write_ptr:] = data_list[:self.max_size - self.write_ptr]
+            self.data[:overflow] = data_list[self.max_size - self.write_ptr:]
+            
+            # Create wrapping indices
+            idx1 = torch.arange(self.write_ptr, self.max_size, device=self.device)
+            idx2 = torch.arange(0, overflow, device=self.device)
+            write_idxs = torch.cat([idx1, idx2])
+
+        # 2. Update Tree (Pure Tensor Operation)
+        # Map write pointer to tree leaf index
+        tree_idxs = write_idxs + (self.tree_capacity - 1)
+        self.update_batch(tree_idxs, priorities)
+
+        self.write_ptr = end_ptr % self.max_size
+        self.current_count = min(self.current_count + count, self.max_size)
+
+    def update_batch(self, tree_idxs: torch.Tensor, priorities: torch.Tensor):
+        """
+        Updates priorities for specific tree indices and propagates up.
+        """
+        if not isinstance(priorities, torch.Tensor):
+            priorities = torch.tensor(priorities, device=self.device, dtype=torch.float32)
+        
+        # Ensure minimum priority
+        priorities = torch.clamp(priorities, min=Config.MIN_PRIOR)
+        
+        # 1. Update Leaves
+        self.tree.index_put_((tree_idxs,), priorities)
+
+        # 2. Propagate Up (The "Heavy" Lifting)
+        # Instead of recursive addition, we recalculate parents layer by layer.
+        # This is extremely fast on GPU as it's just vectorized addition.
+        
+        # We start at the leaves we just modified
+        idx = tree_idxs
+        
+        # Loop strictly for the depth of the tree
+        for _ in range(self.depth + 1):
+            if idx.numel() == 0: 
+                break
+                
+            # Move to parent: (i - 1) // 2
+            idx = (idx - 1) // 2
+            
+            # Standardize indices (unique) to avoid doing math on the same parent twice
+            # Note: unique() can be slow, but essential for correctness in batch updates
+            idx = torch.unique(idx)
+            
+            # Root check (index -1 after the floor division if idx was 0)
+            if idx[0] == -1:
+                break
+
+            # Calculate children indices
             left = 2 * idx + 1
             right = left + 1
-            if s <= self.tree[left]:
-                idx = left
-            else:
-                s -= self.tree[left]
-                idx = right
-                
-        # Map tree index back to data index
-        data_idx = idx - (self.tree_capacity - 1)
-        
-        # Safety: Ensure data_idx is within current valid bounds
-        # This can happen if s lands in the 'dead' space of a power-of-2 tree
-        if data_idx >= self.max_size or self.data[data_idx] is None:
-            data_idx = (self.write_ptr - 1) % self.max_size
-            idx = data_idx + self.tree_capacity - 1
+            
+            # Sum Logic: Parent = Left + Right
+            # We use index_select or direct slicing. Direct slicing with tensor indices is fast.
+            # Safety check for right child bounds (though usually guaranteed by structure)
+            vals = self.tree[left] + self.tree[right]
+            
+            self.tree.index_put_((idx,), vals)
 
-        return idx, self.tree[idx], self.data[data_idx]
+    def get_batch(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        """
+        Perform vectorized tree traversal entirely on the Tensor.
+        """
+        total_p = self.total_priority
+        segment = total_p / batch_size
+        
+        # Generate search values [0, segment, 2*segment, ...] + jitter
+        # entirely on device
+        r = torch.rand(batch_size, device=self.device)
+        s = (torch.arange(batch_size, device=self.device, dtype=torch.float32) + r) * segment
+
+        # Start at root (index 0)
+        idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        
+        # Traverse the tree
+        # This loop runs 'depth' times. Operations inside are fully vectorized.
+        for _ in range(self.depth):
+            left = 2 * idx + 1
+            right = left + 1
+            
+            # Get values of left children
+            # We must mask out indices that might go out of bounds (though typically shouldn't)
+            left_vals = self.tree[left]
+            
+            # Decide direction
+            # If s <= left_val: Go Left.
+            # If s > left_val:  Subtract left_val, Go Right.
+            
+            go_right = s > left_vals
+            
+            # If we go right, we subtract the left value from our search 's'
+            # We use torch.where to conditionally subtract
+            s = torch.where(go_right, s - left_vals, s)
+            
+            # Update index: Left is 'left', Right is 'left + 1'
+            idx = left + go_right.long()
+
+        # Map back to data indices
+        data_idxs = idx - (self.tree_capacity - 1)
+        
+        # Safety clamp to ensure we don't crash on float precision errors at boundaries
+        data_idxs = torch.clamp(data_idxs, 0, self.max_size - 1)
+        
+        # Get priorities directly from tree (no need to copy to CPU)
+        priorities = self.tree[idx]
+        
+        # We return data_idxs as a list only at the very end to fetch objects
+        return idx, priorities, data_idxs.cpu().tolist()
 
     @property
     def total_priority(self):
-        return max(self.tree[0], 1e-6)
+        # Return a float, but carefully handle the tensor scalar
+        return max(self.tree[0].item(), Config.MIN_PRIOR)
 
 # -------------------------------------------------
-# PrioritizedReplayBuffer
+# PrioritizedReplayBuffer (Pure PyTorch)
 # -------------------------------------------------
 class PrioritizedReplayBuffer:
     def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, device: str = "cpu"):
-        self.max_size = capacity
-        self.tree = FastSumTree(capacity)
         self.alpha = alpha
         self.beta = beta
-        self.max_priority = 1.0
         self.device = device
+        # Initialize tree on the specific device
+        self.tree = FastSumTree(capacity, device=device)
+        self.max_priority = 1.0
 
     def add(self, data: Any, priority: float = None):
         """Adds a single transition."""
         if priority is None:
             priority = self.max_priority
         
-        p = (abs(priority) + 1e-5) ** self.alpha
-        self.tree.add(data, p)
+        # Math on CPU for single scalar is fine, but we prepare for batch add
+        p = (abs(priority) + Config.MIN_PRIOR) ** self.alpha
+        
+        # Wrap in list/tensor
+        self.tree.add_batch([data], torch.tensor([p], device=self.device))
 
     def extend(self, data_list: List[Any]):
-        """Adds a list of transitions (used after a full match)."""
-        for data in data_list:
-            self.add(data)
+        """Adds a list of transitions."""
+        count = len(data_list)
+        if count == 0: return
+        
+        # Create priority tensor on device immediately
+        p_val = (self.max_priority ** self.alpha) if self.max_priority > 0 else 1.0
+        priorities = torch.full((count,), p_val, device=self.device, dtype=torch.float32)
+        
+        self.tree.add_batch(data_list, priorities)
 
     def sample(self, batch_size: int) -> Tuple[List[Any], torch.Tensor, torch.Tensor]:
         if self.tree.current_count < batch_size:
             return None, None, None
 
-        batch, tree_idxs, priorities = [], [], []
-        segment = self.tree.total_priority / batch_size
-        
-        for i in range(batch_size):
-            s = random.uniform(segment * i, segment * (i + 1))
-            idx, p, data = self.tree.get(s)
-            batch.append(data)
-            tree_idxs.append(idx)
-            priorities.append(p)
+        # 1. GPU Tree Search
+        # Returns indices and priorities already on-device
+        tree_idxs, priorities, data_idxs = self.tree.get_batch(batch_size)
 
-        # Importance Sampling Weights: (N * P(i))^-beta / max_weight
-        probs = [p / self.tree.total_priority for p in priorities]
-        weights = [(self.tree.current_count * pr) ** -self.beta for pr in probs]
-        
-        max_w = max(weights) if weights else 1.0
-        weights_t = torch.tensor([w / max_w for w in weights], dtype=torch.float32, device=self.device)
-        indices_t = torch.tensor(tree_idxs, dtype=torch.long, device=self.device)
+        # 2. Retrieve Data Objects
+        # This is the only CPU interaction: fetching the complex objects
+        batch = [self.tree.data[i] for i in data_idxs]
 
-        return batch, indices_t, weights_t
+        # 3. Compute Weights (Pure Tensor Math on Device)
+        # No CPU <-> GPU copy needed here
+        probs = priorities / self.tree.total_priority
+        weights = (self.tree.current_count * probs) ** -self.beta
+        
+        # Normalize
+        weights = weights / weights.max()
+        
+        # tree_idxs and weights are ALREADY tensors on the correct device.
+        return batch, tree_idxs, weights
 
-    def update_priorities(self, indices: torch.Tensor, td_errors: Any):
-        """Updates priorities in the tree based on new TD errors from training."""
-        if isinstance(td_errors, torch.Tensor):
-            td_errors = td_errors.detach().cpu().tolist()
+    def update_priorities(self, indices: torch.Tensor, td_errors: torch.Tensor):
+        """
+        Updates priorities. 
+        Expects `td_errors` to ideally already be a Tensor on the correct device 
+        (which it usually is coming from the loss function).
+        """
+        # Ensure input is tensor
+        if not isinstance(td_errors, torch.Tensor):
+            td_errors = torch.tensor(td_errors, device=self.device)
         
-        indices_list = indices.detach().cpu().tolist()
+        # Detach to ensure we don't break gradients, but keep on device
+        td_errors = td_errors.detach()
         
-        for idx, error in zip(indices_list, td_errors):
-            p = (abs(error) + 1e-5) ** self.alpha
-            self.tree.update(idx, p)
-            self.max_priority = max(self.max_priority, p)
+        # Calculate priorities (Vectorized GPU op)
+        new_priorities = (torch.abs(td_errors) + Config.MIN_PRIOR) ** self.alpha
+        
+        # Update max priority (Item access causes a sync, but it's just one float)
+        self.max_priority = max(self.max_priority, new_priorities.max().item())
+        
+        # Batch update tree
+        self.tree.update_batch(indices, new_priorities)
 
     def __len__(self):
         return self.tree.current_count
 
-# -------------------------------------------------
-# SimpleReplayBuffer (Non-Prioritized Fallback)
-# -------------------------------------------------
+# SimpleReplayBuffer remains unchanged...
 class SimpleReplayBuffer:
     def __init__(self, capacity: int):
         self.capacity = capacity
@@ -171,7 +274,7 @@ class SimpleReplayBuffer:
     def __len__(self):
         return self.size
 
-def get_replay_buffer(capacity: int, prioritized: bool = True, **kwargs):
+def get_replay_buffer(capacity: int, prioritized: bool = True, device: str = "cpu", **kwargs):
     if prioritized:
-        return PrioritizedReplayBuffer(capacity, **kwargs)
+        return PrioritizedReplayBuffer(capacity, device=device, **kwargs)
     return SimpleReplayBuffer(capacity)

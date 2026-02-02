@@ -375,37 +375,41 @@ class BackgammonGame:
         return 0, 0
 
     def _finalize_win(self, winner):
-        loser = -winner
-        loser_idx = 0 if loser == 1 else 1
+            loser = -winner
+            loser_idx = 0 if loser == 1 else 1
 
-        mult = 1
-        if self.off[loser_idx] == 0:
-            mult = 2
-            has_bar = self.bar[loser_idx] > 0
-            has_home = False
+            # Use Config value for standard win (usually 1.0)
+            mult = Config.R_WIN 
+            
+            if self.off[loser_idx] == 0:
+                # Gammon condition met
+                mult = Config.R_GAMMON
+                
+                has_bar = self.bar[loser_idx] > 0
+                has_home = False
 
-            home_range = (
-                range(0, 6)
-                if winner == 1 else
-                range(18, 24)
-            )
+                home_range = (
+                    range(0, 6)
+                    if winner == 1 else
+                    range(18, 24)
+                )
 
-            for i in home_range:
-                if (loser == 1 and self.board[i] > 0) or \
-                   (loser == -1 and self.board[i] < 0):
-                    has_home = True
-                    break
+                for i in home_range:
+                    if (loser == 1 and self.board[i] > 0) or (loser == -1 and self.board[i] < 0):
+                        has_home = True
+                        break
 
-            if has_bar or has_home:
-                mult = 3
+                if has_bar or has_home:
+                    # Backgammon condition met
+                    mult = Config.R_BACKGAMMON
 
-        points = self.cube * mult
-        self.match_scores[winner] += points
+            points = self.cube * mult
+            self.match_scores[winner] += points
 
-        if self.crawford_active:
-            self.crawford_used = True
+            if self.crawford_active:
+                self.crawford_used = True
 
-        return winner, points
+            return winner, points
 
     def handle_cube_refusal(self):
         winner = self.turn
@@ -498,12 +502,32 @@ class BackgammonGame:
     # =========================
 
     def can_double(self):
+        # 1. Crawford Rule
         if self.crawford_active:
             return False
+            
+        # 2. Checkers on bar/off restrictions
         if self.off[0] >= Config.CHECKERS_PER_PLAYER:
             return False
         if self.off[1] >= Config.CHECKERS_PER_PLAYER:
             return False
+        
+        # 3. Dynamic Cube Cap (Your Fix)
+        # Calculate the maximum effective points needed to end the match
+        p1_score = self.match_scores[1]
+        p2_score = self.match_scores[-1]
+        
+        # How many points does the player furthest from winning need?
+        # e.g. Target 7, Scores (6, 0). Min is 0. Limit is 7.
+        # e.g. Target 7, Scores (4, 4). Min is 4. Limit is 3.
+        limit = self.match_target - min(p1_score, p2_score)
+        
+        # If the current cube is already greater than or equal to the limit,
+        # doubling adds no value to the match result, only variance/instability.
+        if self.cube >= limit:
+            return False
+
+        # 4. Owner Check
         return self.cube_owner == 0 or self.cube_owner == self.turn
 
     def apply_double(self):

@@ -46,33 +46,32 @@ class Config:
     CNN_KERNEL = 3
 
     # MCTS
-    NUM_SIMULATIONS = 64
-    MCTS_BATCH = 8
+    NUM_SIMULATIONS = 32
+    MCTS_BATCH = 4
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
     MIN_PRIOR = 1e-5
-    MAX_PRIOR = 1e5
 
     # ELO
-    INITIAL_ELO = 100
+    INITIAL_ELO = 0
     ELO_K = 4
     ELO_SCALE = 400.0
-    ELO_EVAL_INTERVAL = 2000
-    ELO_EVAL_GAMES = 32
+    ELO_EVAL_INTERVAL = 1000
+    ELO_EVAL_GAMES = 40
 
     # Training
     # OPTIMIZATION: Increased data generation, reduced overfitting loop
-    MATCHES_PER_ITERATION = 10
+    MATCHES_PER_ITERATION = 4
     TRAIN_UPDATES_PER_ITER = 100
     
-    BATCH_SIZE = 512 if torch.cuda.is_available() else 128
+    BATCH_SIZE = 512 if torch.cuda.is_available() else 32
     BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
     LABEL_SMOOTHING = 0.02
     
     # OPTIMIZATION: Increased LR for faster convergence
-    LR = 1e-6
+    LR = 1e-5
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-4
     TRAIN_STEPS = 1000000
@@ -87,4 +86,4 @@ class Config:
     BASELINE_DIR = "checkpoints_v1"
     BASELINE_MODEL_NAME = "best_model.pt"
     BASELINE_SWITCH_ON_SURPASS = True
-    BASELINE_SELF_PLAY_RATIO = 0.4
+    BASELINE_SELF_PLAY_RATIO = 0.5

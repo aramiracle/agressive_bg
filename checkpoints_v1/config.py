@@ -52,7 +52,6 @@ class Config:
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
     MIN_PRIOR = 1e-5
-    MAX_PRIOR = 1e5
 
     # ELO
     INITIAL_ELO = 200

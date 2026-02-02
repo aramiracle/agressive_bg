@@ -152,7 +152,7 @@ def _play_single_game(
             mcts_p2.reset()
 
     winner, total_points = game.check_win()
-    return winner, total_points * game.cube, history
+    return winner, total_points, history
 
 
 # ---------------------------------------------------------
@@ -208,7 +208,7 @@ def play_self_play_match(game, mcts, model, device, is_eval=False):
         # The existing finalize_history assumes the list is from the perspective of the winner or handled internally.
         # Let's use a specific loop here to be safe:
         
-        reward_mag = float(points)/ (Config.MATCH_TARGET * 2)
+        reward_mag = float(points)/ (Config.MATCH_TARGET * (Config.R_BACKGAMMON + 1))
         
         for h in game_history:
             # Calculate reward relative to the player who made the move
@@ -265,7 +265,7 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
         scores[winner] += points
 
         # Calculate Reward
-        reward_mag = float(points) / (Config.MATCH_TARGET * 2)
+        reward_mag = float(points) / (Config.MATCH_TARGET * (Config.R_BACKGAMMON + 1))
         
         # Add to history (game_history only contains current_model's moves due to flags above)
         for h in game_history:
