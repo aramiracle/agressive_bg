@@ -1,12 +1,9 @@
 """
 Train new model vs older baseline version with full cubing, MCTS reuse, and ELO tracking.
 Features: Mixed-opponent collection, detailed evaluation vs both Best and Baseline models,
-and CUBE EXPLORATION FIXES.
+and CUBE EXPLORATION via CURRICULUM.
 
-Key changes for cube fix:
-- Dynamic epsilon scheduling for cube exploration
-- Pass cube_epsilon to game functions
-- Cube action logging for diagnostics
+Cube epsilon is controlled ONLY by curriculum stages, no linear decay.
 """
 
 import os
@@ -32,35 +29,17 @@ from src.backgammon.replay_buffer import get_replay_buffer
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 # ------------------------------------------------------------
-# Cube Epsilon Scheduling (same as trainer.py)
+# Cube Epsilon from Curriculum Only
 # ------------------------------------------------------------
 
 def get_cube_epsilon(train_step):
-    """Calculate cube exploration rate based on training step."""
-    if Config.CUBE_CURRICULUM_ENABLED:
-        for i in reversed(range(len(Config.CUBE_CURRICULUM_STAGES))):
-            stage = Config.CUBE_CURRICULUM_STAGES[i]
-            if train_step >= stage['steps']:
-                return stage['epsilon']
-        return Config.CUBE_CURRICULUM_STAGES[0]['epsilon']
-    else:
-        if train_step >= Config.CUBE_EPSILON_DECAY_STEPS:
-            return Config.CUBE_EPSILON_END
-        
-        progress = train_step / Config.CUBE_EPSILON_DECAY_STEPS
-        epsilon = Config.CUBE_EPSILON_START - (Config.CUBE_EPSILON_START - Config.CUBE_EPSILON_END) * progress
-        return epsilon
-
-def get_cube_loss_weight(train_step):
-    """Get cube loss weight based on training step."""
-    if Config.CUBE_CURRICULUM_ENABLED:
-        for i in reversed(range(len(Config.CUBE_CURRICULUM_STAGES))):
-            stage = Config.CUBE_CURRICULUM_STAGES[i]
-            if train_step >= stage['steps']:
-                return stage['cube_weight']
-        return Config.CUBE_CURRICULUM_STAGES[0]['cube_weight']
-    else:
-        return Config.CUBE_LOSS_WEIGHT
+    """Get cube exploration rate and weight from curriculum stages."""
+    for i in reversed(range(len(Config.CUBE_CURRICULUM_STAGES))):
+        stage = Config.CUBE_CURRICULUM_STAGES[i]
+        if train_step >= stage['steps']:
+            return stage['epsilon'], stage['cube_weight']
+    
+    return Config.CUBE_CURRICULUM_STAGES[0]['epsilon'], Config.CUBE_CURRICULUM_STAGES[0]['cube_weight']
 
 # ------------------------------------------------------------
 # Collection helpers (Self-play + Vs Baseline)
@@ -201,20 +180,26 @@ def train():
     else:
         phase = "vs_baseline" if use_baseline else "self_play"
 
+    # Get initial curriculum parameters
+    initial_epsilon, initial_cube_weight = get_cube_epsilon(train_step)
+
     print(f"\n🎮 Training Start: Current ELO={current_elo:.0f}, Best ELO={best_elo:.0f}")
     if use_baseline:
         print(f"   Baseline ELO={baseline_elo:.0f}, Phase={phase}")
-    print(f"   Cube Exploration: {Config.CUBE_EPSILON_START:.2f} → {Config.CUBE_EPSILON_END:.2f} over {Config.CUBE_EPSILON_DECAY_STEPS} steps")
-    print(f"   Cube Loss Weight: {Config.CUBE_LOSS_WEIGHT:.1f}x")
+    print(f"   Cube Curriculum: {len(Config.CUBE_CURRICULUM_STAGES)} stages")
+    print(f"   Starting: ε={initial_epsilon:.2f}, cube_weight={initial_cube_weight:.1f}x")
 
     pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Overall Training")
 
     while train_step < Config.TRAIN_STEPS:
         # ======================================
-        # COLLECTION PHASE with Cube Exploration
+        # Get current curriculum parameters
         # ======================================
-        cube_epsilon = get_cube_epsilon(train_step)
+        cube_epsilon, cube_weight = get_cube_epsilon(train_step)
         
+        # ======================================
+        # COLLECTION PHASE
+        # ======================================
         num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
         num_baseline = Config.MATCHES_PER_ITERATION - num_self
 
@@ -231,9 +216,8 @@ def train():
         # ======================================
         model.train()
         for _ in range(Config.TRAIN_UPDATES_PER_ITER):
-            # Update cube loss weight if using curriculum
-            if Config.CUBE_CURRICULUM_ENABLED:
-                Config.CUBE_LOSS_WEIGHT = get_cube_loss_weight(train_step)
+            # Dynamically update cube loss weight from curriculum
+            Config.CUBE_LOSS_WEIGHT = cube_weight
             
             loss, gnorm = train_batch(
                 model,
@@ -253,7 +237,8 @@ def train():
                 'elo': f'{current_elo:.0f}',
                 'gnorm': f'{gnorm:.2f}',
                 'buf': f'{buf_fill:.1f}%',
-                'ε_cube': f'{cube_epsilon:.3f}'
+                'ε': f'{cube_epsilon:.2f}',
+                'cw': f'{cube_weight:.1f}x'
             })
 
             # ======================================
@@ -261,7 +246,7 @@ def train():
             # ======================================
             if train_step % Config.ELO_EVAL_INTERVAL == 0:
                 print(f"\n\n🎯 ELO Evaluation at Step {train_step} (Phase: {phase})")
-                print(f"   Cube Epsilon: {cube_epsilon:.3f}")
+                print(f"   Cube Params: ε={cube_epsilon:.3f}, weight={cube_weight:.1f}x")
                 
                 model.eval()
                 best_model.eval()
@@ -322,8 +307,9 @@ def train():
                 print("-" * 50)
 
     pbar.close()
+    final_epsilon, final_weight = get_cube_epsilon(train_step)
     print("\n✅ Training complete!")
-    print(f"Final Cube Epsilon: {get_cube_epsilon(train_step):.3f}")
+    print(f"Final Cube Params: ε={final_epsilon:.3f}, weight={final_weight:.1f}x")
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
