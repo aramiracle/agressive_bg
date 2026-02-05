@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Entry point for the WebSocket server (HTML UI)."""
 
 import sys
@@ -41,7 +40,9 @@ UI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui")
 # =========================
 class BackgammonServer:
     def __init__(self):
-        self.game = BackgammonGame()
+        # Use train_mode=False for real backgammon scoring (1, 2, 3)
+        # Set train_mode=True if you want to use Config.R_WIN/R_GAMMON/R_BACKGAMMON values
+        self.game = BackgammonGame(train_mode=False)
         self.model = None
         self.mcts = None
         self.model_filename = None
@@ -154,7 +155,8 @@ class BackgammonServer:
         if self.game.dice and not self.game_over:
             moves = self.game.get_legal_moves()
             for m in moves:
-                src, dst = m
+                # Engine returns atomic moves as ((src, dst), die_used)
+                (src, dst), die_used = m
                 legal_moves.append([src, dst])
 
         return {
@@ -213,7 +215,58 @@ class BackgammonServer:
         self.has_rolled = False
         return self.serialize(f"New match started! First to {self.match_target} points.")
     
-    def _handle_game_win(self, winner, points):
+    def _calculate_multiplier(self, winner):
+        """
+        Determines if the win is a Single, Gammon, or Backgammon.
+        Real backgammon scoring: Single=1, Gammon=2, Backgammon=3
+        winner: 1 (White) or -1 (Black)
+        """
+        loser = -winner
+        loser_off = self.game.off[0 if loser == 1 else 1]
+        
+        # 1. If loser has borne off at least one checker, it's a Single Game
+        if loser_off > 0:
+            return 1
+        
+        # 2. Check for Backgammon: Loser has 0 off AND 
+        #    has checkers in winner's home board or on the bar.
+        
+        # Winner White (1) home board is points 19-24
+        # Winner Black (-1) home board is points 1-6
+        loser_bar = self.game.bar[0 if loser == 1 else 1]
+        
+        if loser_bar > 0:
+            return 3  # Backgammon (stuck on bar)
+            
+        # Check winner's home board for loser's pieces
+        board = self.game.board
+        if winner == 1: # White home is 19-24 (indices 18-23)
+            for i in range(18, 24):
+                if (board[i] > 0 and loser == 1) or (board[i] < 0 and loser == -1):
+                    return 3
+        else: # Black home is 1-6 (indices 0-5)
+            for i in range(0, 6):
+                if (board[i] > 0 and loser == 1) or (board[i] < 0 and loser == -1):
+                    return 3
+                    
+        # 3. If loser has 0 off but escaped the winner's home, it's a Gammon
+        return 2
+
+    def _handle_game_win(self, winner, points_from_engine):
+        """
+        Handle game win. The engine has already:
+        1. Calculated points = cube × multiplier (using Config.R_WIN/R_GAMMON/R_BACKGAMMON)
+        2. Updated self.game.match_scores[winner] with those points in _finalize_win()
+        
+        We just need to display the result correctly.
+        """
+        # Engine already added points to match_scores in _finalize_win(), 
+        # so DON'T add them again!
+        total_points = points_from_engine
+        
+        # Calculate multiplier for display (1=Single, 2=Gammon, 3=Backgammon)
+        multiplier = self._calculate_multiplier(winner)
+        
         score_w = self.game.match_scores.get(1, 0)
         score_b = self.game.match_scores.get(-1, 0)
         
@@ -224,12 +277,13 @@ class BackgammonServer:
         self.game_over = True
         self.winner = winner
         
+        win_type = {1: "Single", 2: "a GAMMON", 3: "a BACKGAMMON"}[multiplier]
         winner_name = "White" if winner == 1 else "Black"
         
         if match_winner:
-            return f"🏆 {winner_name} WINS THE MATCH! Final: {score_w}-{score_b}"
+            return f"🏆 {winner_name} wins {win_type}! Final Match Score: {score_w}-{score_b}"
         else:
-            return f"{winner_name} wins (+{points}pts)! Score: {score_w}-{score_b}. Click 'New Game'."
+            return f"{winner_name} wins {win_type} (+{total_points}pts)! Score: {score_w}-{score_b}."
 
     def roll(self):
         if self.game_over:
@@ -287,13 +341,23 @@ class BackgammonServer:
         elif isinstance(dst, str): dst = int(dst)
         
         legal_moves = self.game.get_legal_moves()
-        move = (src, dst)
+        # Engine returns atomic moves as ((src, dst), die_used)
+        # We need to check if any legal move has matching src and dst
+        move_exists = False
+        chosen_move = None
+        for m in legal_moves:
+            (m_src, m_dst), die_used = m
+            if m_src == src and m_dst == dst:
+                move_exists = True
+                chosen_move = m
+                break
         
-        if move not in legal_moves:
+        if not move_exists:
             return self.serialize(f"Illegal move: {src} -> {dst}")
         
         try:
-            winner, points = self.game.step_atomic(move)
+            # Execute the atomic move with full format
+            winner, points = self.game.step_atomic(chosen_move)
         except ValueError as e:
             return self.serialize(f"Engine Error: {str(e)}")
         

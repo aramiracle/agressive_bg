@@ -8,7 +8,15 @@ class BackgammonGame:
     Compatible with MCTS and Neural Network inputs.
     """
 
-    def __init__(self):
+    def __init__(self, train_mode=None):
+        """
+        Initialize BackgammonGame.
+        
+        Args:
+            train_mode: If True, use training values from Config (R_WIN, R_GAMMON, R_BACKGAMMON).
+                       If False, use real backgammon values (1, 2, 3).
+                       If None, check Config.TRAIN_MODE if it exists, else default to True (training).
+        """
         # Match-level state
         self.match_target = Config.MATCH_TARGET
         self.match_scores = {1: 0, -1: 0}
@@ -16,6 +24,13 @@ class BackgammonGame:
         # Crawford State
         self.crawford_active = False
         self.crawford_used = False
+        
+        # Determine train_mode
+        if train_mode is None:
+            # Try to get from Config, default to True (training mode)
+            self.train_mode = getattr(Config, 'TRAIN_MODE', True)
+        else:
+            self.train_mode = train_mode
 
         self.reset()
 
@@ -101,7 +116,7 @@ class BackgammonGame:
         self.match_scores = dict(snapshot[9])
 
     def copy(self):
-        g = BackgammonGame()
+        g = BackgammonGame(train_mode=self.train_mode)
         g.fast_restore(self.fast_save())
         return g
 
@@ -375,33 +390,66 @@ class BackgammonGame:
         return 0, 0
 
     def _finalize_win(self, winner):
+            """
+            Calculate win points based on game type (single/gammon/backgammon).
+            
+            If train_mode=True: Use Config.R_WIN, Config.R_GAMMON, Config.R_BACKGAMMON (e.g., 1, 3, 5 for aggressive training)
+            If train_mode=False: Use real backgammon values (1, 2, 3)
+            """
             loser = -winner
             loser_idx = 0 if loser == 1 else 1
 
-            # Use Config value for standard win (usually 1.0)
-            mult = Config.R_WIN 
-            
-            if self.off[loser_idx] == 0:
-                # Gammon condition met
-                mult = Config.R_GAMMON
+            # Determine multiplier based on train_mode
+            if self.train_mode:
+                # Training mode: use Config values (could be aggressive like 1, 3, 5)
+                mult = Config.R_WIN 
                 
-                has_bar = self.bar[loser_idx] > 0
-                has_home = False
+                if self.off[loser_idx] == 0:
+                    # Gammon condition met
+                    mult = Config.R_GAMMON
+                    
+                    has_bar = self.bar[loser_idx] > 0
+                    has_home = False
 
-                home_range = (
-                    range(0, 6)
-                    if winner == 1 else
-                    range(18, 24)
-                )
+                    home_range = (
+                        range(0, 6)
+                        if winner == 1 else
+                        range(18, 24)
+                    )
 
-                for i in home_range:
-                    if (loser == 1 and self.board[i] > 0) or (loser == -1 and self.board[i] < 0):
-                        has_home = True
-                        break
+                    for i in home_range:
+                        if (loser == 1 and self.board[i] > 0) or (loser == -1 and self.board[i] < 0):
+                            has_home = True
+                            break
 
-                if has_bar or has_home:
-                    # Backgammon condition met
-                    mult = Config.R_BACKGAMMON
+                    if has_bar or has_home:
+                        # Backgammon condition met
+                        mult = Config.R_BACKGAMMON
+            else:
+                # Real backgammon mode: use standard values (1, 2, 3)
+                mult = 1  # Single game
+                
+                if self.off[loser_idx] == 0:
+                    # Gammon condition met
+                    mult = 2
+                    
+                    has_bar = self.bar[loser_idx] > 0
+                    has_home = False
+
+                    home_range = (
+                        range(0, 6)
+                        if winner == 1 else
+                        range(18, 24)
+                    )
+
+                    for i in home_range:
+                        if (loser == 1 and self.board[i] > 0) or (loser == -1 and self.board[i] < 0):
+                            has_home = True
+                            break
+
+                    if has_bar or has_home:
+                        # Backgammon condition met
+                        mult = 3
 
             points = self.cube * mult
             self.match_scores[winner] += points
