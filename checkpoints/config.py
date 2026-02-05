@@ -53,6 +53,31 @@ class Config:
     DIRICHLET_EPS = 0.25
     MIN_PRIOR = 1e-5
 
+    # ========================================
+    # CUBE LEARNING FIXES
+    # ========================================
+    
+    # Cube Exploration: Force random cube decisions during training
+    # This is CRITICAL to break the "never double" cycle
+    CUBE_EPSILON_START = 0.25  # Start with 20% random cube decisions
+    CUBE_EPSILON_END = 0.02    # Decay to 5% random decisions
+    CUBE_EPSILON_DECAY_STEPS = 400000  # Linear decay over 200k steps
+    
+    # Cube Loss Weight: Emphasize learning cube decisions
+    # Higher weight = model pays more attention to cube errors
+    CUBE_LOSS_WEIGHT = 2.0  # 2x weight on cube loss vs movement loss
+    
+    # Curriculum Learning Stages (Optional - can enable later)
+    # Progressive difficulty in cube learning
+    CUBE_CURRICULUM_ENABLED = False
+    CUBE_CURRICULUM_STAGES = [
+        {'steps': 0,      'epsilon': 0.3, 'cube_weight': 3.0},  # High exploration early
+        {'steps': 50000,  'epsilon': 0.2, 'cube_weight': 2.5},
+        {'steps': 100000, 'epsilon': 0.15, 'cube_weight': 2.0},
+        {'steps': 200000, 'epsilon': 0.1, 'cube_weight': 1.5},
+        {'steps': 300000, 'epsilon': 0.05, 'cube_weight': 1.0},  # Low exploration late
+    ]
+
     # ELO
     INITIAL_ELO = 0
     ELO_K = 4
@@ -68,7 +93,7 @@ class Config:
     BATCH_SIZE = 512 if torch.cuda.is_available() else 128
     BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
-    LABEL_SMOOTHING = 0.02
+    LABEL_SMOOTHING = 0.02  # For movement policy only, NOT for cube
     
     # OPTIMIZATION: Increased LR for faster convergence
     LR = 1e-5
@@ -87,3 +112,9 @@ class Config:
     BASELINE_MODEL_NAME = "best_model.pt"
     BASELINE_SWITCH_ON_SURPASS = True
     BASELINE_SELF_PLAY_RATIO = 0.5
+    
+    # ========================================
+    # CUBE DIAGNOSTICS (Optional Logging)
+    # ========================================
+    CUBE_LOGGING_ENABLED = True  # Log cube action distributions
+    CUBE_LOG_INTERVAL = 100      # Log every N training steps

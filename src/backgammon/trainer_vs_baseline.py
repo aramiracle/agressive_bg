@@ -1,6 +1,12 @@
 """
 Train new model vs older baseline version with full cubing, MCTS reuse, and ELO tracking.
-Features: Mixed-opponent collection, detailed evaluation vs both Best and Baseline models.
+Features: Mixed-opponent collection, detailed evaluation vs both Best and Baseline models,
+and CUBE EXPLORATION FIXES.
+
+Key changes for cube fix:
+- Dynamic epsilon scheduling for cube exploration
+- Pass cube_epsilon to game functions
+- Cube action logging for diagnostics
 """
 
 import os
@@ -19,7 +25,6 @@ from src.backgammon.utils.checkpoint import (
     get_model_state_dict, load_model_state_dict, load_model_with_config
 )
 from src.backgammon.utils.elo import evaluate_vs_opponent, update_elo
-# UPDATED IMPORTS: Using match-based functions
 from src.backgammon.utils.train import train_batch
 from src.backgammon.utils.game import play_self_play_match, play_vs_baseline_match
 from src.backgammon.replay_buffer import get_replay_buffer
@@ -27,11 +32,43 @@ from src.backgammon.replay_buffer import get_replay_buffer
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 # ------------------------------------------------------------
+# Cube Epsilon Scheduling (same as trainer.py)
+# ------------------------------------------------------------
+
+def get_cube_epsilon(train_step):
+    """Calculate cube exploration rate based on training step."""
+    if Config.CUBE_CURRICULUM_ENABLED:
+        for i in reversed(range(len(Config.CUBE_CURRICULUM_STAGES))):
+            stage = Config.CUBE_CURRICULUM_STAGES[i]
+            if train_step >= stage['steps']:
+                return stage['epsilon']
+        return Config.CUBE_CURRICULUM_STAGES[0]['epsilon']
+    else:
+        if train_step >= Config.CUBE_EPSILON_DECAY_STEPS:
+            return Config.CUBE_EPSILON_END
+        
+        progress = train_step / Config.CUBE_EPSILON_DECAY_STEPS
+        epsilon = Config.CUBE_EPSILON_START - (Config.CUBE_EPSILON_START - Config.CUBE_EPSILON_END) * progress
+        return epsilon
+
+def get_cube_loss_weight(train_step):
+    """Get cube loss weight based on training step."""
+    if Config.CUBE_CURRICULUM_ENABLED:
+        for i in reversed(range(len(Config.CUBE_CURRICULUM_STAGES))):
+            stage = Config.CUBE_CURRICULUM_STAGES[i]
+            if train_step >= stage['steps']:
+                return stage['cube_weight']
+        return Config.CUBE_CURRICULUM_STAGES[0]['cube_weight']
+    else:
+        return Config.CUBE_LOSS_WEIGHT
+
+# ------------------------------------------------------------
 # Collection helpers (Self-play + Vs Baseline)
 # ------------------------------------------------------------
 
 def collection_worker(args):
-    mode, model_state, baseline_state, matches_per_worker, device = args
+    """Worker function for parallel collection with cube exploration."""
+    mode, model_state, baseline_state, matches_per_worker, device, cube_epsilon = args
     torch.set_num_threads(1)
 
     game = BackgammonGame()
@@ -39,7 +76,6 @@ def collection_worker(args):
     model.load_state_dict(model_state)
     model.eval()
 
-    # Pass config parameters to maintain consistency with the baseline script
     mcts_current = MCTS(model, cpuct=Config.C_PUCT, num_sims=Config.NUM_SIMULATIONS, device=device)
 
     baseline_model = None
@@ -50,16 +86,24 @@ def collection_worker(args):
 
     collected = []
     for _ in range(matches_per_worker):
-        game.reset() # Standardize reset
+        game.reset()
         if mode == "self":
-            data, _ = play_self_play_match(game=game, mcts=mcts_current, model=model, device=device)
+            data, _ = play_self_play_match(
+                game=game, 
+                mcts=mcts_current, 
+                model=model, 
+                device=device,
+                is_eval=False,
+                cube_epsilon=cube_epsilon
+            )
         else:
             data, _ = play_vs_baseline_match(
                 game=game,
                 current_model=model,
                 baseline_model=baseline_model,
                 mcts_current=mcts_current,
-                device=device
+                device=device,
+                cube_epsilon=cube_epsilon
             )
         collected.extend(data)
     return collected
@@ -67,10 +111,8 @@ def collection_worker(args):
 def collect_worker_wrapper(args):
     return collection_worker(args)
 
-def parallel_collect(mode, model, baseline_model, replay_buffer, total_matches, device="cpu"):
-    """
-    Collect matches in parallel using imap_unordered
-    """
+def parallel_collect(mode, model, baseline_model, replay_buffer, total_matches, device="cpu", cube_epsilon=0.0):
+    """Collect matches in parallel using imap_unordered with cube exploration."""
     num_workers = mp.cpu_count()
     matches_per_worker = max(1, total_matches // num_workers)
 
@@ -80,7 +122,7 @@ def parallel_collect(mode, model, baseline_model, replay_buffer, total_matches, 
     ctx = mp.get_context("spawn")
 
     args_list = [
-        (mode, model_state, baseline_state, matches_per_worker, device)
+        (mode, model_state, baseline_state, matches_per_worker, device, cube_epsilon)
         for _ in range(num_workers)
     ]
 
@@ -90,7 +132,6 @@ def parallel_collect(mode, model, baseline_model, replay_buffer, total_matches, 
         pbar = tqdm(total=total_matches, desc=f"Collecting ({mode})", dynamic_ncols=True)
         for result in pool.imap_unordered(collect_worker_wrapper, args_list):
             collected.extend(result)
-            # Update progress based on estimated batch size, or just visually
             pbar.update(len(result) // 20 if len(result) > 20 else 1) 
         pbar.close()
 
@@ -101,6 +142,7 @@ def parallel_collect(mode, model, baseline_model, replay_buffer, total_matches, 
 # =========================
 
 def get_strong_opponent(phase, baseline_model, best_model):
+    """Determine which model to use as opponent based on training phase."""
     if phase == "vs_baseline":
         return baseline_model
     return best_model
@@ -151,8 +193,7 @@ def train():
     else:
         print(f"⚠️ No baseline found at {baseline_path}, proceeding with self-play only.")
 
-    replay_buffer = get_replay_buffer(Config.BUFFER_SIZE, prioritized=True)
-
+    replay_buffer = get_replay_buffer(Config.BUFFER_SIZE, prioritized=True, device=device)
     game = BackgammonGame()
 
     if getattr(Config, 'BASELINE_SWITCH_ON_SURPASS', True):
@@ -163,25 +204,37 @@ def train():
     print(f"\n🎮 Training Start: Current ELO={current_elo:.0f}, Best ELO={best_elo:.0f}")
     if use_baseline:
         print(f"   Baseline ELO={baseline_elo:.0f}, Phase={phase}")
+    print(f"   Cube Exploration: {Config.CUBE_EPSILON_START:.2f} → {Config.CUBE_EPSILON_END:.2f} over {Config.CUBE_EPSILON_DECAY_STEPS} steps")
+    print(f"   Cube Loss Weight: {Config.CUBE_LOSS_WEIGHT:.1f}x")
 
     pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Overall Training")
 
     while train_step < Config.TRAIN_STEPS:
-        # -------- COLLECTION PHASE (decoupled) --------
+        # ======================================
+        # COLLECTION PHASE with Cube Exploration
+        # ======================================
+        cube_epsilon = get_cube_epsilon(train_step)
+        
         num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
         num_baseline = Config.MATCHES_PER_ITERATION - num_self
 
         strong_opponent = get_strong_opponent(phase, baseline_model, best_model)
 
         if num_self > 0:
-            parallel_collect("self", model, None, replay_buffer, num_self)
+            parallel_collect("self", model, None, replay_buffer, num_self, device=device, cube_epsilon=cube_epsilon)
 
         if strong_opponent is not None and num_baseline > 0:
-            parallel_collect("baseline", model, strong_opponent, replay_buffer, num_baseline)
+            parallel_collect("baseline", model, strong_opponent, replay_buffer, num_baseline, device=device, cube_epsilon=cube_epsilon)
 
-        # -------- TRAINING PHASE (heavy reuse) --------
+        # ======================================
+        # TRAINING PHASE
+        # ======================================
         model.train()
         for _ in range(Config.TRAIN_UPDATES_PER_ITER):
+            # Update cube loss weight if using curriculum
+            if Config.CUBE_CURRICULUM_ENABLED:
+                Config.CUBE_LOSS_WEIGHT = get_cube_loss_weight(train_step)
+            
             loss, gnorm = train_batch(
                 model,
                 optimizer,
@@ -199,12 +252,17 @@ def train():
                 'loss': f'{loss:.2f}',
                 'elo': f'{current_elo:.0f}',
                 'gnorm': f'{gnorm:.2f}',
-                'buf': f'{buf_fill:.1f}%'
+                'buf': f'{buf_fill:.1f}%',
+                'ε_cube': f'{cube_epsilon:.3f}'
             })
 
-            # -------- EVALUATION PHASE --------
+            # ======================================
+            # EVALUATION PHASE
+            # ======================================
             if train_step % Config.ELO_EVAL_INTERVAL == 0:
                 print(f"\n\n🎯 ELO Evaluation at Step {train_step} (Phase: {phase})")
+                print(f"   Cube Epsilon: {cube_epsilon:.3f}")
+                
                 model.eval()
                 best_model.eval()
 
@@ -265,6 +323,7 @@ def train():
 
     pbar.close()
     print("\n✅ Training complete!")
+    print(f"Final Cube Epsilon: {get_cube_epsilon(train_step):.3f}")
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
