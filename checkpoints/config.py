@@ -60,7 +60,7 @@ class Config:
     # Cube Exploration: Force random cube decisions during training
     # This is CRITICAL to break the "never double" cycle
     CUBE_EPSILON_START = 0.25  # Start with 20% random cube decisions
-    CUBE_EPSILON_END = 0.02    # Decay to 5% random decisions
+    CUBE_EPSILON_END = 0.02    # Decay to 2% random decisions
     CUBE_EPSILON_DECAY_STEPS = 400000  # Linear decay over 200k steps
     
     # Cube Loss Weight: Emphasize learning cube decisions
@@ -69,13 +69,14 @@ class Config:
     
     # Curriculum Learning Stages (Optional - can enable later)
     # Progressive difficulty in cube learning
-    CUBE_CURRICULUM_ENABLED = False
+    CUBE_CURRICULUM_ENABLED = True
     CUBE_CURRICULUM_STAGES = [
         {'steps': 0,      'epsilon': 0.3, 'cube_weight': 3.0},  # High exploration early
         {'steps': 50000,  'epsilon': 0.2, 'cube_weight': 2.5},
         {'steps': 100000, 'epsilon': 0.15, 'cube_weight': 2.0},
         {'steps': 200000, 'epsilon': 0.1, 'cube_weight': 1.5},
-        {'steps': 300000, 'epsilon': 0.05, 'cube_weight': 1.0},  # Low exploration late
+        {'steps': 300000, 'epsilon': 0.05, 'cube_weight': 1.2},
+        {'steps': 500000, 'epsilon': 0.02, 'cube_weight': 1.0}  # Low exploration late
     ]
 
     # ELO
