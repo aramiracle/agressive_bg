@@ -130,10 +130,7 @@ def train():
         model.train()
         avg_loss = 0
         tqdm.write(f"--- Epoch Phase: Training on {Config.TRAIN_UPDATES_PER_ITER} batches ---")
-        for update_idx in range(Config.TRAIN_UPDATES_PER_ITER):
-            # Print current step within this epoch/iteration
-            tqdm.write(f"   -> Batch {update_idx + 1}/{Config.TRAIN_UPDATES_PER_ITER} | Global Step: {train_step + 1}")
-
+        for ـ in range(Config.TRAIN_UPDATES_PER_ITER):
             Config.CUBE_LOSS_WEIGHT = cube_weight
             loss, gnorm = train_batch(model, optimizer, replay_buffer, Config.BATCH_SIZE, device, scaler)
             avg_loss += loss
