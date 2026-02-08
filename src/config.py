@@ -58,7 +58,7 @@ class Config:
     # ========================================
     CUBE_CURRICULUM_ENABLED = True
     CUBE_CURRICULUM_STAGES = [
-        {'steps': 0,      'epsilon': 0.35, 'cube_weight': 3.0},
+        {'steps': 0,      'epsilon': 0.4, 'cube_weight': 3.0},
         {'steps': 25000,  'epsilon': 0.25, 'cube_weight': 2.5},
         {'steps': 50000,  'epsilon': 0.15, 'cube_weight': 2.0},
         {'steps': 100000, 'epsilon': 0.10, 'cube_weight': 1.5},

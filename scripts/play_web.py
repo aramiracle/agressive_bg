@@ -436,7 +436,7 @@ class BackgammonServer:
             my_score = self.game.match_scores.get(self.game.turn, 0)
             opp_score = self.game.match_scores.get(-self.game.turn, 0)
             
-            take_choice, _ = get_learned_cube_decision(
+            take_choice, _, _= get_learned_cube_decision(
                 self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
             )
             choice = (take_choice == 1)
