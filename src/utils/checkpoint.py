@@ -2,9 +2,9 @@
 
 import os
 import torch
-from src.backgammon.config import Config
+from src.config import Config
 import importlib.util
-from src.backgammon.model import BackgammonTransformer, BackgammonCNN
+from src.model import BackgammonTransformer, BackgammonCNN
 
 def setup_checkpoint_dir():
     """

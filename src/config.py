@@ -47,7 +47,7 @@ class Config:
 
     # MCTS
     NUM_SIMULATIONS = 64
-    MCTS_BATCH = 8
+    MCTS_BATCH = 4
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25

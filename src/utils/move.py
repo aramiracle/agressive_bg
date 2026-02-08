@@ -1,4 +1,4 @@
-from src.backgammon.config import Config
+from src.config import Config
 
 def move_to_indices(start, end):
     if start == 'bar':

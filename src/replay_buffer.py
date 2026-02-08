@@ -1,7 +1,7 @@
 import torch
 import random
 from typing import List, Tuple, Any
-from src.backgammon.config import Config
+from src.config import Config
 
 # -------------------------------------------------
 # FastSumTree (Pure PyTorch)

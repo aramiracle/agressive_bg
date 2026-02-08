@@ -1,4 +1,4 @@
-from src.backgammon.config import Config
+from src.config import Config
 
 def finalize_history(history, current_won, total_points):
     data = []
