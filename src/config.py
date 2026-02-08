@@ -46,8 +46,8 @@ class Config:
     CNN_KERNEL = 3
 
     # MCTS
-    NUM_SIMULATIONS = 128
-    MCTS_BATCH = 16
+    NUM_SIMULATIONS = 64
+    MCTS_BATCH = 8
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
     DIRICHLET_EPS = 0.25
@@ -63,7 +63,7 @@ class Config:
         {'steps': 50000,  'epsilon': 0.15, 'cube_weight': 2.0},
         {'steps': 100000, 'epsilon': 0.10, 'cube_weight': 1.5},
         {'steps': 200000, 'epsilon': 0.05, 'cube_weight': 1.2},
-        {'steps': 400000, 'epsilon': 0.02, 'cube_weight': 1.0}
+        {'steps': 300000, 'epsilon': 0.02, 'cube_weight': 1.0}
     ]
     CUBE_LOSS_WEIGHT = None
 
@@ -75,10 +75,10 @@ class Config:
     ELO_EVAL_GAMES = 50
 
     # Training
-    MATCHES_PER_ITERATION = 8
+    MATCHES_PER_ITERATION = 4
     TRAIN_UPDATES_PER_ITER = 100
     
-    BATCH_SIZE = 512 if torch.cuda.is_available() else 128
+    BATCH_SIZE = 512 if torch.cuda.is_available() else 256
     BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
     LABEL_SMOOTHING = 0.02

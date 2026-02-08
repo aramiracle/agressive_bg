@@ -1,8 +1,8 @@
 import random
 import torch
-from src.backgammon.config import Config
-from src.backgammon.utils.cube import get_learned_cube_decision
-from src.backgammon.mcts import MCTS
+from src.config import Config
+from src.utils.cube import get_learned_cube_decision
+from src.mcts import MCTS
 
 def _play_single_game(
     game, 

@@ -16,11 +16,11 @@ import random
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import threading
 
-from backgammon.engine import BackgammonGame
-from backgammon.mcts import MCTS
-from backgammon.model import get_model
-from backgammon.config import Config
-from backgammon.utils.cube import get_learned_cube_decision
+from engine import BackgammonGame
+from mcts import MCTS
+from model import get_model
+from config import Config
+from utils.cube import get_learned_cube_decision
 
 
 # =========================

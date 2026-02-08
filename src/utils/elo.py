@@ -3,9 +3,9 @@
 import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
-from src.backgammon.config import Config
-from src.backgammon.mcts import MCTS
-from src.backgammon.engine import BackgammonGame
+from src.config import Config
+from src.mcts import MCTS
+from src.engine import BackgammonGame
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 

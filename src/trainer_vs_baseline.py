@@ -4,18 +4,18 @@ import torch.optim as optim
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
-from src.backgammon.config import Config
-from src.backgammon.engine import BackgammonGame
-from src.backgammon.model import get_model
-from src.backgammon.mcts import MCTS
-from src.backgammon.utils.checkpoint import (
+from src.config import Config
+from src.engine import BackgammonGame
+from src.model import get_model
+from src.mcts import MCTS
+from src.utils.checkpoint import (
     setup_checkpoint_dir, save_checkpoint, load_checkpoint,
     get_model_state_dict, load_model_state_dict, load_model_with_config
 )
-from src.backgammon.utils.elo import evaluate_vs_opponent, update_elo
-from src.backgammon.utils.train import train_batch
-from src.backgammon.utils.game import play_self_play_match, play_vs_baseline_match
-from src.backgammon.replay_buffer import get_replay_buffer
+from src.utils.elo import evaluate_vs_opponent, update_elo
+from src.utils.train import train_batch
+from src.utils.game import play_self_play_match, play_vs_baseline_match
+from src.replay_buffer import get_replay_buffer
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 

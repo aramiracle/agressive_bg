@@ -1,6 +1,6 @@
 import math
 import torch
-from src.backgammon.config import Config
+from src.config import Config
 
 class MCTSNode:
     __slots__ = ("parent", "action", "children", "visits", "value_sum", "prior")

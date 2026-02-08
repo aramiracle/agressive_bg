@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from src.backgammon.config import Config
-from src.backgammon.utils.distribution import smooth_distribution, jensen_shannon_loss
+from src.config import Config
+from src.utils.distribution import smooth_distribution, jensen_shannon_loss
 
 def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     if len(replay_buffer) < batch_size:
