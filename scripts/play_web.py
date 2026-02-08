@@ -41,7 +41,6 @@ UI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui")
 class BackgammonServer:
     def __init__(self):
         # Use train_mode=False for real backgammon scoring (1, 2, 3)
-        # Set train_mode=True if you want to use Config.R_WIN/R_GAMMON/R_BACKGAMMON values
         self.game = BackgammonGame(train_mode=False)
         self.model = None
         self.mcts = None
@@ -146,18 +145,31 @@ class BackgammonServer:
             print(f"❌ Model load error: {e}")
             return {"type": "model_error", "error": str(e)}
 
-    # =====================
-    # SERIALIZATION
-    # =====================
     def serialize(self, status=""):
         # Get legal moves for current player
         legal_moves = []
         if self.game.dice and not self.game_over:
             moves = self.game.get_legal_moves()
             for m in moves:
-                # Engine returns atomic moves as ((src, dst), die_used)
-                (src, dst), die_used = m
+                # Robust move unpacking to handle (src, dst, die) or ((src, dst), die) or (src, dst)
+                if len(m) == 2 and isinstance(m[0], (tuple, list)):
+                    src, dst = m[0]
+                elif len(m) >= 2:
+                    src, dst = m[0], m[1]
+                else:
+                    continue # Should not happen
                 legal_moves.append([src, dst])
+
+        # --- Calculate Pip Counts ---
+        pips_white = self.game.bar[0] * 25
+        pips_black = self.game.bar[1] * 25
+        
+        for i, val in enumerate(self.game.board):
+            if val > 0:  # White
+                pips_white += val * (i + 1)
+            elif val < 0:  # Black
+                pips_black += abs(val) * (24 - i)
+        # ---------------------------------
 
         return {
             "type": "state",
@@ -165,6 +177,7 @@ class BackgammonServer:
                 "board": list(self.game.board),
                 "bar": list(self.game.bar),
                 "off": list(self.game.off),
+                "pips": {"white": pips_white, "black": pips_black},
                 "turn": self.game.turn,
                 "dice": list(self.game.dice) if self.game.dice else [],
                 "cube_value": self.game.cube,
@@ -216,55 +229,37 @@ class BackgammonServer:
         return self.serialize(f"New match started! First to {self.match_target} points.")
     
     def _calculate_multiplier(self, winner):
-        """
-        Determines if the win is a Single, Gammon, or Backgammon.
-        Real backgammon scoring: Single=1, Gammon=2, Backgammon=3
-        winner: 1 (White) or -1 (Black)
-        """
         loser = -winner
         loser_off = self.game.off[0 if loser == 1 else 1]
         
-        # 1. If loser has borne off at least one checker, it's a Single Game
+        # 1. Single Game
         if loser_off > 0:
             return 1
         
-        # 2. Check for Backgammon: Loser has 0 off AND 
-        #    has checkers in winner's home board or on the bar.
-        
-        # Winner White (1) home board is points 19-24
-        # Winner Black (-1) home board is points 1-6
+        # 2. Backgammon check
         loser_bar = self.game.bar[0 if loser == 1 else 1]
         
         if loser_bar > 0:
             return 3  # Backgammon (stuck on bar)
             
-        # Check winner's home board for loser's pieces
+        # Check winner's home board
         board = self.game.board
-        if winner == 1: # White home is 19-24 (indices 18-23)
+        if winner == 1: # White home 19-24
             for i in range(18, 24):
                 if (board[i] > 0 and loser == 1) or (board[i] < 0 and loser == -1):
                     return 3
-        else: # Black home is 1-6 (indices 0-5)
+        else: # Black home 1-6
             for i in range(0, 6):
                 if (board[i] > 0 and loser == 1) or (board[i] < 0 and loser == -1):
                     return 3
                     
-        # 3. If loser has 0 off but escaped the winner's home, it's a Gammon
+        # 3. Gammon
         return 2
 
     def _handle_game_win(self, winner, points_from_engine):
-        """
-        Handle game win. The engine has already:
-        1. Calculated points = cube × multiplier (using Config.R_WIN/R_GAMMON/R_BACKGAMMON)
-        2. Updated self.game.match_scores[winner] with those points in _finalize_win()
-        
-        We just need to display the result correctly.
-        """
-        # Engine already added points to match_scores in _finalize_win(), 
-        # so DON'T add them again!
         total_points = points_from_engine
         
-        # Calculate multiplier for display (1=Single, 2=Gammon, 3=Backgammon)
+        # Calculate display multiplier
         multiplier = self._calculate_multiplier(winner)
         
         score_w = self.game.match_scores.get(1, 0)
@@ -341,12 +336,21 @@ class BackgammonServer:
         elif isinstance(dst, str): dst = int(dst)
         
         legal_moves = self.game.get_legal_moves()
-        # Engine returns atomic moves as ((src, dst), die_used)
-        # We need to check if any legal move has matching src and dst
+        
         move_exists = False
         chosen_move = None
+        
+        # Robust move matching handling different return formats
         for m in legal_moves:
-            (m_src, m_dst), die_used = m
+            m_src, m_dst = None, None
+            
+            # Case 1: Nested tuple ((src, dst), die)
+            if len(m) == 2 and isinstance(m[0], (tuple, list)):
+                (m_src, m_dst), _ = m
+            # Case 2: Flat tuple (src, dst, die) or (src, dst)
+            elif len(m) >= 2:
+                m_src, m_dst = m[0], m[1]
+            
             if m_src == src and m_dst == dst:
                 move_exists = True
                 chosen_move = m
@@ -356,7 +360,7 @@ class BackgammonServer:
             return self.serialize(f"Illegal move: {src} -> {dst}")
         
         try:
-            # Execute the atomic move with full format
+            # Execute the move (engine should handle its own format)
             winner, points = self.game.step_atomic(chosen_move)
         except ValueError as e:
             return self.serialize(f"Engine Error: {str(e)}")
@@ -384,19 +388,15 @@ class BackgammonServer:
         player = g.turn
         opponent = -player
 
-        # No doubling after roll
         if self.has_rolled:
             return False
 
-        # Crawford rule
         if g.crawford_active:
             return False
 
-        # Ownership rule: 0 = center, 1 = white, -1 = black
         if g.cube_owner not in (0, player):
             return False
 
-        # Max cube: cannot double beyond remaining points to win
         remaining_points = self.match_target - min(
             g.match_scores.get(player, 0),
             g.match_scores.get(opponent, 0)
@@ -413,18 +413,16 @@ class BackgammonServer:
             return self.serialize("Cannot double right now.")
         
         self.waiting_for_cube_decision = True
-        # We switch the 'turn' visually so the UI knows who must decide
         self.game.turn *= -1
         
         response = self.serialize("Double offered! Take or Pass?")
         await websocket.send(json.dumps(response))
         
-        # If AI's turn to decide, let AI decide immediately
         if self.is_ai_turn():
-            await asyncio.sleep(0.5)  # Small delay for drama
+            await asyncio.sleep(0.5)
             await self.ai_cube_decision(websocket)
     
-        return None  # Already sent response
+        return None
 
     async def ai_cube_decision(self, websocket):
         """AI decides whether to take or pass a double."""
@@ -432,11 +430,9 @@ class BackgammonServer:
             return
         
         if not self.model or not self.mcts:
-            # Without model, AI randomly decides
             import random
             choice = random.choice([True, False])
         else:
-            # Use the learned cube decision from utils
             my_score = self.game.match_scores.get(self.game.turn, 0)
             opp_score = self.game.match_scores.get(-self.game.turn, 0)
             
@@ -455,7 +451,6 @@ class BackgammonServer:
         if not self.waiting_for_cube_decision:
             return self.serialize("No double offered.")
 
-        # Revert turn to the offerer so apply_double() works correctly
         self.game.turn *= -1 
         self.game.apply_double()
         self.waiting_for_cube_decision = False
@@ -467,9 +462,6 @@ class BackgammonServer:
         if not self.waiting_for_cube_decision:
             return self.serialize("No double offered.")
 
-        # In engine.py, handle_cube_refusal() gives points to the current turn.
-        # Since we flipped the turn in offer_double, the 'offerer' is now -turn.
-        # So we flip back first.
         self.game.turn *= -1
         winner, points = self.game.handle_cube_refusal()
         
@@ -500,29 +492,15 @@ class BackgammonServer:
             ))
             return
 
-        # Cache scores for MCTS
         my_score = self.game.match_scores.get(self.game.turn, 0)
         opp_score = self.game.match_scores.get(-self.game.turn, 0)
 
-        # --------------------
-        # 1. AI Decision: Doubling (Pre-Roll)
-        # --------------------
+        # 1. AI Doubling Logic (Pre-Roll)
         if not self.has_rolled and self.can_offer_double():
-            # Use the model's cube head to decide
-            # take_choice == 1 means the AI would TAKE, but we use logic to decide to OFFER
-            # For simplicity, we trigger the doubling logic if the model sees high value
-            take_choice, _ = get_learned_cube_decision(
-                self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
-            )
-            
-            # Logic: If the position is strong enough that the opponent might pass
-            # or it's a "volatile" double, the AI should offer.
-            # (Refining this logic is a next step; for now, let's focus on the move crash)
-            pass 
+             # Basic implementation: AI checks logic here
+             pass 
 
-        # --------------------
         # 2. Roll Dice
-        # --------------------
         if not self.game.dice:
             self.game.roll_dice()
             self.has_rolled = True
@@ -531,50 +509,44 @@ class BackgammonServer:
             ))
             await asyncio.sleep(0.4)
 
-        # --------------------
         # 3. Atomic Move Loop
-        # --------------------
         while self.game.dice and not self.game_over:
-            # Source of Truth: Get legal moves from the engine
             legal = self.game.get_legal_moves()
             if not legal:
-                # No legal moves possible with remaining dice
                 break
 
-            # CRITICAL FIX: Reset the tree before searching to ensure the root
-            # strictly matches the engine's current board and dice state.
             self.mcts.reset() 
-
-            # Search on the current game state
-            # Note: We pass self.game directly as search saves/restores state internally
             root = self.mcts.search(self.game, my_score, opp_score)
 
             if root.children:
-                # Filter children to ensure selection is strictly from current legal engine moves
                 legal_children = [c for c in root.children if c.action in legal]
-                
                 if legal_children:
-                    # Choose the move with the most simulations (robustness)
                     best_action = max(legal_children, key=lambda n: n.visits).action
                 else:
-                    # Fallback if MCTS failed to find legal moves (should not happen)
                     best_action = random.choice(legal)
             else:
                 best_action = random.choice(legal)
 
-            # Unpack for the UI, but step_atomic needs the full wrapper ((s, e), die)
-            (src, dst), die_used = best_action
+            # Robust unpacking for logging
+            src, dst, die_used = "?", "?", "?"
             
+            # Handle nested ((src, dst), die)
+            if len(best_action) == 2 and isinstance(best_action[0], (tuple, list)):
+                (src, dst), die_used = best_action
+            # Handle flat (src, dst, die)
+            elif len(best_action) >= 3:
+                src, dst, die_used = best_action[0], best_action[1], best_action[2]
+            # Handle simple (src, dst)
+            elif len(best_action) == 2:
+                src, dst = best_action[0], best_action[1]
+
             try:
-                # Execute the atomic move
                 winner, points = self.game.step_atomic(best_action)
                 
-                # Report specific move and die used
                 await websocket.send(json.dumps(
                     self.serialize(f"AI moved {src} → {dst} using {die_used}")
                 ))
             except ValueError as e:
-                # Catch-all for engine desync
                 print(f"❌ AI Move Error: {e}")
                 await websocket.send(json.dumps(self.serialize(f"AI Error: {str(e)}")))
                 break
@@ -584,12 +556,9 @@ class BackgammonServer:
                 await websocket.send(json.dumps(self.serialize(status)))
                 return
 
-            # Short delay for visual flow in UI
             await asyncio.sleep(0.3)
 
-        # --------------------
         # 4. End AI Turn
-        # --------------------
         if not self.game_over:
             self.game.switch_turn()
             self.has_rolled = False
@@ -625,7 +594,7 @@ class BackgammonServer:
 
         if t == "double":
             await self.offer_double(websocket)
-            return None  # Already sent
+            return None
 
         if t == "take_double":
             return self.take_double()
@@ -693,6 +662,8 @@ async def handler(websocket):
                     await websocket.send(json.dumps(response))
             except Exception as e:
                 print(f"❌ Handler error: {e}")
+                import traceback
+                traceback.print_exc()
                 await websocket.send(json.dumps({
                     "type": "error",
                     "error": f"Server error: {str(e)}"
@@ -709,7 +680,7 @@ def start_http_server():
     
     class QuietHandler(SimpleHTTPRequestHandler):
         def log_message(self, format, *args):
-            pass  # Suppress HTTP request logs
+            pass
     
     httpd = HTTPServer((HOST, HTTP_PORT), QuietHandler)
     print(f"🌐 HTTP server: http://localhost:{HTTP_PORT}/html_ui.html")
@@ -721,11 +692,9 @@ async def main():
     print(f"📁 Model path: {MODEL_PATH}")
     print(f"🖥️  Device: {DEVICE}")
     
-    # Start HTTP server in background thread
     http_thread = threading.Thread(target=start_http_server, daemon=True)
     http_thread.start()
     
-    # Suppress websocket handshake errors (from non-WS HTTP requests)
     import logging
     logging.getLogger('websockets').setLevel(logging.ERROR)
     

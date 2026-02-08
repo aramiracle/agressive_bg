@@ -3,7 +3,7 @@
 import math
 import torch
 import torch.nn as nn
-from src.backgammon.config import Config
+from src.config import Config
 
 
 # ---------------------------

@@ -178,7 +178,27 @@ select:focus {
   padding: 10px 20px;
 }
 
+/* Add this to your CSS */
+.pip-display {
+  font-size: 11px;
+  color: #8a8070;
+  font-weight: 600;
+  margin-top: 4px;
+  background: rgba(0,0,0,0.2);
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(139,90,43,0.3);
+}
+
 .match-score {
+  display: flex;
+  flex-direction: column; /* Changed from default (row) to column to stack score and pips */
+  align-items: center;
+  gap: 2px; /* Reduced gap since we are stacking */
+}
+
+/* We need to re-layout the inner score row because match-score is now a column */
+.score-row {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -749,10 +769,16 @@ select:focus {
 
 <!-- MATCH SCORE -->
 <div class="panel match-panel">
+  <!-- White Score & Pips -->
   <div class="match-score">
-    <span class="score-label">White</span>
-    <span class="score-value" id="scoreWhite">0</span>
+    <div class="score-row">
+      <span class="score-label">White</span>
+      <span class="score-value" id="scoreWhite">0</span>
+    </div>
+    <div class="pip-display">PIPS: <span id="pipsWhite">167</span></div>
   </div>
+
+  <!-- Center Info -->
   <div class="match-info">
     <div class="match-target">
       Match to 
@@ -769,9 +795,14 @@ select:focus {
     </div>
     <div class="crawford-indicator" id="crawfordIndicator" style="display:none">🏳️ CRAWFORD</div>
   </div>
+
+  <!-- Black Score & Pips -->
   <div class="match-score">
-    <span class="score-value" id="scoreBlack">0</span>
-    <span class="score-label">Black</span>
+    <div class="score-row">
+      <span class="score-value" id="scoreBlack">0</span>
+      <span class="score-label">Black</span>
+    </div>
+    <div class="pip-display">PIPS: <span id="pipsBlack">167</span></div>
   </div>
 </div>
 
@@ -880,7 +911,6 @@ const WS_URL = "ws://localhost:8765";
 let socket = null;
 
 /* ============================
-/* ============================
    CUBE DECISION LISTENER
 ============================ */
 const btnTake = document.getElementById("btnTake");
@@ -928,6 +958,8 @@ let canDouble = false;
 /* ============================
    UI ELEMENTS
 ============================ */
+const pipsWhite = document.getElementById("pipsWhite");
+const pipsBlack = document.getElementById("pipsBlack");
 const status = document.getElementById("status");
 const cubeValEl = document.getElementById("cubeValue");
 const cubeOwnerEl = document.getElementById("cubeOwner");
@@ -1274,6 +1306,11 @@ function applyState(s) {
   if (cubeValue > oldCubeValue) {
     cubeBox.classList.add('doubled');
     setTimeout(() => cubeBox.classList.remove('doubled'), 500);
+  }
+
+  if (s.pips) {
+    pipsWhite.textContent = s.pips.white;
+    pipsBlack.textContent = s.pips.black;
   }
   
   // Update match score display
