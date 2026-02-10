@@ -46,7 +46,7 @@ class Config:
     CNN_KERNEL = 3
 
     # MCTS
-    NUM_SIMULATIONS = 64
+    NUM_SIMULATIONS = 32
     MCTS_BATCH = 4
     C_PUCT = 1.5
     DIRICHLET_ALPHA = 0.3
