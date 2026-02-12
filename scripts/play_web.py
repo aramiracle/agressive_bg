@@ -1,10 +1,6 @@
 """Entry point for the WebSocket server (HTML UI)."""
 
-import sys
 import os
-
-# Add src to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
 
 import asyncio
 import base64
@@ -16,11 +12,11 @@ import random
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import threading
 
-from engine import BackgammonGame
-from mcts import MCTS
-from model import get_model
-from config import Config
-from utils.cube import get_learned_cube_decision
+from src.engine import BackgammonGame
+from src.mcts import MCTS
+from src.model import get_model
+from src.config import Config
+from src.utils.cube import get_learned_cube_decision
 
 
 # =========================
