@@ -76,7 +76,7 @@ class Config:
 
     # Training
     MATCHES_PER_ITERATION = 4
-    TRAIN_UPDATES_PER_ITER = 100
+    TRAIN_UPDATES_PER_ITER = 50
     
     BATCH_SIZE = 512 if torch.cuda.is_available() else 256
     BUFFER_SIZE = 100000
