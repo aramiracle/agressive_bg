@@ -66,12 +66,12 @@ class Config:
     CUBE_CURRICULUM_ENABLED = True
     CUBE_CURRICULUM_STAGES = [
         {'steps': 0,      'epsilon': 0.5,  'cube_weight': 2.0},
-        {'steps': 25000,  'epsilon': 0.40, 'cube_weight': 1.5},
+        {'steps': 25000,  'epsilon': 0.40, 'cube_weight': 1.6},
         {'steps': 50000,  'epsilon': 0.30, 'cube_weight': 1.4},
-        {'steps': 100000, 'epsilon': 0.20, 'cube_weight': 1.25},
-        {'steps': 150000, 'epsilon': 0.10, 'cube_weight': 1.2},
-        {'steps': 200000, 'epsilon': 0.05, 'cube_weight': 1.1},
-        {'steps': 300000, 'epsilon': 0.02, 'cube_weight': 1.0},
+        {'steps': 75000,  'epsilon': 0.20, 'cube_weight': 1.3},
+        {'steps': 100000, 'epsilon': 0.10, 'cube_weight': 1.2},
+        {'steps': 150000, 'epsilon': 0.05, 'cube_weight': 1.1},
+        {'steps': 200000, 'epsilon': 0.02, 'cube_weight': 1.0},
     ]
 
     # CUBE_LOSS_WEIGHT: previously amplified a near-zero (circular) gradient to no
@@ -85,7 +85,7 @@ class Config:
     ELO_K = 4
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 1000
-    ELO_EVAL_GAMES = 50
+    ELO_EVAL_GAMES = 80
 
     # Training
     MATCHES_PER_ITERATION = 4
