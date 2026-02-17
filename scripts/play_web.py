@@ -233,20 +233,25 @@ class BackgammonServer:
             return 1
         
         # 2. Backgammon check
+        # Check if loser is on bar
         loser_bar = self.game.bar[0 if loser == 1 else 1]
-        
         if loser_bar > 0:
             return 3  # Backgammon (stuck on bar)
             
-        # Check winner's home board
+        # Check winner's home board for loser's checkers.
+        # Based on pip logic:
+        # White (1) moves 23->0. White Home is 0-5.
+        # Black (-1) moves 0->23. Black Home is 18-23.
         board = self.game.board
-        if winner == 1: # White home 19-24
-            for i in range(18, 24):
-                if (board[i] > 0 and loser == 1) or (board[i] < 0 and loser == -1):
-                    return 3
-        else: # Black home 1-6
+        if winner == 1: # White wins (Home 0-5)
+            # Check indices 0-5 for Black checkers (<0)
             for i in range(0, 6):
-                if (board[i] > 0 and loser == 1) or (board[i] < 0 and loser == -1):
+                if board[i] < 0:
+                    return 3
+        else: # Black wins (Home 18-23)
+            # Check indices 18-23 for White checkers (>0)
+            for i in range(18, 24):
+                if board[i] > 0:
                     return 3
                     
         # 3. Gammon
@@ -493,8 +498,16 @@ class BackgammonServer:
 
         # 1. AI Doubling Logic (Pre-Roll)
         if not self.has_rolled and self.can_offer_double():
-             # Basic implementation: AI checks logic here
-             pass 
+            # Query model for doubling decision
+            # Returns: action (0/1), probs, value_est
+            double_action, _, _ = get_learned_cube_decision(
+                self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
+            )
+            
+            if double_action == 1:
+                await self.offer_double(websocket)
+                # Important: Stop moving, wait for human response
+                return
 
         # 2. Roll Dice
         if not self.game.dice:
@@ -593,7 +606,13 @@ class BackgammonServer:
             return None
 
         if t == "take_double":
-            return self.take_double()
+            result = self.take_double()
+            await websocket.send(json.dumps(result))
+            # If AI offered and Human took, it's now AI's turn to continue (roll dice)
+            if self.is_ai_turn() and not self.game_over:
+                await asyncio.sleep(0.3)
+                await self.ai_move(websocket)
+            return None
 
         if t == "refuse_double":
             return self.refuse_double()

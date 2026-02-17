@@ -10,7 +10,7 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     batch, indices, weights = replay_buffer.sample(batch_size)
     if batch is None or len(batch) == 0:
         return 0.0, 0.0
-    
+
     boards = torch.stack([x[0] for x in batch]).to(device).long()
     contexts = torch.stack([x[1] for x in batch]).to(device).float()
     rewards = torch.tensor([x[3] for x in batch], dtype=torch.float32, device=device)
@@ -18,8 +18,10 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
 
     with torch.amp.autocast(enabled=False, device_type='cuda'):
         p_from, p_to, v, cube_logits = model(boards, contexts)
-        
-        # Loss: Value (MSE)
+
+        # Loss: Value (MSE) — applies to ALL positions including cube decisions.
+        # The value head learns the position quality (win probability) regardless
+        # of whether a cube action or a board move was taken here.
         v_loss = (weights_t * (v.squeeze(-1) - rewards) ** 2).mean()
 
         p_loss = torch.tensor(0.0, device=device)
@@ -33,7 +35,18 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
             weight = weights_t[i]
 
             if is_cube:
-                # visit_targets is [2] for Pass/Take
+                # visit_targets is a one-hot [2] tensor for the CHOSEN action
+                # (0 = pass/no-double, 1 = double/take).
+                #
+                # FIX: Previously this was the model's own softmax output, causing
+                # JS(p||p)=0 and zero gradient. Now it is a one-hot, so the cube
+                # head learns to predict the action that was actually chosen.
+                #
+                # The value head (trained above on 'rewards') handles the outcome
+                # weighting — it learns that positions where we chose to double and
+                # won are high-value. The cube head learns the action DISTRIBUTION.
+                # Together they form the actor-critic: cube head = policy, value head
+                # = critic. This mirrors exactly how the move policy is trained.
                 target = smooth_distribution(visit_targets.to(device).float(), smoothing, 2)
                 logp = nn.functional.log_softmax(cube_logits[i], dim=0)
                 loss_val = jensen_shannon_loss(logp, target)
@@ -41,7 +54,8 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
                     c_loss += weight * loss_val
                     c_count += 1
             else:
-                # visit_targets is (target_f, target_t)
+                # visit_targets is (target_f, target_t) — MCTS visit-count distributions.
+                # This path is unchanged and was correct.
                 target_f, target_t = visit_targets
                 tf = smooth_distribution(target_f.to(device).float(), smoothing, Config.NUM_ACTIONS)
                 tt = smooth_distribution(target_t.to(device).float(), smoothing, Config.NUM_ACTIONS)
@@ -51,14 +65,18 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
 
                 js_f = jensen_shannon_loss(logp_f, tf)
                 js_t = jensen_shannon_loss(logp_t, tt)
-                
+
                 if torch.isfinite(js_f).all() and torch.isfinite(js_t).all():
                     p_loss += weight * 0.5 * (js_f + js_t)
                     p_count += 1
 
         loss = v_loss
-        if p_count > 0: loss += p_loss / p_count
-        if c_count > 0: loss += (c_loss / c_count) * Config.CUBE_LOSS_WEIGHT
+        if p_count > 0:
+            loss = loss + p_loss / p_count
+        if c_count > 0:
+            # CUBE_LOSS_WEIGHT is now meaningful: the cube head gradient is real
+            # (non-zero) so the weight actually controls relative learning speed.
+            loss = loss + (c_loss / c_count) * Config.CUBE_LOSS_WEIGHT
 
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()

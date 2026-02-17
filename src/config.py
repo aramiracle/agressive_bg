@@ -35,12 +35,12 @@ class Config:
     DROPOUT = 0.1
     VALUE_HIDDEN = 64
     MAX_SEQ_LEN = BOARD_SEQ_LEN + 1
-    
+
     # Transformer specific
     N_HEAD = 8
     N_LAYERS = 5
     DIM_FEEDFORWARD = 256
-    
+
     # CNN specific
     CNN_BLOCKS = 4
     CNN_KERNEL = 3
@@ -56,16 +56,29 @@ class Config:
     # ========================================
     # CUBE LEARNING - CURRICULUM
     # ========================================
+    # epsilon controls stochastic exploration of cube decisions.
+    # cube_weight scales the cube head loss relative to value + policy loss.
+    #
+    # With the circular-gradient bug fixed, the cube head now receives a genuine
+    # one-hot JS signal. We can reduce epsilon more gradually — the network will
+    # actually learn from the signal rather than drift. Start higher to explore
+    # the full range of cube positions (take AND drop) before committing.
     CUBE_CURRICULUM_ENABLED = True
     CUBE_CURRICULUM_STAGES = [
-        {'steps': 0,      'epsilon': 0.4, 'cube_weight': 3.0},
-        {'steps': 25000,  'epsilon': 0.25, 'cube_weight': 2.5},
-        {'steps': 50000,  'epsilon': 0.15, 'cube_weight': 2.0},
-        {'steps': 100000, 'epsilon': 0.10, 'cube_weight': 1.5},
-        {'steps': 200000, 'epsilon': 0.05, 'cube_weight': 1.2},
-        {'steps': 300000, 'epsilon': 0.02, 'cube_weight': 1.0}
+        {'steps': 0,      'epsilon': 0.5,  'cube_weight': 2.0},
+        {'steps': 25000,  'epsilon': 0.40, 'cube_weight': 1.5},
+        {'steps': 50000,  'epsilon': 0.30, 'cube_weight': 1.4},
+        {'steps': 100000, 'epsilon': 0.20, 'cube_weight': 1.25},
+        {'steps': 150000, 'epsilon': 0.10, 'cube_weight': 1.2},
+        {'steps': 200000, 'epsilon': 0.05, 'cube_weight': 1.1},
+        {'steps': 300000, 'epsilon': 0.02, 'cube_weight': 1.0},
     ]
-    CUBE_LOSS_WEIGHT = None
+
+    # CUBE_LOSS_WEIGHT: previously amplified a near-zero (circular) gradient to no
+    # effect. Now that the cube head loss is a genuine JS(model || one-hot) signal,
+    # 1.0 gives equal footing with policy loss. Do NOT set above ~2.0 or the cube
+    # head will overwhelm the value head's gradients through shared transformer weights.
+    CUBE_LOSS_WEIGHT = 1.0
 
     # ELO
     INITIAL_ELO = 0
@@ -77,12 +90,12 @@ class Config:
     # Training
     MATCHES_PER_ITERATION = 4
     TRAIN_UPDATES_PER_ITER = 50
-    
+
     BATCH_SIZE = 512 if torch.cuda.is_available() else 256
     BUFFER_SIZE = 100000
     KL_EPSILON = 1e-6
     LABEL_SMOOTHING = 0.02
-    
+
     LR = 1e-5
     GRAD_CLIP = 1.0
     WEIGHT_DECAY = 1e-4
@@ -92,7 +105,7 @@ class Config:
 
     # Device
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    SELF_PLAY_DEVICE = "cpu" # Often faster to run env on CPU if GPU is busy training
+    SELF_PLAY_DEVICE = "cpu"  # Often faster to run env on CPU if GPU is busy training
 
     # Checkpoints
     CHECKPOINT_DIR = "checkpoints"
