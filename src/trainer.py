@@ -16,6 +16,7 @@ from src.utils.elo import evaluate_combined, update_elo
 from src.replay_buffer import get_replay_buffer
 from src.utils.game import play_self_play_match
 from src.utils.train import train_batch
+from src.utils.match_equity import MatchEquityTable
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -29,7 +30,7 @@ def get_cube_epsilon(train_step):
 
 
 def collection_worker(args):
-    model_state, matches_per_worker, device, cube_epsilon = args
+    model_state, equity_table_state, matches_per_worker, device, cube_epsilon = args
     torch.set_num_threads(1)
 
     game  = BackgammonGame()
@@ -37,6 +38,10 @@ def collection_worker(args):
     model.load_state_dict(model_state)
     model.eval()
     mcts  = MCTS(model, cpuct=Config.C_PUCT, num_sims=Config.NUM_SIMULATIONS, device=device)
+    
+    # Reconstruct match equity table in worker
+    equity_table = MatchEquityTable()
+    equity_table.equity_table = equity_table_state
 
     collected   = []
     local_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
@@ -45,7 +50,7 @@ def collection_worker(args):
     for _ in range(matches_per_worker):
         game.reset()
         data, _, match_stats = play_self_play_match(
-            game, mcts, model, device,
+            game, mcts, model, device, equity_table,
             is_eval=False,
             cube_epsilon=cube_epsilon
         )
@@ -53,36 +58,48 @@ def collection_worker(args):
         for k in local_stats:
             local_stats[k] += match_stats[k]
 
-    return collected, local_stats
+    # Return updated equity table state
+    return collected, local_stats, equity_table.equity_table
 
 
 def collect_worker_wrapper(args):
     return collection_worker(args)
 
 
-def parallel_collect_self_play(model, replay_buffer, total_matches, device="cpu", cube_epsilon=0.0):
+def parallel_collect_self_play(model, equity_table, replay_buffer, total_matches, device="cpu", cube_epsilon=0.0):
     collection_device = getattr(Config, 'SELF_PLAY_DEVICE', device)
     num_workers       = mp.cpu_count()
     matches_per_worker = max(1, total_matches // num_workers)
 
     model_state = model.state_dict()
+    equity_table_state = equity_table.equity_table.copy()  # Send current table to workers
     ctx         = mp.get_context("spawn")
 
     args_list = [
-        (model_state, matches_per_worker, collection_device, cube_epsilon)
+        (model_state, equity_table_state, matches_per_worker, collection_device, cube_epsilon)
         for _ in range(num_workers)
     ]
 
     collected_data = []
     agg_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                  'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
+    
+    # Collect updated equity tables from workers
+    worker_equity_tables = []
 
     with ctx.Pool(processes=num_workers) as pool:
         results = pool.map(collect_worker_wrapper, args_list)
-        for data, stats in results:
+        for data, stats, worker_equity in results:
             collected_data.extend(data)
             for k in agg_stats:
                 agg_stats[k] += stats[k]
+            worker_equity_tables.append(worker_equity)
+    
+    # Merge worker equity tables back into main table
+    # Average the updates from all workers
+    for key in equity_table.equity_table.keys():
+        values = [wt.get(key, equity_table.equity_table[key]) for wt in worker_equity_tables]
+        equity_table.equity_table[key] = sum(values) / len(values)
 
     replay_buffer.extend(collected_data)
     return agg_stats
@@ -104,8 +121,17 @@ def train():
     cp_best  = load_checkpoint(best_path, best_model, None, device)
     best_elo = cp_best['elo'] if cp_best else current_elo
 
-    # Optionally load an external baseline for richer eval signal.
-    # If not present, evaluate_combined falls back to best_model only.
+    # Initialize match equity table
+    equity_table = MatchEquityTable(match_target=Config.MATCH_TARGET, learning_rate=0.01)
+    equity_path = os.path.join(checkpoint_dir, 'match_equity.pt')
+    if os.path.exists(equity_path):
+        try:
+            equity_table.load(equity_path)
+            tqdm.write(f"   Loaded match equity table from {equity_path}")
+        except:
+            tqdm.write(f"   Failed to load equity table, using fresh initialization")
+
+    # Optionally load an external baseline for richer eval signal
     baseline_model = None
     baseline_elo   = Config.INITIAL_ELO
     baseline_path  = os.path.join(
@@ -140,7 +166,7 @@ def train():
 
         tqdm.write(f"--- Epoch Phase 1: Collecting {Config.MATCHES_PER_ITERATION} self-play games ---")
         stats = parallel_collect_self_play(
-            model, replay_buffer, Config.MATCHES_PER_ITERATION, device, cube_epsilon
+            model, equity_table, replay_buffer, Config.MATCHES_PER_ITERATION, device, cube_epsilon
         )
 
         if len(replay_buffer) < Config.BATCH_SIZE:
@@ -181,9 +207,6 @@ def train():
             model.eval()
             best_model.eval()
 
-            # evaluate_combined splits ELO_EVAL_GAMES between baseline and best_model
-            # according to BASELINE_SELF_PLAY_RATIO, accumulates all wins, and returns
-            # the weighted opponent ELO so update_elo receives one coherent signal.
             total_wins, total_games, opponent_elo = evaluate_combined(
                 model         = model,
                 best_model    = best_model,
@@ -209,6 +232,12 @@ def train():
                 tqdm.write(f"  --> New Best Model Saved (ELO {best_elo:.0f})")
 
             save_checkpoint(model, optimizer, train_step, current_elo, avg_loss, latest_path)
+            equity_table.save(equity_path)
+            
+            # Optionally print equity table for inspection
+            if train_step % (Config.ELO_EVAL_INTERVAL * 10) == 0:
+                equity_table.print_table()
+            
             model.train()
 
     pbar.close()

@@ -16,6 +16,7 @@ from src.utils.elo import evaluate_combined, update_elo
 from src.utils.train import train_batch
 from src.utils.game import play_self_play_match, play_vs_baseline_match
 from src.replay_buffer import get_replay_buffer
+from src.utils.match_equity import MatchEquityTable
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -29,7 +30,7 @@ def get_cube_epsilon(train_step):
 
 
 def collection_worker(args):
-    mode, model_state, baseline_state, matches_per_worker, device, cube_epsilon = args
+    mode, model_state, baseline_state, equity_table_state, matches_per_worker, device, cube_epsilon = args
     torch.set_num_threads(1)
 
     game  = BackgammonGame()
@@ -45,6 +46,9 @@ def collection_worker(args):
         baseline_model.load_state_dict(baseline_state)
         baseline_model.eval()
 
+    equity_table = MatchEquityTable()
+    equity_table.equity_table = equity_table_state
+
     collected   = []
     local_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                    'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
@@ -53,46 +57,54 @@ def collection_worker(args):
         game.reset()
         if mode == "self":
             data, _, stats = play_self_play_match(
-                game, mcts_current, model, device, False, cube_epsilon
+                game, mcts_current, model, device, equity_table, False, cube_epsilon
             )
         else:
             data, _, stats = play_vs_baseline_match(
-                game, model, baseline_model, mcts_current, device, cube_epsilon
+                game, model, baseline_model, mcts_current, device, equity_table, cube_epsilon
             )
 
         collected.extend(data)
         for k in local_stats:
             local_stats[k] += stats[k]
 
-    return collected, local_stats
+    return collected, local_stats, equity_table.equity_table
 
 
 def collect_worker_wrapper(args):
     return collection_worker(args)
 
 
-def parallel_collect(mode, model, baseline_model, replay_buffer,
+def parallel_collect(mode, model, baseline_model, equity_table, replay_buffer,
                      total_matches, device="cpu", cube_epsilon=0.0):
     num_workers        = mp.cpu_count()
     matches_per_worker = max(1, total_matches // num_workers)
     model_state        = model.state_dict()
     baseline_state     = baseline_model.state_dict() if baseline_model else None
+    equity_table_state = equity_table.equity_table.copy()
     ctx                = mp.get_context("spawn")
 
     args_list = [
-        (mode, model_state, baseline_state, matches_per_worker, device, cube_epsilon)
+        (mode, model_state, baseline_state, equity_table_state, matches_per_worker, device, cube_epsilon)
         for _ in range(num_workers)
     ]
     collected_data = []
     agg_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                  'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
+    worker_equity_tables = []
 
     with ctx.Pool(processes=num_workers) as pool:
         results = pool.map(collect_worker_wrapper, args_list)
-        for data, stats in results:
+        for data, stats, worker_equity in results:
             collected_data.extend(data)
             for k in agg_stats:
                 agg_stats[k] += stats[k]
+            worker_equity_tables.append(worker_equity)
+
+    # Merge equity tables
+    for key in equity_table.equity_table.keys():
+        values = [wt.get(key, equity_table.equity_table[key]) for wt in worker_equity_tables]
+        equity_table.equity_table[key] = sum(values) / len(values)
 
     replay_buffer.extend(collected_data)
     return agg_stats
@@ -113,6 +125,16 @@ def train():
 
     cp_best  = load_checkpoint(best_path, best_model, None, device)
     best_elo = cp_best['elo'] if cp_best else current_elo
+
+    # Initialize match equity table
+    equity_table = MatchEquityTable(match_target=Config.MATCH_TARGET, learning_rate=0.01)
+    equity_path = os.path.join(checkpoint_dir, 'match_equity.pt')
+    if os.path.exists(equity_path):
+        try:
+            equity_table.load(equity_path)
+            tqdm.write(f"   Loaded match equity table")
+        except:
+            tqdm.write(f"   Using fresh equity table")
 
     # Load external baseline
     baseline_path = os.path.join(
@@ -148,8 +170,6 @@ def train():
     while train_step < Config.TRAIN_STEPS:
         cube_epsilon, cube_weight = get_cube_epsilon(train_step)
 
-        # Collection split: BASELINE_SELF_PLAY_RATIO fraction are self-play games,
-        # the remainder are played against the current opponent (baseline or best).
         num_self     = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
         num_opponent = Config.MATCHES_PER_ITERATION - num_self
         opponent     = baseline_model if phase == "vs_baseline" else best_model
@@ -162,13 +182,13 @@ def train():
         if num_self > 0:
             tqdm.write(f"--- Epoch Phase: Collecting {num_self} self-play games ---")
             stats_self = parallel_collect(
-                "self", model, None, replay_buffer, num_self, device, cube_epsilon
+                "self", model, None, equity_table, replay_buffer, num_self, device, cube_epsilon
             )
 
         if opponent is not None and num_opponent > 0:
             tqdm.write(f"--- Epoch Phase: Collecting {num_opponent} opponent games ---")
             stats_opp = parallel_collect(
-                "baseline", model, opponent, replay_buffer, num_opponent, device, cube_epsilon
+                "baseline", model, opponent, equity_table, replay_buffer, num_opponent, device, cube_epsilon
             )
 
         if len(replay_buffer) < Config.BATCH_SIZE:
@@ -187,7 +207,6 @@ def train():
             pbar.update(1)
         avg_loss /= Config.TRAIN_UPDATES_PER_ITER
 
-        # Combined stats for display
         s_d  = stats_self['doubles']        + stats_opp['doubles']
         s_g  = stats_self['games']          + stats_opp['games']
         s_t  = stats_self['takes']          + stats_opp['takes']
@@ -206,17 +225,13 @@ def train():
             model.eval()
             best_model.eval()
 
-            # FIX: When model has surpassed baseline (phase == "self_play"),
-            # evaluate against best_model only. The external baseline is no longer
-            # relevant — it's weaker than our current best checkpoint. Passing
-            # baseline_model=None to evaluate_combined routes all eval games to best_model.
             eval_baseline_model = baseline_model if phase == "vs_baseline" else None
             eval_baseline_elo   = baseline_elo   if phase == "vs_baseline" else best_elo
 
             total_wins, total_games, opponent_elo = evaluate_combined(
                 model          = model,
                 best_model     = best_model,
-                baseline_model = eval_baseline_model,  # None when phase == "self_play"
+                baseline_model = eval_baseline_model,
                 best_elo       = best_elo,
                 baseline_elo   = eval_baseline_elo,
                 total_games    = Config.ELO_EVAL_GAMES,
@@ -242,6 +257,11 @@ def train():
                 tqdm.write(">>> Surpassed Baseline! Switching to Self-Play for collection AND evaluation.")
 
             save_checkpoint(model, optimizer, train_step, current_elo, avg_loss, latest_path)
+            equity_table.save(equity_path)
+            
+            if train_step % (Config.ELO_EVAL_INTERVAL * 10) == 0:
+                equity_table.print_table()
+            
             model.train()
 
     pbar.close()

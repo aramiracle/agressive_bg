@@ -30,8 +30,6 @@ def _play_single_game(
         'sum_val_double': 0.0, 'sum_val_drop': 0.0
     }
 
-    norm_factor = float(Config.MATCH_TARGET * (Config.R_BACKGAMMON + 1))
-
     for _ in range(Config.MAX_GAME_MOVES):
         winner, _ = game.check_win()
         if winner != 0: break
@@ -54,19 +52,15 @@ def _play_single_game(
 
             if collect_current:
                 board_t, ctx_t = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
-                # FIX BUG 1: Store a one-hot vector of the CHOSEN ACTION as the target,
-                # NOT the model's probability output. The model's own probs have zero
-                # JS-divergence with themselves, producing no corrective gradient.
-                # One-hot gives a real signal: push the cube head toward the chosen action,
-                # which will later be weighted by the game outcome via the value head.
                 cube_target = torch.zeros(2)
                 cube_target[double_choice] = 1.0
 
                 history.append({
                     'board': board_t, 'ctx': ctx_t, 'action': double_choice,
                     'turn': game.turn, 'is_cube': True,
-                    'probs': cube_target,          # one-hot of chosen action
+                    'probs': cube_target,
                     'is_p1': (game.turn == 1), 'cube_type': 'double_decision',
+                    'score_before': (my_s, opp_s),
                     'immediate_reward': None,
                     'mcts_val': val_est_doubler
                 })
@@ -86,15 +80,15 @@ def _play_single_game(
 
                 if collect_opp:
                     board_opp, ctx_opp = game.get_vector(opp_s, my_s, device='cpu', canonical=True)
-                    # FIX BUG 1 (same): one-hot for the taker's decision
                     take_target = torch.zeros(2)
                     take_target[take_choice] = 1.0
 
                     history.append({
                         'board': board_opp, 'ctx': ctx_opp, 'action': take_choice,
                         'turn': game.turn, 'is_cube': True,
-                        'probs': take_target,      # one-hot of chosen action
+                        'probs': take_target,
                         'is_p1': (game.turn == 1), 'cube_type': 'take_decision',
+                        'score_before': (opp_s, my_s),
                         'immediate_reward': None,
                         'mcts_val': val_est_taker
                     })
@@ -104,26 +98,26 @@ def _play_single_game(
                 if take_choice == 1:
                     stats['takes'] += 1
                     game.apply_double()
-                    # Game continues
                 else:
                     stats['drops'] += 1
                     stats['sum_val_drop'] += val_est_taker
 
                     winner, points = game.handle_cube_refusal()
 
-                    points_lost = float(points)
-                    drop_reward_mag = points_lost / norm_factor
-
+                    # Mark drop outcome: will be converted to match equity change later
+                    # We store the score_after for later equity computation
                     if collect_current:
                         for h in reversed(history):
                             if h.get('cube_type') == 'double_decision':
-                                h['immediate_reward'] = drop_reward_mag
+                                h['drop_outcome'] = True
+                                h['score_after'] = (my_s + points, opp_s)
                                 break
 
                     if collect_opp:
                         for h in reversed(history):
                             if h.get('cube_type') == 'take_decision':
-                                h['immediate_reward'] = -drop_reward_mag
+                                h['drop_outcome'] = True
+                                h['score_after'] = (opp_s, my_s + points)
                                 break
 
                     return winner, points, history, stats
@@ -174,6 +168,7 @@ def _play_single_game(
                     'is_cube': False,
                     'probs': (target_f, target_t),
                     'is_p1': (game.turn == 1),
+                    'score_before': (my_s, opp_s),
                     'immediate_reward': None,
                     'mcts_val': mcts_root_value
                 })
@@ -191,13 +186,15 @@ def _play_single_game(
     return winner, total_points, history, stats
 
 
-def play_self_play_match(game, mcts, model, device, is_eval=False, cube_epsilon=0.0):
+def play_self_play_match(game, mcts, model, device, match_equity_table, 
+                         is_eval=False, cube_epsilon=0.0):
     scores = {1: 0, -1: 0}
     full_match_history = []
     crawford_occurred = False
+    scores_seen = []  # Track all score pairs for equity table update
 
-    match_stats = {'doubles': 0, 'takes': 0, 'drops': 0, 'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
-    norm_factor = float(Config.MATCH_TARGET * (Config.R_BACKGAMMON + 1))
+    match_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
+                   'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
 
     while scores[1] < Config.MATCH_TARGET and scores[-1] < Config.MATCH_TARGET:
         leader = 1 if scores[1] > scores[-1] else -1
@@ -205,6 +202,12 @@ def play_self_play_match(game, mcts, model, device, is_eval=False, cube_epsilon=
         if not crawford_occurred and (Config.MATCH_TARGET - scores[leader] == 1):
             is_crawford_game = True
             crawford_occurred = True
+
+        # Record score before this game
+        score_before_p1 = scores[1]
+        score_before_p2 = scores[-1]
+        scores_seen.append((score_before_p1, score_before_p2))
+        scores_seen.append((score_before_p2, score_before_p1))  # Both perspectives
 
         winner, points, game_history, g_stats = _play_single_game(
             game, model, mcts, model, mcts, scores, is_crawford_game, device,
@@ -216,29 +219,35 @@ def play_self_play_match(game, mcts, model, device, is_eval=False, cube_epsilon=
         match_stats['games'] += 1
         for k in g_stats: match_stats[k] += g_stats[k]
 
-        # FIX BUG 2: reward_mag must use the ACTUAL game points (including cube
-        # multiplier) so that movement entries leading to high-cube outcomes are
-        # rewarded proportionally. The old code had this right in structure but
-        # the drop early-return corrupted it. Since dropped games return early,
-        # movement entries in those games use immediate_reward=None, so they DO
-        # fall through to use reward_mag. For dropped games, points = cube (1 pt
-        # if cube=1), giving reward_mag ≈ 0.024 — tiny. This is actually correct:
-        # if the game ended after one forced drop, we should not retroactively
-        # assign a large movement reward. The cube entries already carry the right
-        # immediate_reward signal. Leave this logic as-is; the key fix is Bug 1.
-        reward_mag = float(points) / norm_factor
+        # CRITICAL: Compute rewards using MATCH EQUITY CHANGE, not point normalization
+        # This eliminates cube inflation: the reward reflects the strategic value
+        # of the score change, not the raw points multiplied by cube level.
+        
+        score_after_p1 = scores[1]
+        score_after_p2 = scores[-1]
 
         for h in game_history:
             player_val = 1 if h['is_p1'] else -1
-            is_winner = (player_val == winner)
-
-            # 1. Determine the Game Outcome Reward
-            if h.get('immediate_reward') is not None:
-                outcome_reward = h['immediate_reward']
+            my_score_before, opp_score_before = h['score_before']
+            
+            # Determine score after this game from this player's perspective
+            if h.get('drop_outcome'):
+                # Drop: score_after was stored in history entry
+                my_score_after, opp_score_after = h['score_after']
             else:
-                outcome_reward = reward_mag if is_winner else -reward_mag
-
-            # 2. Mix with MCTS Value for moves (not for cube decisions)
+                # Normal game end: use match scores
+                if player_val == 1:
+                    my_score_after, opp_score_after = score_after_p1, score_after_p2
+                else:
+                    my_score_after, opp_score_after = score_after_p2, score_after_p1
+            
+            # Compute reward as match equity change
+            outcome_reward = match_equity_table.compute_reward(
+                my_score_before, opp_score_before,
+                my_score_after, opp_score_after
+            )
+            
+            # Mix with MCTS value for moves (not for cube decisions)
             final_target = outcome_reward
             if not h['is_cube'] and h.get('mcts_val') is not None:
                 final_target = 0.5 * outcome_reward + 0.5 * h['mcts_val']
@@ -247,16 +256,22 @@ def play_self_play_match(game, mcts, model, device, is_eval=False, cube_epsilon=
                 h['board'], h['ctx'], h['action'], final_target, h['is_cube'], h['probs']
             ))
 
+    # Update match equity table based on match outcome
     overall_winner = 1 if scores[1] >= Config.MATCH_TARGET else -1
+    match_equity_table.update_from_match(scores_seen, overall_winner)
+
     return full_match_history, overall_winner, match_stats
 
 
-def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, device, cube_epsilon=0.0):
+def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, device,
+                           match_equity_table, cube_epsilon=0.0):
     scores = {1: 0, -1: 0}
     full_match_history = []
     crawford_occurred = False
-    match_stats = {'doubles': 0, 'takes': 0, 'drops': 0, 'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
-    norm_factor = float(Config.MATCH_TARGET * (Config.R_BACKGAMMON + 1))
+    scores_seen = []
+
+    match_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
+                   'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
 
     current_is_p1 = random.choice([True, False])
     model_p1 = current_model if current_is_p1 else baseline_model
@@ -271,6 +286,11 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
             is_crawford_game = True
             crawford_occurred = True
 
+        score_before_p1 = scores[1]
+        score_before_p2 = scores[-1]
+        scores_seen.append((score_before_p1, score_before_p2))
+        scores_seen.append((score_before_p2, score_before_p1))
+
         winner, points, game_history, g_stats = _play_single_game(
             game, model_p1, mcts_p1, model_p2, mcts_p2, scores, is_crawford_game, device,
             collect_history_p1=current_is_p1, collect_history_p2=(not current_is_p1),
@@ -281,22 +301,32 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
         match_stats['games'] += 1
         for k in g_stats: match_stats[k] += g_stats[k]
 
-        reward_mag = float(points) / norm_factor
+        score_after_p1 = scores[1]
+        score_after_p2 = scores[-1]
 
         for h in game_history:
-            am_i_p1 = current_is_p1
-            i_won = (winner == 1 and am_i_p1) or (winner == -1 and not am_i_p1)
-
-            if h.get('immediate_reward') is not None:
-                # immediate_reward is already correctly signed from _play_single_game
-                # (positive for the doubler who benefits from the drop,
-                #  negative for the taker who chose to drop).
-                # We must NOT flip it again based on i_won — that would double-negate.
-                # The reward was signed relative to the doubler/taker perspective,
-                # which is already the current player's perspective for collected entries.
-                outcome_reward = h['immediate_reward']
+            # Map to current model's perspective
+            if h['is_p1'] == current_is_p1:
+                my_score_before, opp_score_before = h['score_before']
+                
+                if h.get('drop_outcome'):
+                    my_score_after, opp_score_after = h['score_after']
+                else:
+                    my_score_after = score_after_p1 if current_is_p1 else score_after_p2
+                    opp_score_after = score_after_p2 if current_is_p1 else score_after_p1
             else:
-                outcome_reward = reward_mag if i_won else -reward_mag
+                # This entry is from opponent's perspective, already collected correctly
+                my_score_before, opp_score_before = h['score_before']
+                if h.get('drop_outcome'):
+                    my_score_after, opp_score_after = h['score_after']
+                else:
+                    my_score_after = score_after_p2 if current_is_p1 else score_after_p1
+                    opp_score_after = score_after_p1 if current_is_p1 else score_after_p2
+
+            outcome_reward = match_equity_table.compute_reward(
+                my_score_before, opp_score_before,
+                my_score_after, opp_score_after
+            )
 
             final_target = outcome_reward
             if not h['is_cube'] and h.get('mcts_val') is not None:
@@ -306,5 +336,9 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
                 h['board'], h['ctx'], h['action'], final_target, h['is_cube'], h['probs']
             ))
 
-    current_won_match = (scores[1] >= Config.MATCH_TARGET) if current_is_p1 else (scores[-1] >= Config.MATCH_TARGET)
+    overall_winner = 1 if scores[1] >= Config.MATCH_TARGET else -1
+    match_equity_table.update_from_match(scores_seen, overall_winner)
+
+    current_won_match = (scores[1] >= Config.MATCH_TARGET) if current_is_p1 else \
+                        (scores[-1] >= Config.MATCH_TARGET)
     return full_match_history, current_won_match, match_stats
