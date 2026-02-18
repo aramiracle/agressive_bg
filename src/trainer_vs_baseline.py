@@ -206,16 +206,19 @@ def train():
             model.eval()
             best_model.eval()
 
-            # Split ELO_EVAL_GAMES between baseline and best_model using
-            # BASELINE_SELF_PLAY_RATIO, accumulate all wins, get weighted opponent_elo.
-            # Example: ratio=0.7, total=100 -> 70 vs baseline + 30 vs best
-            #          opponent_elo = baseline_elo*0.7 + best_elo*0.3
+            # FIX: When model has surpassed baseline (phase == "self_play"),
+            # evaluate against best_model only. The external baseline is no longer
+            # relevant — it's weaker than our current best checkpoint. Passing
+            # baseline_model=None to evaluate_combined routes all eval games to best_model.
+            eval_baseline_model = baseline_model if phase == "vs_baseline" else None
+            eval_baseline_elo   = baseline_elo   if phase == "vs_baseline" else best_elo
+
             total_wins, total_games, opponent_elo = evaluate_combined(
                 model          = model,
                 best_model     = best_model,
-                baseline_model = baseline_model if use_baseline else None,
+                baseline_model = eval_baseline_model,  # None when phase == "self_play"
                 best_elo       = best_elo,
-                baseline_elo   = baseline_elo,
+                baseline_elo   = eval_baseline_elo,
                 total_games    = Config.ELO_EVAL_GAMES,
                 device         = 'cpu',
             )
@@ -236,7 +239,7 @@ def train():
 
             if phase == "vs_baseline" and current_elo >= baseline_elo:
                 phase = "self_play"
-                tqdm.write(">>> Surpassed Baseline! Switching to Self-Play.")
+                tqdm.write(">>> Surpassed Baseline! Switching to Self-Play for collection AND evaluation.")
 
             save_checkpoint(model, optimizer, train_step, current_elo, avg_loss, latest_path)
             model.train()
