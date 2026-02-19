@@ -47,7 +47,10 @@ def _play_single_game(
         # 1. CUBING PHASE
         # ==========================================
         if game.can_double() and not game.crawford_active:
-            double_choice, log_prob_double, val_est_doubler = get_learned_cube_decision(
+            # me_soft_target: float32 [2] — ME-derived soft target for JS training.
+            # Replaces one-hot behavioural cloning. When equity_table=None,
+            # falls back to one-hot of chosen action (original behaviour).
+            double_choice, me_soft_target_d, val_est_doubler = get_learned_cube_decision(
                 current_model, game, device, my_s, opp_s,
                 equity_table=equity_table,
                 stochastic=not is_eval,
@@ -56,13 +59,17 @@ def _play_single_game(
 
             if collect_current:
                 board_t, ctx_t = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
-                cube_target = torch.zeros(2)
-                cube_target[double_choice] = 1.0
+                # Use ME soft target if available, else one-hot fallback
+                if me_soft_target_d is not None:
+                    cube_probs = me_soft_target_d.cpu()
+                else:
+                    cube_probs = torch.zeros(2)
+                    cube_probs[double_choice] = 1.0
 
                 history.append({
                     'board': board_t, 'ctx': ctx_t, 'action': double_choice,
                     'turn': game.turn, 'is_cube': True,
-                    'probs': cube_target,
+                    'probs': cube_probs,
                     'is_p1': (game.turn == 1), 'cube_type': 'double_decision',
                     'score_before': (my_s, opp_s),
                     'immediate_reward': None,
@@ -77,7 +84,7 @@ def _play_single_game(
                 opp_model   = model_p1 if game.turn == 1 else model_p2
                 collect_opp = collect_history_p1 if game.turn == 1 else collect_history_p2
 
-                take_choice, log_prob_take, val_est_taker = get_learned_cube_decision(
+                take_choice, me_soft_target_t, val_est_taker = get_learned_cube_decision(
                     opp_model, game, device, opp_s, my_s,
                     equity_table=equity_table,
                     stochastic=not is_eval,
@@ -86,13 +93,16 @@ def _play_single_game(
 
                 if collect_opp:
                     board_opp, ctx_opp = game.get_vector(opp_s, my_s, device='cpu', canonical=True)
-                    take_target = torch.zeros(2)
-                    take_target[take_choice] = 1.0
+                    if me_soft_target_t is not None:
+                        take_probs = me_soft_target_t.cpu()
+                    else:
+                        take_probs = torch.zeros(2)
+                        take_probs[take_choice] = 1.0
 
                     history.append({
                         'board': board_opp, 'ctx': ctx_opp, 'action': take_choice,
                         'turn': game.turn, 'is_cube': True,
-                        'probs': take_target,
+                        'probs': take_probs,
                         'is_p1': (game.turn == 1), 'cube_type': 'take_decision',
                         'score_before': (opp_s, my_s),
                         'immediate_reward': None,
@@ -191,12 +201,12 @@ def _play_single_game(
 
 
 # ---------------------------------------------------------------------------
-# Reward assignment
+# Reward assignment helper
 # ---------------------------------------------------------------------------
 def _assign_rewards(game_history, match_equity_table, score_after_p1, score_after_p2):
     """
     Convert raw history entries into replay-buffer tuples.
-    Reward = match equity change for that player's perspective.
+    Reward = match equity change (in [-1, 1], no extra scaling).
     For move positions, blend in MCTS value for variance reduction.
     """
     result = []
@@ -232,12 +242,8 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
     scores             = {1: 0, -1: 0}
     full_match_history = []
     crawford_occurred  = False
-
-    # Track scores SEPARATELY per player perspective.
-    # scores_seen_p1[i] = (p1_score, p2_score) before game i  → p1's view
-    # scores_seen_p2[i] = (p2_score, p1_score) before game i  → p2's view
-    scores_seen_p1 = []
-    scores_seen_p2 = []
+    scores_seen_p1     = []   # p1's own perspective: (p1_score, p2_score)
+    scores_seen_p2     = []   # p2's own perspective: (p2_score, p1_score)
 
     match_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                    'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
@@ -249,7 +255,6 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
             is_crawford_game  = True
             crawford_occurred = True
 
-        # Record each player's score from their OWN perspective
         scores_seen_p1.append((scores[1],  scores[-1]))
         scores_seen_p2.append((scores[-1], scores[1]))
 
@@ -269,10 +274,7 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
         )
 
     overall_winner = 1 if scores[1] >= Config.MATCH_TARGET else -1
-
-    # Update equity table ONCE PER PERSPECTIVE with the correct winner flag.
-    # p1 won  → p1's scores updated toward 1.0, p2's scores updated toward 0.0
-    # p1 lost → p1's scores updated toward 0.0, p2's scores updated toward 1.0
+    # Update each player's perspective separately with the correct outcome
     match_equity_table.update_from_match(scores_seen_p1, i_won=(overall_winner == 1))
     match_equity_table.update_from_match(scores_seen_p2, i_won=(overall_winner == -1))
 

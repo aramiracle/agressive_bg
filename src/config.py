@@ -78,9 +78,8 @@ class Config:
     # effect. Now that the cube head loss is a genuine JS(model || one-hot) signal,
     # 1.0 gives equal footing with policy loss. Do NOT set above ~2.0 or the cube
     # head will overwhelm the value head's gradients through shared transformer weights.
-    CUBE_LOSS_WEIGHT = 1.0
-    CUBE_ENTROPY_BETA = 0.01   # entropy regularisation for cube policy head
-    CUBE_ME_ALPHA     = 2.0    # scale of match-equity logit adjustment
+    CUBE_LOSS_WEIGHT    = 1.0   # now directly comparable to move policy JS loss
+    CUBE_ME_TEMPERATURE = 4.0   # sigmoid sharpness; higher = more decisive targets
 
     # ELO
     INITIAL_ELO = 0

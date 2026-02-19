@@ -22,8 +22,8 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
 
         # ----------------------------------------------------------------
         # Value loss — all transitions.
-        # rewards are match equity changes, in [-1, 1] (no *2 scaling).
-        # Value head is tanh → output in [-1, 1], perfectly aligned.
+        # Rewards are match equity changes in [-1, 1].
+        # Value head (tanh) outputs in [-1, 1] — perfectly aligned, no scaling.
         # ----------------------------------------------------------------
         v_sq   = v.squeeze(-1)
         v_loss = (weights_t * (v_sq - rewards) ** 2).mean()
@@ -33,33 +33,6 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
         p_count, c_count = 0, 0
         smoothing = Config.LABEL_SMOOTHING
 
-        # ----------------------------------------------------------------
-        # Pre-compute batch-normalised advantage for cube REINFORCE.
-        #
-        # Why batch-normalise?
-        #   Per-sample advantage = reward[i] - V(s[i]).  In a mixed batch
-        #   (mostly move transitions, sparse cube transitions), the raw
-        #   advantage values have high variance and inconsistent scale
-        #   relative to the JS loss magnitude.  Batch-normalising across
-        #   the cube transitions only (mean=0, std=1) stabilises the PG
-        #   update and makes CUBE_LOSS_WEIGHT meaningful as a direct
-        #   relative scale factor vs the policy and value losses.
-        # ----------------------------------------------------------------
-        cube_indices = [i for i, t in enumerate(batch) if t[4]]  # is_cube
-
-        if cube_indices:
-            cube_idx_t   = torch.tensor(cube_indices, device=device)
-            raw_adv      = rewards[cube_idx_t] - v_sq[cube_idx_t].detach()
-            adv_mean     = raw_adv.mean()
-            adv_std      = raw_adv.std().clamp(min=1e-6)
-            # Store normalised advantages keyed by position in batch
-            adv_map = {
-                cube_indices[k]: ((raw_adv[k] - adv_mean) / adv_std).item()
-                for k in range(len(cube_indices))
-            }
-        else:
-            adv_map = {}
-
         for i, transition in enumerate(batch):
             is_cube       = transition[4]
             visit_targets = transition[5]
@@ -67,34 +40,41 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
 
             if is_cube:
                 # --------------------------------------------------------
-                # REINFORCE for the cube head (actor-critic style).
+                # Cube policy: JS divergence against ME-derived soft target.
                 #
-                # action_taken: recovered from one-hot probs via argmax.
-                # advantage:    batch-normalised (computed above).
-                # entropy:      regularisation to prevent premature collapse.
+                # This is the same loss family as the move policy (JS vs
+                # MCTS visit counts), making all three losses commensurable:
+                #   v_loss  : MSE,          always >= 0, scale ~[0, 1]
+                #   p_loss  : JS/p_count,   always >= 0, scale ~[0, log2]
+                #   c_loss  : JS/c_count,   always >= 0, scale ~[0, log2]
                 #
-                # Loss = -log π(a|s) * advantage - β * H(π)
+                # The soft target (visit_targets, shape [2]) was computed at
+                # collection time by compute_me_soft_target():
+                #   target[1] = sigmoid(ev_double_vs_no * temperature)
+                #   target[0] = 1 - target[1]
                 #
-                # Positive advantage → reinforce the action (it led to a
-                #   better-than-average match equity gain).
-                # Negative advantage → suppress the action (it underperformed
-                #   the value-head baseline).
+                # ev_double_vs_no > 0 → target[1] > 0.5 → push toward double
+                # ev_double_vs_no < 0 → target[1] < 0.5 → push toward no-double
+                # ev_double_vs_no = 0 → target = [0.5, 0.5] → maximum uncertainty
+                #
+                # Label smoothing is applied identically to the move policy.
+                # CUBE_LOSS_WEIGHT now has a clean, interpretable meaning:
+                # it is the relative weight of cube JS loss vs move JS loss.
                 # --------------------------------------------------------
-                action_taken = visit_targets.argmax().long()
-                log_probs    = torch.log_softmax(cube_logits[i], dim=0)
-                log_prob     = log_probs[action_taken]
-                advantage    = adv_map.get(i, 0.0)
-                entropy      = -(log_probs.exp() * log_probs).sum()
+                target = smooth_distribution(
+                    visit_targets.to(device).float(), smoothing, 2
+                )
+                logp   = nn.functional.log_softmax(cube_logits[i], dim=0)
+                c_loss_i = jensen_shannon_loss(logp, target)
 
-                pg_loss = -log_prob * advantage - Config.CUBE_ENTROPY_BETA * entropy
-
-                if torch.isfinite(pg_loss):
-                    c_loss  += weight * pg_loss
+                if torch.isfinite(c_loss_i):
+                    c_loss  += weight * c_loss_i
                     c_count += 1
 
             else:
                 # --------------------------------------------------------
-                # Move policy: MCTS visit-count targets via JS divergence.
+                # Move policy: JS divergence against MCTS visit-count targets.
+                # Unchanged.
                 # --------------------------------------------------------
                 target_f, target_t = visit_targets
                 tf = smooth_distribution(target_f.to(device).float(), smoothing, Config.NUM_ACTIONS)

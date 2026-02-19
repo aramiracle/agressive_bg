@@ -7,9 +7,6 @@ def compute_cube_features(game_equity, game, my_score, opp_score, equity_table):
     """
     Compute match-equity-aware features for the cube decision.
 
-    Takes game_equity (already from the model's value head) and the equity
-    table.  Returns structured features and the net ME gain from doubling.
-
     Features layout [8]:
         [0] game_equity         : model P(win game), in [0, 1]
         [1] me_current          : ME at current score
@@ -19,6 +16,10 @@ def compute_cube_features(game_equity, game, my_score, opp_score, equity_table):
         [5] ev_double_take      : EV of doubling, assuming opponent takes
         [6] ev_double_vs_no     : net ME gain from doubling vs not doubling
         [7] cube_level_norm     : current cube / 64
+
+    Returns:
+        features        : float32 tensor [8]
+        ev_double_vs_no : float — core signal for soft target construction
     """
     cube_level = getattr(game, 'cube_value', 1)
     target     = Config.MATCH_TARGET
@@ -49,53 +50,59 @@ def compute_cube_features(game_equity, game, my_score, opp_score, equity_table):
     return features, ev_double_vs_no
 
 
+def compute_me_soft_target(ev_double_vs_no, temperature=None):
+    """
+    Convert ME net gain into a soft probability target for the cube head.
+
+    This is the teacher signal for the cube policy — analogous to how MCTS
+    visit counts are the teacher signal for the move policy.
+
+    Sigmoid maps ev_double_vs_no to P(double=correct):
+        ev_double_vs_no >> 0  →  target[1] → 1.0  (strongly double)
+        ev_double_vs_no ~  0  →  target[1] → 0.5  (uncertain, ME-neutral)
+        ev_double_vs_no << 0  →  target[1] → 0.0  (strongly no-double)
+
+    Temperature controls sharpness:
+        lower  → sharper targets, faster learning, less exploration
+        higher → softer targets, slower but more stable
+
+    Returns float32 tensor [2]: [P(no-double), P(double)]
+    """
+    if temperature is None:
+        temperature = getattr(Config, 'CUBE_ME_TEMPERATURE', 4.0)
+
+    p_double   = torch.sigmoid(torch.tensor(ev_double_vs_no * temperature))
+    soft_target = torch.stack([1.0 - p_double, p_double])
+    return soft_target
+
+
 def get_learned_cube_decision(model, game, device, my_score, opp_score,
                                equity_table=None,
                                stochastic=True, epsilon=0.0):
     """
     Get cube decision from the model.
 
-    ME reasoning is applied as a logit adjustment AFTER the normal forward
-    pass — model architecture and ctx_proj are completely untouched.
-
-    The adjustment:
-        logit[1] (double/take) += alpha * ev_double_vs_no
-
-    where ev_double_vs_no is the net ME gain from doubling:
-        > 0  → ME says doubling gains match equity  → boost logit[1]
-        < 0  → ME says doubling loses match equity  → suppress logit[1]
-        = 0  → ME is neutral                        → no adjustment
-
-    IMPORTANT: The adjustment is clamped to [-alpha, +alpha] to prevent the
-    ME signal from completely overriding the model's board-texture assessment.
-    The model must retain meaningful gradient signal — if alpha is too large
-    the cube head degenerates to a threshold on ev_double_vs_no alone.
-
-    Config keys:
-        CUBE_ME_ALPHA : scale of ME logit adjustment (default 2.0).
-                        Tune between 1.0–4.0.  Larger = more ME influence.
-
     Returns:
-        action           : int, 0 (no-double / drop) or 1 (double / take)
-        log_prob_chosen  : scalar tensor, log π(action|state) [for REINFORCE]
-        value_est        : float, value head output in [-1, 1] [critic baseline]
+        action          : int, 0 (no-double / drop) or 1 (double / take)
+        me_soft_target  : float32 tensor [2] — ME-derived soft target for JS
+                          training. None if equity_table not provided.
+        value_est       : float, value head output in [-1, 1]
     """
     board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
 
     with torch.no_grad():
         _, _, v, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
         value_est   = v.item()
-        cube_logits = cube_logits.squeeze(0).clone()  # [2], detached
+        cube_logits = cube_logits.squeeze(0).clone()  # [2]
 
+    # Compute ME soft target for training (independent of action selection)
+    me_soft_target = None
     if equity_table is not None:
         game_equity = (value_est + 1.0) / 2.0  # [-1,1] -> [0,1]
         _, ev_double_vs_no = compute_cube_features(
             game_equity, game, my_score, opp_score, equity_table
         )
-        alpha = getattr(Config, 'CUBE_ME_ALPHA', 2.0)
-        # Clamp so ME can nudge but not dictate
-        adjustment = float(max(-alpha, min(alpha, alpha * ev_double_vs_no)))
-        cube_logits[1] = cube_logits[1] + adjustment
+        me_soft_target = compute_me_soft_target(ev_double_vs_no)
 
     log_probs = torch.log_softmax(cube_logits, dim=0)
     probs     = log_probs.exp()
@@ -107,6 +114,4 @@ def get_learned_cube_decision(model, game, device, my_score, opp_score,
     else:
         action = torch.argmax(probs).item()
 
-    log_prob_chosen = log_probs[action]
-
-    return action, log_prob_chosen, value_est
+    return action, me_soft_target, value_est
