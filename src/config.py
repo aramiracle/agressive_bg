@@ -79,6 +79,7 @@ class Config:
     # 1.0 gives equal footing with policy loss. Do NOT set above ~2.0 or the cube
     # head will overwhelm the value head's gradients through shared transformer weights.
     CUBE_LOSS_WEIGHT = 1.0
+    CUBE_ME_ALPHA = 1.0
 
     # ELO
     INITIAL_ELO = 0
