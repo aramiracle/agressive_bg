@@ -4,6 +4,7 @@ from src.config import Config
 from src.utils.cube import get_learned_cube_decision
 from src.mcts import MCTS
 
+
 def _play_single_game(
     game,
     model_p1, mcts_p1,
@@ -15,7 +16,7 @@ def _play_single_game(
     collect_history_p2=True,
     is_eval=False,
     cube_epsilon=0.0,
-    equity_table=None,     # NEW: passed through for ME-aware cube features
+    equity_table=None,
 ):
     game.reset()
     game.set_match_scores(scores[1], scores[-1])
@@ -35,8 +36,8 @@ def _play_single_game(
         winner, _ = game.check_win()
         if winner != 0: break
 
-        current_model = model_p1 if game.turn == 1 else model_p2
-        current_mcts  = mcts_p1  if game.turn == 1 else mcts_p2
+        current_model   = model_p1 if game.turn == 1 else model_p2
+        current_mcts    = mcts_p1  if game.turn == 1 else mcts_p2
         collect_current = collect_history_p1 if game.turn == 1 else collect_history_p2
 
         my_s  = scores[game.turn]
@@ -46,8 +47,6 @@ def _play_single_game(
         # 1. CUBING PHASE
         # ==========================================
         if game.can_double() and not game.crawford_active:
-            # equity_table is forwarded so get_learned_cube_decision can
-            # append ME-aware features and return log_prob for REINFORCE.
             double_choice, log_prob_double, val_est_doubler = get_learned_cube_decision(
                 current_model, game, device, my_s, opp_s,
                 equity_table=equity_table,
@@ -57,7 +56,6 @@ def _play_single_game(
 
             if collect_current:
                 board_t, ctx_t = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
-                # Store one-hot for action recovery in REINFORCE (train.py uses argmax)
                 cube_target = torch.zeros(2)
                 cube_target[double_choice] = 1.0
 
@@ -138,7 +136,7 @@ def _play_single_game(
                 game.dice = []
                 break
 
-            root    = current_mcts.search(game, my_s, opp_s)
+            root     = current_mcts.search(game, my_s, opp_s)
             children = root.children
 
             mcts_root_value = root.value()
@@ -193,21 +191,17 @@ def _play_single_game(
 
 
 # ---------------------------------------------------------------------------
-# Helper: shared reward assignment logic (avoids duplication across match fns)
+# Reward assignment
 # ---------------------------------------------------------------------------
-def _assign_rewards(game_history, match_equity_table,
-                    score_after_p1, score_after_p2):
+def _assign_rewards(game_history, match_equity_table, score_after_p1, score_after_p2):
     """
     Convert raw history entries into replay-buffer tuples.
-
-    Reward = match equity change.  For move positions we mix in the MCTS
-    value estimate as a variance-reduction baseline (0.5 / 0.5 blend).
-
-    Returns list of (board, ctx, action, reward, is_cube, probs) tuples.
+    Reward = match equity change for that player's perspective.
+    For move positions, blend in MCTS value for variance reduction.
     """
     result = []
     for h in game_history:
-        player_val       = 1 if h['is_p1'] else -1
+        player_val = 1 if h['is_p1'] else -1
         my_score_before, opp_score_before = h['score_before']
 
         if h.get('drop_outcome'):
@@ -235,10 +229,15 @@ def _assign_rewards(game_history, match_equity_table,
 
 def play_self_play_match(game, mcts, model, device, match_equity_table,
                          is_eval=False, cube_epsilon=0.0):
-    scores            = {1: 0, -1: 0}
+    scores             = {1: 0, -1: 0}
     full_match_history = []
     crawford_occurred  = False
-    scores_seen        = []
+
+    # Track scores SEPARATELY per player perspective.
+    # scores_seen_p1[i] = (p1_score, p2_score) before game i  → p1's view
+    # scores_seen_p2[i] = (p2_score, p1_score) before game i  → p2's view
+    scores_seen_p1 = []
+    scores_seen_p2 = []
 
     match_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                    'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
@@ -250,16 +249,15 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
             is_crawford_game  = True
             crawford_occurred = True
 
-        score_before_p1 = scores[1]
-        score_before_p2 = scores[-1]
-        scores_seen.append((score_before_p1, score_before_p2))
-        scores_seen.append((score_before_p2, score_before_p1))
+        # Record each player's score from their OWN perspective
+        scores_seen_p1.append((scores[1],  scores[-1]))
+        scores_seen_p2.append((scores[-1], scores[1]))
 
         winner, points, game_history, g_stats = _play_single_game(
             game, model, mcts, model, mcts, scores, is_crawford_game, device,
             collect_history_p1=True, collect_history_p2=True,
             is_eval=is_eval, cube_epsilon=cube_epsilon,
-            equity_table=match_equity_table,          # NEW
+            equity_table=match_equity_table,
         )
 
         scores[winner] += points
@@ -267,12 +265,16 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
         for k in g_stats: match_stats[k] += g_stats[k]
 
         full_match_history.extend(
-            _assign_rewards(game_history, match_equity_table,
-                            scores[1], scores[-1])
+            _assign_rewards(game_history, match_equity_table, scores[1], scores[-1])
         )
 
     overall_winner = 1 if scores[1] >= Config.MATCH_TARGET else -1
-    match_equity_table.update_from_match(scores_seen, overall_winner)
+
+    # Update equity table ONCE PER PERSPECTIVE with the correct winner flag.
+    # p1 won  → p1's scores updated toward 1.0, p2's scores updated toward 0.0
+    # p1 lost → p1's scores updated toward 0.0, p2's scores updated toward 1.0
+    match_equity_table.update_from_match(scores_seen_p1, i_won=(overall_winner == 1))
+    match_equity_table.update_from_match(scores_seen_p2, i_won=(overall_winner == -1))
 
     return full_match_history, overall_winner, match_stats
 
@@ -282,7 +284,8 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
     scores             = {1: 0, -1: 0}
     full_match_history = []
     crawford_occurred  = False
-    scores_seen        = []
+    scores_seen_p1     = []
+    scores_seen_p2     = []
 
     match_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                    'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
@@ -302,16 +305,14 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
             is_crawford_game  = True
             crawford_occurred = True
 
-        score_before_p1 = scores[1]
-        score_before_p2 = scores[-1]
-        scores_seen.append((score_before_p1, score_before_p2))
-        scores_seen.append((score_before_p2, score_before_p1))
+        scores_seen_p1.append((scores[1],  scores[-1]))
+        scores_seen_p2.append((scores[-1], scores[1]))
 
         winner, points, game_history, g_stats = _play_single_game(
             game, model_p1, mcts_p1, model_p2, mcts_p2, scores, is_crawford_game, device,
             collect_history_p1=current_is_p1, collect_history_p2=(not current_is_p1),
             is_eval=False, cube_epsilon=cube_epsilon,
-            equity_table=match_equity_table,          # NEW
+            equity_table=match_equity_table,
         )
 
         scores[winner] += points
@@ -322,7 +323,6 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
         score_after_p2 = scores[-1]
 
         for h in game_history:
-            # Remap scores to current-model perspective
             my_score_before, opp_score_before = h['score_before']
 
             if h.get('drop_outcome'):
@@ -347,8 +347,9 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
                 h['board'], h['ctx'], h['action'], final_target, h['is_cube'], h['probs']
             ))
 
-    overall_winner    = 1 if scores[1] >= Config.MATCH_TARGET else -1
-    match_equity_table.update_from_match(scores_seen, overall_winner)
+    overall_winner = 1 if scores[1] >= Config.MATCH_TARGET else -1
+    match_equity_table.update_from_match(scores_seen_p1, i_won=(overall_winner == 1))
+    match_equity_table.update_from_match(scores_seen_p2, i_won=(overall_winner == -1))
 
     current_won_match = (scores[1] >= Config.MATCH_TARGET) if current_is_p1 else \
                         (scores[-1] >= Config.MATCH_TARGET)

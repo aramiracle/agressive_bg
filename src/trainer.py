@@ -235,8 +235,7 @@ def train():
             equity_table.save(equity_path)
             
             # Optionally print equity table for inspection
-            if train_step % (Config.ELO_EVAL_INTERVAL * 10) == 0:
-                equity_table.print_table()
+            equity_table.print_table()
             
             model.train()
 

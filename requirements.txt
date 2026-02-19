@@ -5,9 +5,6 @@ tqdm>=4.65.0
 # Web UI (WebSocket server)
 websockets>=11.0
 
-# Desktop UI (Kivy)
-kivy>=2.2.0
-
 # Optional: CUDA support (install separately based on your CUDA version)
 # pip install torch --index-url https://download.pytorch.org/whl/cu118
 

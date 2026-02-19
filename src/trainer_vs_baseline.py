@@ -259,8 +259,7 @@ def train():
             save_checkpoint(model, optimizer, train_step, current_elo, avg_loss, latest_path)
             equity_table.save(equity_path)
             
-            if train_step % (Config.ELO_EVAL_INTERVAL * 10) == 0:
-                equity_table.print_table()
+            equity_table.print_table()
             
             model.train()
 
