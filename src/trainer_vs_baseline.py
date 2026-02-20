@@ -215,7 +215,7 @@ def train():
         n_g  = max(1, s_g)
 
         pbar.set_postfix({
-            'L':    f'{avg_loss:.2f}',
+            'L':    f'{avg_loss:.3f}',
             'ELO':  f'{current_elo:.0f}',
             'Cube': f'D/G:{s_d/n_g:.1f} Tk:{s_t/n_d:.0%} VD:{s_vd/n_d:.2f}'
         })

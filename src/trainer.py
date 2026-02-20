@@ -192,7 +192,7 @@ def train():
         n_g = max(1, stats['games'])
         n_d = max(1, stats['doubles'])
         pbar.set_postfix({
-            'L':    f'{avg_loss:.2f}',
+            'L':    f'{avg_loss:.3f}',
             'ELO':  f'{current_elo:.0f}',
             'ε':    f'{cube_epsilon:.2f}',
             'Cube': (
