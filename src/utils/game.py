@@ -47,9 +47,6 @@ def _play_single_game(
         # 1. CUBING PHASE
         # ==========================================
         if game.can_double() and not game.crawford_active:
-            # me_soft_target: float32 [2] — ME-derived soft target for JS training.
-            # Replaces one-hot behavioural cloning. When equity_table=None,
-            # falls back to one-hot of chosen action (original behaviour).
             double_choice, me_soft_target_d, val_est_doubler = get_learned_cube_decision(
                 current_model, game, device, my_s, opp_s,
                 equity_table=equity_table,
@@ -59,7 +56,6 @@ def _play_single_game(
 
             if collect_current:
                 board_t, ctx_t = game.get_vector(my_s, opp_s, device='cpu', canonical=True)
-                # Use ME soft target if available, else one-hot fallback
                 if me_soft_target_d is not None:
                     cube_probs = me_soft_target_d.cpu()
                 else:
@@ -201,13 +197,19 @@ def _play_single_game(
 
 
 # ---------------------------------------------------------------------------
-# Reward assignment helper
+# Reward assignment
 # ---------------------------------------------------------------------------
 def _assign_rewards(game_history, match_equity_table, score_after_p1, score_after_p2):
     """
     Convert raw history entries into replay-buffer tuples.
-    Reward = match equity change (in [-1, 1], no extra scaling).
+
+    Value target = 2 * equity_after - 1, in [-1, 1].
+    This spans the full tanh range so the value head can learn meaningful
+    positional quality.  (equity_change alone is ~±0.1, too small.)
+
     For move positions, blend in MCTS value for variance reduction.
+    MCTS values are also in [-1, 1] from the value head, so the blend
+    stays in the correct range.
     """
     result = []
     for h in game_history:
@@ -222,14 +224,17 @@ def _assign_rewards(game_history, match_equity_table, score_after_p1, score_afte
             else:
                 my_score_after, opp_score_after = score_after_p2, score_after_p1
 
-        outcome_reward = match_equity_table.compute_reward(
+        # compute_reward is aliased to compute_value_target:
+        # returns 2 * equity_after - 1, spanning [-1, 1]
+        value_target = match_equity_table.compute_reward(
             my_score_before, opp_score_before,
             my_score_after,  opp_score_after,
         )
 
-        final_target = outcome_reward
+        final_target = value_target
         if not h['is_cube'] and h.get('mcts_val') is not None:
-            final_target = 0.5 * outcome_reward + 0.5 * h['mcts_val']
+            # Both value_target and mcts_val are in [-1, 1] — blend is valid
+            final_target = 0.5 * value_target + 0.5 * h['mcts_val']
 
         result.append((
             h['board'], h['ctx'], h['action'], final_target, h['is_cube'], h['probs']
@@ -242,8 +247,8 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
     scores             = {1: 0, -1: 0}
     full_match_history = []
     crawford_occurred  = False
-    scores_seen_p1     = []   # p1's own perspective: (p1_score, p2_score)
-    scores_seen_p2     = []   # p2's own perspective: (p2_score, p1_score)
+    scores_seen_p1     = []
+    scores_seen_p2     = []
 
     match_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                    'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
@@ -274,7 +279,6 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
         )
 
     overall_winner = 1 if scores[1] >= Config.MATCH_TARGET else -1
-    # Update each player's perspective separately with the correct outcome
     match_equity_table.update_from_match(scores_seen_p1, i_won=(overall_winner == 1))
     match_equity_table.update_from_match(scores_seen_p2, i_won=(overall_winner == -1))
 
@@ -336,14 +340,14 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
                 my_score_after  = score_after_p2 if current_is_p1 else score_after_p1
                 opp_score_after = score_after_p1 if current_is_p1 else score_after_p2
 
-            outcome_reward = match_equity_table.compute_reward(
+            value_target = match_equity_table.compute_reward(
                 my_score_before, opp_score_before,
                 my_score_after,  opp_score_after,
             )
 
-            final_target = outcome_reward
+            final_target = value_target
             if not h['is_cube'] and h.get('mcts_val') is not None:
-                final_target = 0.5 * outcome_reward + 0.5 * h['mcts_val']
+                final_target = 0.5 * value_target + 0.5 * h['mcts_val']
 
             full_match_history.append((
                 h['board'], h['ctx'], h['action'], final_target, h['is_cube'], h['probs']

@@ -6,12 +6,19 @@ score pair. Learned from actual self-play outcomes, not hard-coded.
 
 KEY DESIGN PRINCIPLES:
   - equity_table[(my_score, opp_score)] = P(I win match from here), in [0, 1]
-  - Table is NOT symmetric across the diagonal by construction — it IS
-    symmetric in the sense that equity(a,b) + equity(b,a) == 1.0 (zero-sum).
-  - update_from_match must be called ONCE PER PLAYER PERSPECTIVE, not with
-    mixed (my, opp) and (opp, my) pairs in the same call.
-  - compute_reward does NOT multiply by 2.0: equity diffs are already in
-    [-1, 1] and the value head (tanh) can represent them directly.
+  - Zero-sum: equity(a,b) + equity(b,a) == 1.0
+  - update_from_match must be called ONCE PER PLAYER PERSPECTIVE.
+
+VALUE TARGET vs REWARD — critical distinction:
+  - value_target: what the value head (tanh, range [-1,1]) trains on.
+                  = 2 * equity_after - 1
+                  Spans the full [-1,1] range, enabling meaningful
+                  positional evaluation. This is compute_value_target().
+  - equity_change: used ONLY for the ME soft target (cube JS loss) and
+                   PER priorities.  Small magnitude (~±0.1 per game).
+                   This is compute_equity_change().
+  - compute_reward() is an alias for compute_value_target() to keep
+    the existing call-site in game.py working without changes.
 """
 
 import torch
@@ -32,10 +39,8 @@ class MatchEquityTable:
     def _initialize_table(self):
         """
         Initialize with zero-sum symmetric values.
-
-        At equal scores equity = 0.5.  The sigmoid mapping ensures
-        equity(a,b) + equity(b,a) = 1.0 exactly at init, which is the
-        only hard constraint the table must satisfy throughout training.
+        equity(a,b) + equity(b,a) == 1.0 exactly at init.
+        At equal scores equity == 0.5.
         """
         target = self.match_target
 
@@ -48,9 +53,8 @@ class MatchEquityTable:
                 else:
                     points_i_need   = target - my_score
                     points_opp_need = target - opp_score
-                    # Raw advantage: positive = I'm closer to winning
-                    raw_advantage = (points_opp_need - points_i_need) / \
-                                    (points_i_need + points_opp_need)
+                    raw_advantage   = (points_opp_need - points_i_need) / \
+                                      (points_i_need + points_opp_need)
                     equity = 1.0 / (1.0 + math.exp(-4.0 * raw_advantage))
 
                 self.equity_table[(my_score, opp_score)] = equity
@@ -71,18 +75,10 @@ class MatchEquityTable:
         """
         Update equity table for ONE player's perspective.
 
-        Args:
-            scores_seen_my_perspective : list of (my_score, opp_score) tuples
-                                         encountered during the match, from
-                                         THIS player's point of view only.
-            i_won : bool — True if this player won the match.
-
-        IMPORTANT: Call this method TWICE per match — once for each player —
-        with the correct i_won flag for each.  Do NOT mix both players'
-        (my, opp) and (opp, my) pairs into the same call.
+        Call TWICE per match — once per player — with the correct i_won flag.
+        Do NOT mix both players' tuples in the same call.
         """
         target_equity = 1.0 if i_won else 0.0
-
         for my_score, opp_score in scores_seen_my_perspective:
             key = (my_score, opp_score)
             if key not in self.equity_table:
@@ -91,22 +87,51 @@ class MatchEquityTable:
             self.equity_table[key] += self.learning_rate * (target_equity - current)
 
     # ------------------------------------------------------------------
-    # Reward computation
+    # Value target — what the value head trains on
     # ------------------------------------------------------------------
+    def compute_value_target(self, my_score_before, opp_score_before,
+                             my_score_after, opp_score_after):
+        """
+        Returns the VALUE HEAD training target in [-1, 1].
+
+        = 2 * equity_after - 1
+
+        This maps equity [0, 1] to [-1, 1], matching the tanh output range
+        and ensuring the value head receives targets that span its full
+        representable range.  Without this mapping, equity changes (~±0.1)
+        are too small for the value head to learn meaningful positional
+        quality, collapsing all predictions toward zero.
+
+        Example (7pt match, trailing 0-0 → 1-0 after winning):
+            equity_after  = get_equity(1, 0) ≈ 0.60
+            value_target  = 2 * 0.60 - 1    = 0.20   ← meaningful signal
+            equity_change = 0.60 - 0.50      = 0.10   ← too small alone
+        """
+        equity_after = self.get_equity(my_score_after, opp_score_after)
+        return 2.0 * equity_after - 1.0
+
     def compute_reward(self, my_score_before, opp_score_before,
                        my_score_after, opp_score_after):
-        """
-        Reward = change in match win probability, in [-1, 1].
+        """Alias for compute_value_target — keeps existing call-sites working."""
+        return self.compute_value_target(
+            my_score_before, opp_score_before,
+            my_score_after,  opp_score_after,
+        )
 
-        equity is in [0, 1], so the diff is already in [-1, 1].
-        We do NOT scale by 2 — the value head (tanh) has range [-1, 1]
-        and can represent this directly.  Scaling by 2 would push targets
-        outside the representable range and permanently miscalibrate the
-        value head, breaking the REINFORCE advantage signal.
+    # ------------------------------------------------------------------
+    # Equity change — used for ME soft target and PER priorities
+    # ------------------------------------------------------------------
+    def compute_equity_change(self, my_score_before, opp_score_before,
+                              my_score_after, opp_score_after):
+        """
+        Returns the raw equity change in [-1, 1].
+        Used by compute_me_soft_target() to build the cube JS target.
+        Small magnitude (~±0.05–0.15 per game), NOT suitable as a
+        standalone value head target.
         """
         equity_before = self.get_equity(my_score_before, opp_score_before)
         equity_after  = self.get_equity(my_score_after,  opp_score_after)
-        return equity_after - equity_before   # in [-1, 1], no extra scaling
+        return equity_after - equity_before
 
     # ------------------------------------------------------------------
     # Persistence
@@ -143,7 +168,6 @@ class MatchEquityTable:
             print()
         print("=" * 60)
 
-        # Symmetry check: print max violation of equity(a,b)+equity(b,a)=1
         max_violation = 0.0
         for my in range(target):
             for opp in range(target):

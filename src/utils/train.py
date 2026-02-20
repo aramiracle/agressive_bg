@@ -22,8 +22,16 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
 
         # ----------------------------------------------------------------
         # Value loss — all transitions.
-        # Rewards are match equity changes in [-1, 1].
-        # Value head (tanh) outputs in [-1, 1] — perfectly aligned, no scaling.
+        #
+        # rewards = 2 * equity_after - 1, spanning [-1, 1].
+        # Value head (tanh) outputs [-1, 1] — same range, no mismatch.
+        #
+        # Why 2*equity_after-1 and not equity_change?
+        #   equity_change per game ≈ ±0.05–0.15. With tanh targets that
+        #   small, the value head collapses to predicting ~0 everywhere,
+        #   losing all positional discrimination and breaking MCTS bootstrap.
+        #   2*equity_after-1 spans the full [-1, 1] range: trailing badly
+        #   → target ≈ -0.9, leading → target ≈ +0.9. Meaningful signal.
         # ----------------------------------------------------------------
         v_sq   = v.squeeze(-1)
         v_loss = (weights_t * (v_sq - rewards) ** 2).mean()
@@ -42,29 +50,22 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
                 # --------------------------------------------------------
                 # Cube policy: JS divergence against ME-derived soft target.
                 #
-                # This is the same loss family as the move policy (JS vs
-                # MCTS visit counts), making all three losses commensurable:
-                #   v_loss  : MSE,          always >= 0, scale ~[0, 1]
-                #   p_loss  : JS/p_count,   always >= 0, scale ~[0, log2]
-                #   c_loss  : JS/c_count,   always >= 0, scale ~[0, log2]
+                # Same loss family as move policy — all losses now:
+                #   v_loss : MSE ≥ 0, scale ~[0, 1]
+                #   p_loss : JS  ≥ 0, scale ~[0, log2]
+                #   c_loss : JS  ≥ 0, scale ~[0, log2]
                 #
-                # The soft target (visit_targets, shape [2]) was computed at
-                # collection time by compute_me_soft_target():
-                #   target[1] = sigmoid(ev_double_vs_no * temperature)
-                #   target[0] = 1 - target[1]
+                # visit_targets [2] = compute_me_soft_target() output:
+                #   target[1] = sigmoid(normalised_ev * temperature)
+                #   normalised_ev = ev_double_vs_no / equity_at_stake
                 #
-                # ev_double_vs_no > 0 → target[1] > 0.5 → push toward double
-                # ev_double_vs_no < 0 → target[1] < 0.5 → push toward no-double
-                # ev_double_vs_no = 0 → target = [0.5, 0.5] → maximum uncertainty
-                #
-                # Label smoothing is applied identically to the move policy.
-                # CUBE_LOSS_WEIGHT now has a clean, interpretable meaning:
-                # it is the relative weight of cube JS loss vs move JS loss.
+                # This gives a properly scaled [-1,1] signal before sigmoid,
+                # producing meaningful targets (not always ~0.5).
                 # --------------------------------------------------------
-                target = smooth_distribution(
+                target   = smooth_distribution(
                     visit_targets.to(device).float(), smoothing, 2
                 )
-                logp   = nn.functional.log_softmax(cube_logits[i], dim=0)
+                logp     = nn.functional.log_softmax(cube_logits[i], dim=0)
                 c_loss_i = jensen_shannon_loss(logp, target)
 
                 if torch.isfinite(c_loss_i):
@@ -74,7 +75,6 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
             else:
                 # --------------------------------------------------------
                 # Move policy: JS divergence against MCTS visit-count targets.
-                # Unchanged.
                 # --------------------------------------------------------
                 target_f, target_t = visit_targets
                 tf = smooth_distribution(target_f.to(device).float(), smoothing, Config.NUM_ACTIONS)
