@@ -17,6 +17,7 @@ from src.mcts import MCTS
 from src.model import get_model
 from src.config import Config
 from src.utils.cube import get_learned_cube_decision
+from src.utils.match_equity import MatchEquityTable
 
 
 # =========================
@@ -50,9 +51,17 @@ class BackgammonServer:
         
         # Ensure engine knows the config target
         self.game.match_target = self.match_target
+        self.equity_table = MatchEquityTable()
+        self._try_load_equity_table()
         
         # Try to load default model
         self._try_load_default_model()
+
+    def _try_load_equity_table(self):
+        equity_path = os.path.join(CHECKPOINTS_DIR, "equity_table.pt")
+        if os.path.exists(equity_path):
+            self.equity_table.load(equity_path)
+            print(f"✅ Match Equity Table loaded: {equity_path}")
 
     def _try_load_default_model(self):
         """Try to load default model from checkpoints folder"""
@@ -437,8 +446,10 @@ class BackgammonServer:
             my_score = self.game.match_scores.get(self.game.turn, 0)
             opp_score = self.game.match_scores.get(-self.game.turn, 0)
             
-            take_choice, _, _= get_learned_cube_decision(
-                self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
+            take_choice, _, _ = get_learned_cube_decision(
+                self.model, self.game, DEVICE, my_score, opp_score, 
+                equity_table=self.equity_table,  # Pass the table here
+                stochastic=False
             )
             choice = (take_choice == 1)
         
