@@ -3,26 +3,9 @@ import random
 from src.config import Config
 
 
-def compute_cube_features(game_equity, game, my_score, opp_score, equity_table):
+def compute_cube_features(game_equity, game, my_score, opp_score, equity_table, is_take=False):
     """
     Compute match-equity-aware features for the cube decision.
-
-    Features layout [8]:
-        [0] game_equity         : model P(win game), in [0, 1]
-        [1] me_current          : ME at current score
-        [2] me_win              : ME if I win (cube * 2 pts)
-        [3] me_lose             : ME if I lose (cube * 2 pts)
-        [4] me_drop             : ME if opponent drops (I gain cube pts)
-        [5] ev_double_take      : EV of doubling, assuming opponent takes
-        [6] ev_double_vs_no     : net ME gain from doubling vs not doubling
-        [7] cube_level_norm     : current cube / 64
-
-    Returns:
-        features            : float32 tensor [8]
-        ev_double_vs_no     : float, net ME gain from doubling
-        game_equity_at_stake: float = |me_win - me_lose|, the total ME
-                              range this game can span — used to normalise
-                              ev_double_vs_no into a [-1, 1] signal.
     """
     cube_level = getattr(game, 'cube_value', 1)
     target     = Config.MATCH_TARGET
@@ -31,75 +14,70 @@ def compute_cube_features(game_equity, game, my_score, opp_score, equity_table):
     pts_lose = cube_level * 2
     pts_drop = cube_level
 
-    me_current = equity_table.get_equity(my_score, opp_score)
-    me_win     = equity_table.get_equity(min(my_score + pts_win,  target), opp_score)
-    me_lose    = equity_table.get_equity(my_score, min(opp_score + pts_lose, target))
-    me_drop    = equity_table.get_equity(min(my_score + pts_drop, target), opp_score)
+    # 1. Back out the raw game winning probability from the value head's match equity.
+    # The value head predicts E[match_equity] = p_win * me_win(current_cube) + (1-p_win) * me_lose(current_cube)
+    me_win_current  = equity_table.get_equity(min(my_score + cube_level, target), opp_score)
+    me_lose_current = equity_table.get_equity(my_score, min(opp_score + cube_level, target))
+    
+    denom = max(me_win_current - me_lose_current, 1e-6)
+    p_win_game = (game_equity - me_lose_current) / denom
+    p_win_game = max(0.0, min(1.0, p_win_game))
 
-    ev_double_take       = game_equity * me_win + (1.0 - game_equity) * me_lose
-    ev_double_vs_no      = ev_double_take - me_current
-    game_equity_at_stake = abs(me_win - me_lose)   # total ME range of this game
+    # 2. Evaluate outcomes at the doubled stakes
+    me_win_double  = equity_table.get_equity(min(my_score + pts_win, target), opp_score)
+    me_lose_double = equity_table.get_equity(my_score, min(opp_score + pts_lose, target))
+    
+    ev_take = p_win_game * me_win_double + (1.0 - p_win_game) * me_lose_double
+    game_equity_at_stake = abs(me_win_double - me_lose_double)
 
-    features = torch.tensor([
-        game_equity,
-        me_current,
-        me_win,
-        me_lose,
-        me_drop,
-        ev_double_take,
-        ev_double_vs_no,
-        float(cube_level) / 64.0,
-    ], dtype=torch.float32)
+    if is_take:
+        # TAKER PERSPECTIVE: choice is between TAKING (playing for double) or DROPPING (losing pts_drop)
+        me_drop = equity_table.get_equity(my_score, min(opp_score + pts_drop, target))
+        ev_gain = ev_take - me_drop
+        
+        features = torch.tensor([
+            game_equity, me_drop, me_win_double, me_lose_double, me_drop,
+            ev_take, ev_gain, float(cube_level) / 64.0,
+        ], dtype=torch.float32)
 
-    return features, ev_double_vs_no, game_equity_at_stake
+        return features, ev_gain, game_equity_at_stake
+    else:
+        # DOUBLER PERSPECTIVE: choice is between DOUBLING or NOT DOUBLING
+        # If we double, the opponent will choose the outcome that minimizes our equity
+        me_drop = equity_table.get_equity(min(my_score + pts_drop, target), opp_score)
+        ev_double = min(ev_take, me_drop)
+        
+        # Net gain vs doing nothing (which is exactly our current game_equity)
+        ev_gain = ev_double - game_equity
+        
+        features = torch.tensor([
+            game_equity, game_equity, me_win_double, me_lose_double, me_drop,
+            ev_take, ev_gain, float(cube_level) / 64.0,
+        ], dtype=torch.float32)
+
+        return features, ev_gain, game_equity_at_stake
 
 
-def compute_me_soft_target(ev_double_vs_no, game_equity_at_stake):
+def compute_me_soft_target(ev_gain, game_equity_at_stake):
     """
     Convert ME net gain into a soft probability target for the cube head.
-
-    The key insight: ev_double_vs_no is tiny in absolute terms (~0.05) but
-    meaningful RELATIVE to the total equity at stake in this game
-    (game_equity_at_stake = |me_win - me_lose|).
-
-    We normalise by game_equity_at_stake to get a [-1, 1] signal that
-    reflects "how much of the available ME gain does doubling capture?",
-    then apply sigmoid with a moderate temperature.
-
-    normalised = ev_double_vs_no / max(game_equity_at_stake, eps)
-        =  1.0 → doubling captures 100% of available ME gain (strong double)
-        =  0.0 → ME neutral
-        = -1.0 → doubling loses 100% of available ME (strong no-double)
-
-    With temperature=4: sigmoid(±1 * 4) = 0.018 / 0.982 → sharp targets
-    With temperature=4: sigmoid(±0.3 * 4) = 0.23 / 0.77 → moderate signal
-
-    Returns float32 tensor [2]: [P(no-double), P(double)]
     """
     temperature = getattr(Config, 'CUBE_ME_TEMPERATURE', 4.0)
     eps = 1e-6
 
-    # Normalise ev by the equity at stake so the signal is scale-invariant
-    normalised = ev_double_vs_no / max(game_equity_at_stake, eps)
-    # Clamp to prevent extreme logits when game_equity_at_stake is tiny
+    normalised = ev_gain / max(game_equity_at_stake, eps)
     normalised = max(-2.0, min(2.0, normalised))
 
-    p_double    = torch.sigmoid(torch.tensor(normalised * temperature, dtype=torch.float32))
-    soft_target = torch.stack([1.0 - p_double, p_double])
+    p_positive  = torch.sigmoid(torch.tensor(normalised * temperature, dtype=torch.float32))
+    soft_target = torch.stack([1.0 - p_positive, p_positive])
     return soft_target
 
 
 def get_learned_cube_decision(model, game, device, my_score, opp_score,
                                equity_table=None,
-                               stochastic=True, epsilon=0.0):
+                               stochastic=True, epsilon=0.0, is_take=False):
     """
     Get cube decision from the model.
-
-    Returns:
-        action          : int, 0 (no-double / drop) or 1 (double / take)
-        me_soft_target  : float32 tensor [2] — ME-derived soft target for JS
-                          training. None if equity_table not provided.
-        value_est       : float, value head output in [-1, 1]
     """
     board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
 
@@ -111,10 +89,10 @@ def get_learned_cube_decision(model, game, device, my_score, opp_score,
     me_soft_target = None
     if equity_table is not None:
         game_equity = (value_est + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-        _, ev_double_vs_no, game_equity_at_stake = compute_cube_features(
-            game_equity, game, my_score, opp_score, equity_table
+        _, ev_gain, game_equity_at_stake = compute_cube_features(
+            game_equity, game, my_score, opp_score, equity_table, is_take
         )
-        me_soft_target = compute_me_soft_target(ev_double_vs_no, game_equity_at_stake)
+        me_soft_target = compute_me_soft_target(ev_gain, game_equity_at_stake)
 
     log_probs = torch.log_softmax(cube_logits, dim=0)
     probs     = log_probs.exp()

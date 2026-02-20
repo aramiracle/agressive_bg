@@ -52,6 +52,7 @@ def _play_single_game(
                 equity_table=equity_table,
                 stochastic=not is_eval,
                 epsilon=cube_epsilon if not is_eval else 0.0,
+                is_take=False
             )
 
             if collect_current:
@@ -85,6 +86,7 @@ def _play_single_game(
                     equity_table=equity_table,
                     stochastic=not is_eval,
                     epsilon=cube_epsilon if not is_eval else 0.0,
+                    is_take=True
                 )
 
                 if collect_opp:
@@ -200,17 +202,6 @@ def _play_single_game(
 # Reward assignment
 # ---------------------------------------------------------------------------
 def _assign_rewards(game_history, match_equity_table, score_after_p1, score_after_p2):
-    """
-    Convert raw history entries into replay-buffer tuples.
-
-    Value target = 2 * equity_after - 1, in [-1, 1].
-    This spans the full tanh range so the value head can learn meaningful
-    positional quality.  (equity_change alone is ~±0.1, too small.)
-
-    For move positions, blend in MCTS value for variance reduction.
-    MCTS values are also in [-1, 1] from the value head, so the blend
-    stays in the correct range.
-    """
     result = []
     for h in game_history:
         player_val = 1 if h['is_p1'] else -1
@@ -224,8 +215,6 @@ def _assign_rewards(game_history, match_equity_table, score_after_p1, score_afte
             else:
                 my_score_after, opp_score_after = score_after_p2, score_after_p1
 
-        # compute_reward is aliased to compute_value_target:
-        # returns 2 * equity_after - 1, spanning [-1, 1]
         value_target = match_equity_table.compute_reward(
             my_score_before, opp_score_before,
             my_score_after,  opp_score_after,
@@ -233,7 +222,6 @@ def _assign_rewards(game_history, match_equity_table, score_after_p1, score_afte
 
         final_target = value_target
         if not h['is_cube'] and h.get('mcts_val') is not None:
-            # Both value_target and mcts_val are in [-1, 1] — blend is valid
             final_target = 0.5 * value_target + 0.5 * h['mcts_val']
 
         result.append((
