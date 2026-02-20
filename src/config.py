@@ -85,8 +85,8 @@ class Config:
     INITIAL_ELO = 0
     ELO_K = 4
     ELO_SCALE = 400.0
-    ELO_EVAL_INTERVAL = 1000
-    ELO_EVAL_GAMES = 80
+    ELO_EVAL_INTERVAL = 500
+    ELO_EVAL_GAMES = 64
 
     # Training
     MATCHES_PER_ITERATION = 8
