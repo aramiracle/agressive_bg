@@ -83,7 +83,7 @@ class Config:
 
     # ELO
     INITIAL_ELO = 0
-    ELO_K = 4
+    ELO_K = 2
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 500
     ELO_EVAL_GAMES = 64
