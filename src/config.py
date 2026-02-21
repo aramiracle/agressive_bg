@@ -65,13 +65,13 @@ class Config:
     # the full range of cube positions (take AND drop) before committing.
     CUBE_CURRICULUM_ENABLED = True
     CUBE_CURRICULUM_STAGES = [
-        {'steps': 0,      'epsilon': 0.25,  'cube_weight': 2.0},
-        {'steps': 25000,  'epsilon': 0.20, 'cube_weight': 1.6},
-        {'steps': 50000,  'epsilon': 0.15, 'cube_weight': 1.4},
-        {'steps': 75000,  'epsilon': 0.10, 'cube_weight': 1.3},
-        {'steps': 100000, 'epsilon': 0.05, 'cube_weight': 1.2},
-        {'steps': 150000, 'epsilon': 0.02, 'cube_weight': 1.1},
-        {'steps': 200000, 'epsilon': 0.01, 'cube_weight': 1.0},
+        {'steps': 0,      'epsilon': 0.20,  'cube_weight': 2.0},
+        {'steps': 25000,  'epsilon': 0.10,  'cube_weight': 1.6},
+        {'steps': 50000,  'epsilon': 0.05,  'cube_weight': 1.4},
+        {'steps': 75000,  'epsilon': 0.02,  'cube_weight': 1.3},
+        {'steps': 100000, 'epsilon': 0.01,  'cube_weight': 1.2},
+        {'steps': 150000, 'epsilon': 0.005, 'cube_weight': 1.1},
+        {'steps': 200000, 'epsilon': 0.002, 'cube_weight': 1.0},
     ]
 
     # CUBE_LOSS_WEIGHT: previously amplified a near-zero (circular) gradient to no
