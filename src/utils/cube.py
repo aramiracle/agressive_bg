@@ -87,7 +87,7 @@ def compute_cube_features(game_equity, game, my_score, opp_score, equity_table, 
         # Magnitude: span of outcomes at doubled stake from taker's view
         equity_magnitude = abs(me_win_doubled - me_lose_doubled)
 
-        max_cube = 1 << (target.bit_length() - 1)
+        max_cube = 1 << target.bit_length()
         features = torch.tensor([
             game_equity,
             p_win,
@@ -127,7 +127,7 @@ def compute_cube_features(game_equity, game, my_score, opp_score, equity_table, 
         # ----------------------------------------------------------------
         equity_magnitude = abs(me_win_current - me_lose_current)
 
-        max_cube = 1 << (target.bit_length() - 1)
+        max_cube = 1 << target.bit_length()
         features = torch.tensor([
             game_equity,
             p_win,
@@ -160,7 +160,6 @@ def compute_me_soft_target(ev_gain, equity_magnitude):
     information throughout training.
     """
     temperature = getattr(Config, 'CUBE_ME_TEMPERATURE', 2.0)
-    eps = 1e-6
 
     # Normalise by equity magnitude, but guard against degenerate table entries.
     # Use a floor of 0.05 to prevent amplification when the table is early/flat.
