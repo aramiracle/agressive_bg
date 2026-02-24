@@ -59,27 +59,31 @@ class Config:
     # epsilon controls stochastic exploration of cube decisions.
     # cube_weight scales the cube head loss relative to value + policy loss.
     #
-    # With the circular-gradient bug fixed, the cube head now receives a genuine
-    # one-hot JS signal. We can reduce epsilon more gradually — the network will
-    # actually learn from the signal rather than drift. Start higher to explore
-    # the full range of cube positions (take AND drop) before committing.
+    # The soft target is derived from ME net-gain (ev_gain / equity_magnitude),
+    # so the cube head receives a meaningful signal at every position.
+    # We ramp epsilon down slowly to explore both take and drop positions,
+    # then let the model converge.
     CUBE_CURRICULUM_ENABLED = True
     CUBE_CURRICULUM_STAGES = [
-        {'steps': 0,      'epsilon': 0.20,  'cube_weight': 2.0},
-        {'steps': 25000,  'epsilon': 0.10,  'cube_weight': 1.6},
-        {'steps': 50000,  'epsilon': 0.05,  'cube_weight': 1.4},
-        {'steps': 75000,  'epsilon': 0.02,  'cube_weight': 1.3},
-        {'steps': 100000, 'epsilon': 0.01,  'cube_weight': 1.2},
-        {'steps': 150000, 'epsilon': 0.005, 'cube_weight': 1.1},
-        {'steps': 200000, 'epsilon': 0.002, 'cube_weight': 1.0},
+        {'steps': 0,      'epsilon': 0.25,  'cube_weight': 1.5},
+        {'steps': 25000,  'epsilon': 0.15,  'cube_weight': 1.3},
+        {'steps': 50000,  'epsilon': 0.08,  'cube_weight': 1.2},
+        {'steps': 75000,  'epsilon': 0.04,  'cube_weight': 1.1},
+        {'steps': 100000, 'epsilon': 0.02,  'cube_weight': 1.0},
+        {'steps': 150000, 'epsilon': 0.01,  'cube_weight': 1.0},
+        {'steps': 200000, 'epsilon': 0.005, 'cube_weight': 1.0},
     ]
 
-    # CUBE_LOSS_WEIGHT: previously amplified a near-zero (circular) gradient to no
-    # effect. Now that the cube head loss is a genuine JS(model || one-hot) signal,
-    # 1.0 gives equal footing with policy loss. Do NOT set above ~2.0 or the cube
-    # head will overwhelm the value head's gradients through shared transformer weights.
-    CUBE_LOSS_WEIGHT    = 1.0   # now directly comparable to move policy JS loss
-    CUBE_ME_TEMPERATURE = 4.0   # sigmoid sharpness; higher = more decisive targets
+    # CUBE_LOSS_WEIGHT: the cube JS loss is now properly scaled (ev_gain in ME units,
+    # magnitude floored at 0.05), so 1.0 is the right default.
+    CUBE_LOSS_WEIGHT    = 1.0
+
+    # CUBE_ME_TEMPERATURE: sigmoid sharpness applied to normalised ev_gain.
+    # normalised = ev_gain / equity_magnitude, clamped to [-1.5, 1.5].
+    # At temperature 2.0, sigmoid(1.5*2) = 0.95 — never a hard target.
+    # This was 4.0 before, which combined with small equity_magnitude
+    # caused sigmoid saturation (always double).
+    CUBE_ME_TEMPERATURE = 2.0
 
     # ELO
     INITIAL_ELO = 0
