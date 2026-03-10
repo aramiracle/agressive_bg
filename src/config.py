@@ -37,9 +37,9 @@ class Config:
     MAX_SEQ_LEN = BOARD_SEQ_LEN + 1
 
     # Transformer specific
-    N_HEAD = 8
-    N_LAYERS = 5
-    DIM_FEEDFORWARD = 256
+    N_HEAD = 16
+    N_LAYERS = 8
+    DIM_FEEDFORWARD = 512
 
     # CNN specific
     CNN_BLOCKS = 4

@@ -17,6 +17,7 @@ def _play_single_game(
     is_eval=False,
     cube_epsilon=0.0,
     equity_table=None,
+    equity_table_p2=None,
 ):
     game.reset()
     game.set_match_scores(scores[1], scores[-1])
@@ -40,6 +41,11 @@ def _play_single_game(
         current_mcts    = mcts_p1  if game.turn == 1 else mcts_p2
         collect_current = collect_history_p1 if game.turn == 1 else collect_history_p2
 
+        active_equity = (
+            equity_table if game.turn == 1
+            else (equity_table_p2 if equity_table_p2 is not None else equity_table)
+        )
+
         my_s  = scores[game.turn]
         opp_s = scores[-game.turn]
 
@@ -49,7 +55,7 @@ def _play_single_game(
         if game.can_double() and not game.crawford_active:
             double_choice, me_soft_target_d, val_est_doubler = get_learned_cube_decision(
                 current_model, game, device, my_s, opp_s,
-                equity_table=equity_table,
+                equity_table=active_equity,
                 stochastic=not is_eval,
                 epsilon=cube_epsilon if not is_eval else 0.0,
                 is_take=False
@@ -80,10 +86,14 @@ def _play_single_game(
 
                 opp_model   = model_p1 if game.turn == 1 else model_p2
                 collect_opp = collect_history_p1 if game.turn == 1 else collect_history_p2
+                opp_equity  = (
+                    equity_table if game.turn == 1
+                    else (equity_table_p2 if equity_table_p2 is not None else equity_table)
+                )
 
                 take_choice, me_soft_target_t, val_est_taker = get_learned_cube_decision(
                     opp_model, game, device, opp_s, my_s,
-                    equity_table=equity_table,
+                    equity_table=opp_equity,
                     stochastic=not is_eval,
                     epsilon=cube_epsilon if not is_eval else 0.0,
                     is_take=True
@@ -274,7 +284,8 @@ def play_self_play_match(game, mcts, model, device, match_equity_table,
 
 
 def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, device,
-                           match_equity_table, cube_epsilon=0.0):
+                           match_equity_table, cube_epsilon=0.0,
+                           baseline_equity_table=None):
     scores             = {1: 0, -1: 0}
     full_match_history = []
     crawford_occurred  = False
@@ -292,6 +303,12 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
     mcts_p2  = MCTS(baseline_model, device=device, cpuct=Config.C_PUCT,
                     num_sims=Config.NUM_SIMULATIONS) if current_is_p1 else mcts_current
 
+    # Assign equity tables: current model uses match_equity_table, baseline uses its own
+    et_current  = match_equity_table
+    et_baseline = baseline_equity_table if baseline_equity_table is not None else match_equity_table
+    et_p1 = et_current  if current_is_p1 else et_baseline
+    et_p2 = et_baseline if current_is_p1 else et_current
+
     while scores[1] < Config.MATCH_TARGET and scores[-1] < Config.MATCH_TARGET:
         leader = 1 if scores[1] > scores[-1] else -1
         is_crawford_game = False
@@ -306,7 +323,7 @@ def play_vs_baseline_match(game, current_model, baseline_model, mcts_current, de
             game, model_p1, mcts_p1, model_p2, mcts_p2, scores, is_crawford_game, device,
             collect_history_p1=current_is_p1, collect_history_p2=(not current_is_p1),
             is_eval=False, cube_epsilon=cube_epsilon,
-            equity_table=match_equity_table,
+            equity_table=et_p1, equity_table_p2=et_p2,
         )
 
         scores[winner] += points

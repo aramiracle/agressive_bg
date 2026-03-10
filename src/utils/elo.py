@@ -92,17 +92,21 @@ def play_single_game(game, model_a, model_b, mcts_a, mcts_b, a_is_white, device,
 
 
 def _worker_play_match(args):
-    match_idx, model_a_state, model_b_state, device = args
+    match_idx, model_a_state, model_b_state, model_b_config_path, device = args
 
     torch.set_num_threads(1)
 
-    # Recreate models from state dicts inside the worker (spawn-safe)
     from src.model import get_model
+    from src.utils.checkpoint import build_model_from_config_path
+
     model_a = get_model().to(device)
     model_a.load_state_dict(model_a_state)
     model_a.eval()
 
-    model_b = get_model().to(device)
+    if model_b_config_path is not None:
+        model_b = build_model_from_config_path(model_b_config_path, device)
+    else:
+        model_b = get_model().to(device)
     model_b.load_state_dict(model_b_state)
     model_b.eval()
 
@@ -136,7 +140,7 @@ def evaluate_vs_opponent(args):
     Play num_games matches of model_a vs model_b.
     Returns (wins_by_model_a, num_games).
     """
-    game, model_a, model_b, num_games, device, num_processes = args
+    game, model_a, model_b, num_games, device, num_processes, model_b_config_path = args
 
     if num_processes is None:
         num_processes = mp.cpu_count()
@@ -155,7 +159,7 @@ def evaluate_vs_opponent(args):
     )
 
     worker_args = [
-        (i, model_a_state, model_b_state, device)
+        (i, model_a_state, model_b_state, model_b_config_path, device)
         for i in range(num_games)
     ]
 
@@ -171,7 +175,8 @@ def evaluate_vs_opponent(args):
 
 def evaluate_combined(model, best_model, baseline_model,
                       best_elo, baseline_elo,
-                      total_games, device, num_processes=None):
+                      total_games, device, num_processes=None,
+                      baseline_config_path=None):
     """
     Split eval games between baseline and best model according to
     Config.BASELINE_SELF_PLAY_RATIO, accumulate results, and compute
@@ -213,7 +218,7 @@ def evaluate_combined(model, best_model, baseline_model,
             f"   ELO eval: {n_vs_baseline} games vs baseline (ELO {baseline_elo:.0f})"
         )
         wins_vs_baseline, _ = evaluate_vs_opponent(
-            (None, model, baseline_model, n_vs_baseline, device, num_processes)
+            (None, model, baseline_model, n_vs_baseline, device, num_processes, baseline_config_path)
         )
 
     # --- Games vs best model ---
@@ -222,7 +227,7 @@ def evaluate_combined(model, best_model, baseline_model,
             f"   ELO eval: {n_vs_best} games vs best (ELO {best_elo:.0f})"
         )
         wins_vs_best, _ = evaluate_vs_opponent(
-            (None, model, best_model, n_vs_best, device, num_processes)
+            (None, model, best_model, n_vs_best, device, num_processes, None)
         )
 
     total_wins = wins_vs_baseline + wins_vs_best

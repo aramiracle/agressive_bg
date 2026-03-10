@@ -104,6 +104,23 @@ def load_model_state_dict(model, state_dict):
     else:
         model.load_state_dict(state_dict)
 
+def build_model_from_config_path(config_path, device):
+    """Instantiate a model using the architecture defined in a saved config file."""
+    spec = importlib.util.spec_from_file_location("baseline_config", config_path)
+    base_cfg_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(base_cfg_mod)
+    BConfig = base_cfg_mod.Config
+
+    if BConfig.MODEL_TYPE == "transformer":
+        model = BackgammonTransformer(config=BConfig)
+    elif BConfig.MODEL_TYPE == "cnn":
+        model = BackgammonCNN(config=BConfig)
+    else:
+        raise ValueError(f"Unknown MODEL_TYPE in baseline: {BConfig.MODEL_TYPE}")
+
+    return model.to(device)
+
+
 def load_model_with_config(config_path, model_path, device):
     """
     Dynamically loads a baseline model using its own saved config file.

@@ -10,7 +10,8 @@ from src.model import get_model
 from src.mcts import MCTS
 from src.utils.checkpoint import (
     setup_checkpoint_dir, save_checkpoint, load_checkpoint,
-    get_model_state_dict, load_model_state_dict, load_model_with_config
+    get_model_state_dict, load_model_state_dict, load_model_with_config,
+    build_model_from_config_path,
 )
 from src.utils.elo import evaluate_combined, update_elo
 from src.utils.train import train_batch
@@ -30,7 +31,9 @@ def get_cube_epsilon(train_step):
 
 
 def collection_worker(args):
-    mode, model_state, baseline_state, equity_table_state, matches_per_worker, device, cube_epsilon = args
+    (mode, model_state, baseline_state, baseline_config_path,
+     equity_table_state, baseline_equity_state,
+     matches_per_worker, device, cube_epsilon) = args
     torch.set_num_threads(1)
 
     game  = BackgammonGame()
@@ -42,12 +45,17 @@ def collection_worker(args):
 
     baseline_model = None
     if baseline_state:
-        baseline_model = get_model().to(device)
+        baseline_model = build_model_from_config_path(baseline_config_path, device)
         baseline_model.load_state_dict(baseline_state)
         baseline_model.eval()
 
     equity_table = MatchEquityTable()
     equity_table.equity_table = equity_table_state
+
+    baseline_equity_table = None
+    if baseline_equity_state is not None:
+        baseline_equity_table = MatchEquityTable()
+        baseline_equity_table.equity_table = baseline_equity_state
 
     collected   = []
     local_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
@@ -61,7 +69,8 @@ def collection_worker(args):
             )
         else:
             data, _, stats = play_vs_baseline_match(
-                game, model, baseline_model, mcts_current, device, equity_table, cube_epsilon
+                game, model, baseline_model, mcts_current, device, equity_table, cube_epsilon,
+                baseline_equity_table=baseline_equity_table,
             )
 
         collected.extend(data)
@@ -76,16 +85,22 @@ def collect_worker_wrapper(args):
 
 
 def parallel_collect(mode, model, baseline_model, equity_table, replay_buffer,
-                     total_matches, device="cpu", cube_epsilon=0.0):
+                     total_matches, device="cpu", cube_epsilon=0.0,
+                     baseline_config_path=None, baseline_equity_table=None):
     num_workers        = mp.cpu_count()
     matches_per_worker = max(1, total_matches // num_workers)
     model_state        = model.state_dict()
     baseline_state     = baseline_model.state_dict() if baseline_model else None
     equity_table_state = equity_table.equity_table.copy()
+    baseline_equity_state = (
+        baseline_equity_table.equity_table.copy() if baseline_equity_table is not None else None
+    )
     ctx                = mp.get_context("spawn")
 
     args_list = [
-        (mode, model_state, baseline_state, equity_table_state, matches_per_worker, device, cube_epsilon)
+        (mode, model_state, baseline_state, baseline_config_path,
+         equity_table_state, baseline_equity_state,
+         matches_per_worker, device, cube_epsilon)
         for _ in range(num_workers)
     ]
     collected_data = []
@@ -148,15 +163,32 @@ def train():
         'config.py'
     )
 
-    baseline_model = None
-    baseline_elo   = Config.INITIAL_ELO
-    use_baseline   = False
+    baseline_model        = None
+    baseline_equity_table = None
+    baseline_elo          = Config.INITIAL_ELO
+    use_baseline          = False
 
     if os.path.exists(baseline_path):
         baseline_model, baseline_elo = load_model_with_config(
             baseline_config_path, baseline_path, device
         )
         use_baseline = True
+
+        # Load the baseline's own match equity table
+        baseline_equity_path = os.path.join(
+            os.path.dirname(checkpoint_dir),
+            Config.BASELINE_DIR,
+            'match_equity.pt',
+        )
+        baseline_equity_table = MatchEquityTable(
+            match_target=Config.MATCH_TARGET, learning_rate=0.01
+        )
+        if os.path.exists(baseline_equity_path):
+            try:
+                baseline_equity_table.load(baseline_equity_path)
+                tqdm.write(f"   Loaded baseline match equity table")
+            except Exception:
+                tqdm.write(f"   Using fresh equity table for baseline")
 
     replay_buffer = get_replay_buffer(Config.BUFFER_SIZE, prioritized=True, device=device)
     phase = "vs_baseline" if (use_baseline and current_elo < baseline_elo) else "self_play"
@@ -182,13 +214,16 @@ def train():
         if num_self > 0:
             tqdm.write(f"--- Epoch Phase: Collecting {num_self} self-play games ---")
             stats_self = parallel_collect(
-                "self", model, None, equity_table, replay_buffer, num_self, device, cube_epsilon
+                "self", model, None, equity_table, replay_buffer, num_self, device, cube_epsilon,
             )
 
         if opponent is not None and num_opponent > 0:
             tqdm.write(f"--- Epoch Phase: Collecting {num_opponent} opponent games ---")
+            opp_equity = baseline_equity_table if phase == "vs_baseline" else None
             stats_opp = parallel_collect(
-                "baseline", model, opponent, equity_table, replay_buffer, num_opponent, device, cube_epsilon
+                "baseline", model, opponent, equity_table, replay_buffer, num_opponent, device, cube_epsilon,
+                baseline_config_path=baseline_config_path if phase == "vs_baseline" else None,
+                baseline_equity_table=opp_equity,
             )
 
         if len(replay_buffer) < Config.BATCH_SIZE:
@@ -227,15 +262,17 @@ def train():
 
             eval_baseline_model = baseline_model if phase == "vs_baseline" else None
             eval_baseline_elo   = baseline_elo   if phase == "vs_baseline" else best_elo
+            eval_baseline_cfg   = baseline_config_path if phase == "vs_baseline" else None
 
             total_wins, total_games, opponent_elo = evaluate_combined(
-                model          = model,
-                best_model     = best_model,
-                baseline_model = eval_baseline_model,
-                best_elo       = best_elo,
-                baseline_elo   = eval_baseline_elo,
-                total_games    = Config.ELO_EVAL_GAMES,
-                device         = 'cpu',
+                model                = model,
+                best_model           = best_model,
+                baseline_model       = eval_baseline_model,
+                best_elo             = best_elo,
+                baseline_elo         = eval_baseline_elo,
+                total_games          = Config.ELO_EVAL_GAMES,
+                device               = 'cpu',
+                baseline_config_path = eval_baseline_cfg,
             )
 
             old_elo     = current_elo
