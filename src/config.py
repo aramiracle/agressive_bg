@@ -38,7 +38,7 @@ class Config:
 
     # Transformer specific
     N_HEAD = 16
-    N_LAYERS = 8
+    N_LAYERS = 12
     DIM_FEEDFORWARD = 512
 
     # CNN specific
