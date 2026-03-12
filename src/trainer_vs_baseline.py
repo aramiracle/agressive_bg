@@ -45,7 +45,12 @@ def collection_worker(args):
 
     baseline_model = None
     if baseline_state:
-        baseline_model = build_model_from_config_path(baseline_config_path, device)
+        # In self-play phase, opponent is the current/best model architecture,
+        # so there is no external baseline config file to load from.
+        if baseline_config_path is not None:
+            baseline_model = build_model_from_config_path(baseline_config_path, device)
+        else:
+            baseline_model = get_model().to(device)
         baseline_model.load_state_dict(baseline_state)
         baseline_model.eval()
 
