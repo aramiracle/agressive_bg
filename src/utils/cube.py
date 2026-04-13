@@ -29,7 +29,7 @@ def compute_cube_features(game_equity, game, my_score, opp_score, equity_table, 
     Design principle: NO thresholds, NO heuristics.  The soft target is a smooth
     function of ev_gain that lets the RL signal guide the cube head.
     """
-    cube_level = getattr(game, 'cube_value', 1)
+    cube_level = game.cube
     target     = Config.MATCH_TARGET
 
     # Points exchanged at current and doubled stake

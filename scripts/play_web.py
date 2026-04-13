@@ -155,15 +155,18 @@ class BackgammonServer:
         legal_moves = []
         if self.game.dice and not self.game_over:
             moves = self.game.get_legal_moves()
+            seen = set()
             for m in moves:
-                # Robust move unpacking to handle (src, dst, die) or ((src, dst), die) or (src, dst)
                 if len(m) == 2 and isinstance(m[0], (tuple, list)):
                     src, dst = m[0]
                 elif len(m) >= 2:
                     src, dst = m[0], m[1]
                 else:
-                    continue # Should not happen
-                legal_moves.append([src, dst])
+                    continue
+                key = (src, dst)
+                if key not in seen:
+                    seen.add(key)
+                    legal_moves.append([src, dst])
 
         # --- Calculate Pip Counts ---
         pips_white = self.game.bar[0] * 25
@@ -309,18 +312,6 @@ class BackgammonServer:
         
         return self.serialize(status)
 
-    def double(self):
-        if self.game_over:
-            return self.serialize("Game is over")
-
-        if not self.game.can_double():
-            return self.serialize("Cannot double now")
-
-        if self.game.apply_double():
-            return self.serialize(f"Cube doubled to {self.game.cube}")
-        else:
-            return self.serialize("Double rejected")
-
     def end_turn(self):
         if self.game_over:
             return self.serialize("Game is over")
@@ -412,7 +403,7 @@ class BackgammonServer:
             g.match_scores.get(opponent, 0)
         )
 
-        if g.cube > remaining_points:
+        if g.cube >= remaining_points:
             return False
 
         return True
@@ -463,8 +454,10 @@ class BackgammonServer:
         if not self.waiting_for_cube_decision:
             return self.serialize("No double offered.")
 
-        self.game.turn *= -1 
-        self.game.apply_double()
+        self.game.turn *= -1
+        if not self.game.apply_double():
+            self.waiting_for_cube_decision = False
+            return self.serialize("Double could not be applied (cube at limit).")
         self.waiting_for_cube_decision = False
         
         return self.serialize(f"Double accepted! Cube is now {self.game.cube}")
@@ -512,13 +505,15 @@ class BackgammonServer:
             # Query model for doubling decision
             # Returns: action (0/1), probs, value_est
             double_action, _, _ = get_learned_cube_decision(
-                self.model, self.game, DEVICE, my_score, opp_score, stochastic=False
+                self.model, self.game, DEVICE, my_score, opp_score,
+                equity_table=self.equity_table, stochastic=False
             )
             
             if double_action == 1:
                 await self.offer_double(websocket)
-                # Important: Stop moving, wait for human response
-                return
+                if self.game_over or self.waiting_for_cube_decision:
+                    return
+                # AI opponent took inline — continue to roll and move
 
         # 2. Roll Dice
         if not self.game.dice:

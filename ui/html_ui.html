@@ -612,13 +612,17 @@ select:focus {
    MIDDLE ROW (point numbers)
 ====================== */
 .middle-row {
-  display: flex;
-  justify-content: space-around;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
   align-items: center;
   font-size: 9px;
   color: rgba(232,220,200,0.5);
   padding: 0 4px;
   font-weight: 500;
+}
+
+.middle-row span {
+  text-align: center;
 }
 
 /* ======================
@@ -1125,13 +1129,29 @@ function renderBoard() {
   bottomLeft.innerHTML = "";
   bottomRight.innerHTML = "";
 
-  // Top row: 13-18 (left), 19-24 (right) - displayed as points 12-17 and 18-23
+  // Top row: points 13-18 (left), 19-24 (right)
   for (let i = 12; i < 18; i++) topLeft.appendChild(makePoint(i, false));
   for (let i = 18; i < 24; i++) topRight.appendChild(makePoint(i, false));
   
-  // Bottom row: 12-7 (left), 6-1 (right) - displayed as points 11-6 and 5-0
+  // Bottom row: points 12-7 (left), 6-1 (right)
   for (let i = 11; i >= 6; i--) bottomLeft.appendChild(makePoint(i, true));
   for (let i = 5; i >= 0; i--) bottomRight.appendChild(makePoint(i, true));
+
+  // Point numbers (1-indexed display)
+  const midL = document.getElementById("midLeft");
+  const midR = document.getElementById("midRight");
+  midL.innerHTML = "";
+  midR.innerHTML = "";
+  for (let i = 12; i < 18; i++) {
+    const s = document.createElement("span");
+    s.textContent = i + 1;
+    midL.appendChild(s);
+  }
+  for (let i = 18; i < 24; i++) {
+    const s = document.createElement("span");
+    s.textContent = i + 1;
+    midR.appendChild(s);
+  }
 
   renderBar();
   renderBearoff();
@@ -1279,17 +1299,13 @@ function applyState(s) {
 
   // Clear selection when state changes
   selectedPoint = null;
- if (isWaitingForCube) {
-    // Only show overlay if it's human's turn to decide
+  if (isWaitingForCube) {
     if (isHumanTurn()) {
-        cubeOverlay.style.display = "flex";
-        cubePrompt.textContent = `${turn === 1 ? "White" : "Black"}: Take or Pass?`;
+      cubeOverlay.style.display = "flex";
+      cubePrompt.textContent = `${turn === 1 ? "White" : "Black"}: Take or Pass?`;
     } else {
-        cubeOverlay.style.display = "none";
-        // AI will decide automatically on server side
+      cubeOverlay.style.display = "none";
     }
-    
-    // Disable other controls while deciding
     btnRoll.disabled = true;
     btnDouble.disabled = true;
     btnEnd.disabled = true;
