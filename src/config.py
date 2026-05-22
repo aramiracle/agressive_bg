@@ -22,7 +22,7 @@ class Config:
     }
 
     # Game
-    MATCH_TARGET = 7
+    MATCH_TARGET = 1
 
     # Rewards
     R_WIN = 1.0
@@ -87,7 +87,7 @@ class Config:
 
     # ELO
     INITIAL_ELO = 0
-    ELO_K = 2
+    ELO_K = 1
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 500
     ELO_EVAL_GAMES = 64
