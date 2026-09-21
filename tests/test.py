@@ -1,127 +1,268 @@
-import torch
-import torch.nn as nn
-import numpy as np
+"""
+Regression suite for the value-search training pipeline.
+
+Run from the repo root:  python -m tests.test
+"""
+
 import os
-from src.backgammon.engine import BackgammonGame
-from src.backgammon.mcts import MCTS
-from src.backgammon.model import get_model
-from src.backgammon.config import Config
-from src.backgammon.utils.train import train_batch
-from src.backgammon.replay_buffer import SimpleReplayBuffer
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+from src.engine import BackgammonGame
+from src.search import Searcher, select_candidate
+from src.mcts import Candidate, prune_losing_moves
+from src.model import get_model, LegacyValueTransformer
+from src.utils.checkpoint import load_model_with_config, baseline_artifact_paths, save_checkpoint
+from src.config import Config
+from src.utils.train import train_batch
+from src.utils.outcome import flip, money_equity, terminal_distribution, race_win_probability
+from src.utils.game import _assign_targets, play_self_play_match
+from src.utils.match_equity import MatchEquityTable
+from src.utils.elo import passes_gate
+from src.replay_buffer import SimpleReplayBuffer
+
+
+def check(cond, ok, bad):
+    print(("✅ " + ok) if cond else ("❌ " + bad))
+    return cond
+
 
 def run_regression_suite():
     device = torch.device("cpu")
-    model = get_model().to(device)
+    torch.manual_seed(0)
+    model = get_model().to(device).eval()
     game = BackgammonGame()
-    
-    print("🚀 STARTING GLOBAL REGRESSION SUITE\n" + "="*40)
+    all_ok = True
 
-    # 1. ARCHITECTURE & ACTIVATION CHECK
-    print("\n[1] Architecture & Activation Check")
-    has_tanh = any(isinstance(m, nn.Tanh) for m in model.modules())
-    print(f"-> Value head has Tanh: {has_tanh}")
-    
-    # 2. REWARD SCALE SANITY
-    print("\n[2] Reward Scale vs Activation")
-    # Test typical points (2) vs Match Target (7)
-    points = 2
-    target = Config.MATCH_TARGET
-    reward_mag = float(points) / (target * 2)
-    
-    print(f"-> Calculated Reward Magnitude: {reward_mag:.2f}")
-    if has_tanh and reward_mag > 1.0:
-        print("❌ CRITICAL FAILURE: Reward > 1.0 will saturate Tanh. Win rate will drop to 0%.")
-    else:
-        print("✅ Reward/Activation alignment looks safe.")
+    print("🚀 REGRESSION SUITE\n" + "=" * 40)
 
-    # 3. ENGINE-TO-MODEL VECTORIZATION
-    print("\n[3] Input Vectorization (Dtypes & Bounds)")
+    print("\n[1] Model output shapes")
     board_t, ctx_t = game.get_vector(0, 0, device=device, canonical=True)
-    print(f"-> Board Dtype: {board_t.dtype} (Expected: torch.int64)")
-    print(f"-> Context Dtype: {ctx_t.dtype} (Expected: torch.float32)")
-    
-    vocab_size = model.embedding.num_embeddings
-    if torch.max(board_t) >= vocab_size or torch.min(board_t) < 0:
-        print(f"❌ CRITICAL FAILURE: Board values {torch.max(board_t)} exceed Embedding vocab {vocab_size}")
-    else:
-        print("✅ Input vectors are valid for Embedding layer.")
+    out, cube = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
+    all_ok &= check(out.shape == (1, Config.NUM_OUTCOMES) and cube.shape == (1, 2),
+                    f"outcome {tuple(out.shape)}, cube {tuple(cube.shape)}",
+                    f"unexpected shapes {tuple(out.shape)} / {tuple(cube.shape)}")
+    all_ok &= check(ctx_t.shape[0] == Config.CONTEXT_SIZE,
+                    f"context has {Config.CONTEXT_SIZE} features (cube owner + crawford included)",
+                    "context size mismatch")
 
-    # 4. CANONICAL SYMMETRY (Turn-based flipping)
-    print("\n[4] Canonical Perspective Symmetry")
-    # P1 with 2 checkers on point 24
+    print("\n[2] Canonical perspective symmetry")
     game.reset(); game.board[23] = 2; game.turn = 1
     v1, _ = game.get_vector(0, 0, canonical=True)
-    
-    # P2 with 2 checkers on point 1 (Point 24 from their side)
     game.reset(); game.board[0] = -2; game.turn = -1
     v2, _ = game.get_vector(0, 0, canonical=True)
-    
-    if torch.equal(v1, v2):
-        print("✅ Symmetry: Model sees the board identically for both players.")
-    else:
-        print("❌ CRITICAL: Symmetry broken! Model must learn two different games.")
+    all_ok &= check(torch.equal(v1, v2), "board is identical from both perspectives",
+                    "symmetry broken")
 
-    # 5. MCTS SEARCH & BACKPROP
-    print("\n[5] MCTS Logic & Value Sign-Flip")
-    mcts = MCTS(model, num_sims=20)
-    mcts.search(game, 0, 0)
-    
-    if not mcts.root.children:
-        print("❌ FAILURE: MCTS failed to generate legal children.")
-    else:
-        child = mcts.root.children[0]
-        # Simulate a win backprop
-        val = 0.5
-        mcts._backprop(child, val)
-        # Root is parent, should be -val
-        if mcts.root.value_sum == -val:
-            print("✅ MCTS Backprop: Value correctly flips signs at root.")
-        else:
-            print(f"❌ MCTS Backprop: Sign flip failed. Root sum: {mcts.root.value_sum}")
+    print("\n[3] Outcome helpers")
+    t = terminal_distribution(True, 2)
+    all_ok &= check(float(money_equity(t)) > 0 and float(money_equity(flip(t))) < 0,
+                    "flip() negates equity", "flip()/equity inconsistent")
+    p = race_win_probability(100, 100)
+    all_ok &= check(0.5 < p < 0.65, f"race formula: on roll in even 100-pip race = {p:.3f}",
+                    f"race formula off: {p:.3f}")
 
-    # 6. POLICY INDEXING (Bar/Off Mapping)
-    print("\n[6] Policy Index Mapping")
-    game.reset(); game.bar[1] = 1; game.turn = -1; game.dice = [1, 2] # P2 from bar
-    legals = game.get_legal_moves()
-    
-    found_bar = False
-    for move in legals:
-        # Canonical: P2 entering from bar should look like index 24
-        (src, dst), _ = game.real_action_to_canonical(move)
-        s_idx = 24 if src == "bar" else src
-        if s_idx == 24: found_bar = True
-    
-    if found_bar:
-        print("✅ Policy: 'Bar' moves correctly map to canonical index 24.")
-    else:
-        print("❌ Policy: Mapping logic failed to identify Bar entry.")
+    print("\n[4] Full-turn enumeration")
+    game.reset(); game.turn = 1; game.dice = [3, 1]
+    turns = game.get_legal_turns()
+    all_ok &= check(len(turns) > 5 and all(len(path) == 2 for path, _ in turns),
+                    f"{len(turns)} distinct complete plays for 3-1, all use both dice",
+                    "enumeration failed")
+    snap = game.fast_save()
+    game.apply_turn(turns[0][0])
+    all_ok &= check(game.dice == [] and (tuple(game.board), tuple(game.bar), tuple(game.off)) == turns[0][1],
+                    "apply_turn reproduces the enumerated position", "apply_turn mismatch")
+    game.fast_restore(snap)
 
-    # 7. TRAINING LOOP (Optimization Check)
-    print("\n[7] Optimization Step (One-batch Update)")
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    buffer = SimpleReplayBuffer(100)
-    
-    # Create fake transition
-    target_f, target_t = torch.zeros(26), torch.zeros(26)
-    target_f[12] = 1.0; target_t[15] = 1.0
-    buffer.add((board_t, ctx_t, None, 1.0, False, (target_f, target_t)))
-    
-    initial_loss = None
+    print("\n[5] MCTS (1-ply and 2-ply) is consistent and side-effect free")
+    s1 = Searcher(model, ply=1)
+    s2 = Searcher(model, ply=2)
+    before = game.fast_save()
+    r1 = s1.search(game, 0, 0)
+    r2 = s2.search(game, 0, 0)
+    all_ok &= check(game.fast_save() == before, "game state restored after search",
+                    "search mutated the game")
+    all_ok &= check(len(r1) == len(turns) and len(r2) == len(turns),
+                    "every legal play has a candidate", "candidate count mismatch")
+    probs_ok = all(abs(float(c.probs.sum()) - 1.0) < 1e-4 for c in r2.candidates)
+    all_ok &= check(probs_ok, "candidate outcome distributions sum to 1", "bad distributions")
+    visited = [c for c in r1.candidates if c.visits > 0]
+    all_ok &= check(0 < len(visited) <= Config.SEARCH_PRUNE_TOP_K,
+                    f"B1 prune: {len(visited)} survivors (≤ top_k={Config.SEARCH_PRUNE_TOP_K})",
+                    f"prune kept {len(visited)} plays")
+    all_ok &= check(
+        all(abs(c.value() - c.equity) < 1e-5 for c in visited),
+        "A1: same-player backup, Q equals leaf equity (never negated)",
+        "A1 broken: child Q != leaf equity",
+    )
+    # terminal afterstate must be evaluated exactly (not by the network)
+    game.reset(); game.board = [0] * 24; game.board[0] = 1; game.board[23] = -1
+    game.off = [14, 14]; game.turn = 1; game.dice = [1, 2]
+    rt = s2.search(game, 0, 0).best()
+    all_ok &= check(float(rt.probs[0]) == 1.0, "bearing off the last checker = certain win",
+                    f"terminal not exact: {rt.probs}")
+    game.fast_restore(snap)
+
+    print("\n[6] Exploration")
+    picks = {id(select_candidate(r1, explore=True, temperature=1.0)) for _ in range(30)}
+    all_ok &= check(len(picks) > 1, "high temperature samples different plays",
+                    "exploration never deviates")
+    all_ok &= check(select_candidate(r1, explore=False) is r1.best(), "greedy picks best",
+                    "greedy did not pick best")
+
+    print("\n[7] TD(lambda) targets")
+    est = torch.tensor([0.5, 0.1, 0.0, 0.3, 0.1, 0.0])
+    hist = [
+        {'board': board_t, 'ctx': ctx_t, 'turn': 1, 'is_p1': True, 'is_cube': True,
+         'cube_probs': torch.tensor([0.4, 0.6]), 'search_probs': None},
+        {'board': board_t, 'ctx': ctx_t, 'turn': 1, 'is_p1': True, 'is_cube': False,
+         'cube_probs': None, 'search_probs': est},
+        {'board': board_t, 'ctx': ctx_t, 'turn': -1, 'is_p1': False, 'is_cube': False,
+         'cube_probs': None, 'search_probs': est},
+        {'board': board_t, 'ctx': ctx_t, 'turn': 1, 'is_p1': True, 'is_cube': False,
+         'cube_probs': None, 'search_probs': est},
+    ]
+    data = _assign_targets(hist, winner=1, win_type=1)
+    lam = Config.TD_LAMBDA
+    term = terminal_distribution(True, 1)
+    expected_first_move = (1 - lam) * est + lam * term  # bootstraps from next own decision
+    all_ok &= check(torch.equal(data[3][2], term), "last decision of the winner -> exact win",
+                    "terminal target wrong")
+    all_ok &= check(torch.allclose(data[1][2], expected_first_move),
+                    "earlier decision mixes next search estimate and later target",
+                    "TD mixing wrong")
+    all_ok &= check(torch.equal(data[0][2], data[1][2]) and data[0][3] is True,
+                    "cube decision shares the following move's target",
+                    "cube target wrong")
+    all_ok &= check(torch.equal(data[2][2], terminal_distribution(False, 1)),
+                    "loser's last decision -> exact loss", "loser terminal wrong")
+
+    print("\n[8] Full self-play game + vectorised training step")
+    Config.SEARCH_PLY = 1
+    searcher = Searcher(model, ply=1)
+    table = MatchEquityTable(match_target=Config.MATCH_TARGET)
+    old_max_moves = Config.MAX_GAME_MOVES
     try:
-        scaler = torch.amp.GradScaler(enabled=False)
-        for _ in range(5):
-            loss, _ = train_batch(model, optimizer, buffer, 1, device, scaler)
-            if initial_loss is None: initial_loss = loss
-        
-        if loss < initial_loss:
-            print(f"✅ Training: Loss decreased from {initial_loss:.4f} to {loss:.4f}.")
-        else:
-            print("⚠️ Training: Loss did not decrease. Check optimizer/learning rate.")
-    except Exception as e:
-        print(f"❌ Training Loop Failed: {e}")
+        Config.MAX_GAME_MOVES = 0
+        _, cap_winner, _ = play_self_play_match(game, searcher, model, device, table)
+        all_ok &= check(cap_winner in (1, -1),
+                        "move-cap abort still names a winner (no KeyError on scores[0])",
+                        f"move-cap winner was {cap_winner}")
+        Config.MAX_GAME_MOVES = 80
+        data, winner, stats = play_self_play_match(game, searcher, model, device, table)
+    finally:
+        Config.MAX_GAME_MOVES = old_max_moves
+    all_ok &= check(len(data) > 10 and winner in (1, -1),
+                    f"self-play game finished: {len(data)} samples, {stats['games']} game(s)",
+                    "self-play failed")
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    buffer = SimpleReplayBuffer(10000)
+    buffer.extend(data)
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
+    losses = [train_batch(model, optimizer, buffer, min(32, len(data)), device, scaler)[0]
+              for _ in range(8)]
+    all_ok &= check(losses[-1] < losses[0], f"loss decreased {losses[0]:.4f} -> {losses[-1]:.4f}",
+                    f"loss did not decrease {losses}")
 
-    print("\n" + "="*40 + "\n🏁 REGRESSION COMPLETE")
+    print("\n[9] Prune losing moves, cube stage, E3 gate")
+    fake = [Candidate((), None) for _ in range(6)]
+    for c, e in zip(fake, [0.90, 0.85, 0.40, 0.30, 0.20, -0.50]):
+        c.equity = e
+    kept = prune_losing_moves(fake, top_k=4, margin=0.10)
+    all_ok &= check([round(c.equity, 2) for c in kept] == [0.90, 0.85],
+                    "B1: only plays within 0.10 of the best survive prune",
+                    f"prune kept {[c.equity for c in kept]}")
+
+    old_cube, old_target = Config.CUBE_ENABLED, Config.MATCH_TARGET
+    Config.CUBE_ENABLED = False
+    g1 = BackgammonGame()
+    g1.match_target = 1
+    all_ok &= check(not g1.can_double(), "A4: stage-1 cube disabled", "cube still offered at target 1")
+    Config.CUBE_ENABLED = True
+    Config.MATCH_TARGET = 7
+    g7 = BackgammonGame()
+    g7.match_target = 7
+    g7.set_match_scores(0, 0)
+    all_ok &= check(g7.can_double(), "A4: 7-point opening can double", "cube blocked at 7-pt 0-0")
+    Config.CUBE_ENABLED = old_cube
+    Config.MATCH_TARGET = old_target
+
+    old_rate = Config.GATE_WIN_RATE
+    Config.GATE_WIN_RATE = 0.525
+    keep, _ = passes_gate(21, 40, 21, 40)
+    promote, _ = passes_gate(22, 40, 22, 40)
+    all_ok &= check(keep is False, "E3: 21/40 ≤ 52.5% keeps best_model", "promoted at 52.5%")
+    all_ok &= check(promote is True, "E3: 22/40 > 52.5% promotes", "did not promote above 52.5%")
+    Config.GATE_WIN_RATE = old_rate
+
+    print("\n[legacy baseline adapter]")
+    class TinyLegacyConfig:
+        MODEL_TYPE = "transformer"
+        HEAD_KIND = "value_policy"
+        NUM_ACTIONS = 26
+        EMBED_VOCAB_SIZE = 31
+        CONTEXT_SIZE = 4
+        D_MODEL = 32
+        DROPOUT = 0.0
+        VALUE_HIDDEN = 16
+        MAX_SEQ_LEN = 29
+        N_HEAD = 4
+        N_LAYERS = 1
+        DIM_FEEDFORWARD = 64
+
+    legacy = LegacyValueTransformer(config=TinyLegacyConfig()).eval()
+    board = torch.zeros(2, 28, dtype=torch.long)
+    ctx5 = torch.tensor([
+        [0.0, 2.0 / Config.MAX_CUBE, 0.1, 0.2, 0.0],
+        [1.0, 4.0 / Config.MAX_CUBE, 0.3, 0.4, 1.0],
+    ])
+    outcome, cube = legacy(board, ctx5)
+    all_ok &= check(tuple(outcome.shape) == (2, 6) and tuple(cube.shape) == (2, 2),
+                    "legacy net maps 5-feature context to (outcome, cube)",
+                    f"unexpected legacy shapes {tuple(outcome.shape)} / {tuple(cube.shape)}")
+    probs = torch.softmax(outcome, dim=-1)
+    all_ok &= check(torch.all(probs[:, 1] < 1e-6) and torch.all(probs[:, 2] < 1e-6),
+                    "legacy adapter puts no mass on gammon outcomes",
+                    f"gammon mass {probs[:, 1:3].tolist()}")
+
+    baseline_path, baseline_config, _ = baseline_artifact_paths()
+    if os.path.exists(baseline_path) and os.path.exists(baseline_config):
+        loaded, elo = load_model_with_config(baseline_config, baseline_path, "cpu")
+        out, cube = loaded(board[:1], ctx5[:1])
+        all_ok &= check(tuple(out.shape) == (1, 6) and elo > 0,
+                        f"frozen baseline loads (ELO {elo:.0f})",
+                        f"baseline forward failed: {tuple(out.shape)} elo={elo}")
+    else:
+        print("⏭️  skipped real baseline load (checkpoints/baseline missing)")
+
+    print("\n[checkpoint size]")
+    max_bytes = 15 * 1024 * 1024
+    size_model = get_model()
+    optimizer = torch.optim.AdamW(size_model.parameters(), lr=Config.LR)
+    for param in size_model.parameters():
+        param.grad = torch.zeros_like(param)
+    optimizer.step()
+    fd, ckpt_path = tempfile.mkstemp(suffix=".pt")
+    os.close(fd)
+    try:
+        save_checkpoint(size_model, optimizer, 0, 0.0, 0.0, ckpt_path)
+        ckpt_bytes = os.path.getsize(ckpt_path)
+    finally:
+        os.remove(ckpt_path)
+    ckpt_mb = ckpt_bytes / (1024 * 1024)
+    all_ok &= check(
+        ckpt_bytes < max_bytes,
+        f"stage1/stage2 AdamW checkpoint {ckpt_mb:.2f}MB < 15MB",
+        f"checkpoint {ckpt_mb:.2f}MB exceeds 15MB",
+    )
+
+    print("\n" + "=" * 40 + ("\n🏁 ALL CHECKS PASSED" if all_ok else "\n🏁 SOME CHECKS FAILED"))
+    return all_ok
+
 
 if __name__ == "__main__":
-    run_regression_suite()
+    sys.exit(0 if run_regression_suite() else 1)

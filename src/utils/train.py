@@ -1,10 +1,21 @@
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from src.config import Config
-from src.utils.distribution import smooth_distribution, jensen_shannon_loss
+from src.utils.distribution import smooth_distribution, jensen_shannon_loss_batch
+from src.utils.outcome import money_weights
 
 
 def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
+    """
+    One optimisation step. Transitions are
+        (board[28], ctx[CONTEXT_SIZE], outcome_target[6], is_cube, cube_target[2])
+
+    Losses (all vectorised):
+      outcome : soft-target cross-entropy between the predicted outcome
+                distribution and the TD(lambda) target — every transition.
+      cube    : Jensen-Shannon divergence against the ME-derived soft target —
+                cube-decision transitions only.
+    """
     if len(replay_buffer) < batch_size:
         return 0.0, 0.0
 
@@ -12,89 +23,32 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     if batch is None or len(batch) == 0:
         return 0.0, 0.0
 
-    boards    = torch.stack([x[0] for x in batch]).to(device).long()
-    contexts  = torch.stack([x[1] for x in batch]).to(device).float()
-    rewards   = torch.tensor([x[3] for x in batch], dtype=torch.float32, device=device)
-    weights_t = weights.clone().detach().to(device).float()
+    boards   = torch.stack([x[0] for x in batch]).to(device).long()
+    contexts = torch.stack([x[1] for x in batch]).to(device).float()
+    targets  = torch.stack([x[2] for x in batch]).to(device).float()
+    is_cube  = torch.tensor([bool(x[3]) for x in batch], device=device)
+    cube_tgt = torch.stack([x[4] for x in batch]).to(device).float()
+    w        = weights.clone().detach().to(device).float()
 
-    with torch.amp.autocast(enabled=False, device_type='cuda'):
-        p_from, p_to, v, cube_logits = model(boards, contexts)
+    use_amp = device.type == 'cuda'
+    with torch.amp.autocast(device_type='cuda', enabled=use_amp):
+        outcome_logits, cube_logits = model(boards, contexts)
 
-        # ----------------------------------------------------------------
-        # Value loss — all transitions.
-        #
-        # rewards = 2 * equity_after - 1, spanning [-1, 1].
-        # Value head (tanh) outputs [-1, 1] — same range, no mismatch.
-        #
-        # Why 2*equity_after-1 and not equity_change?
-        #   equity_change per game ≈ ±0.05–0.15. With tanh targets that
-        #   small, the value head collapses to predicting ~0 everywhere,
-        #   losing all positional discrimination and breaking MCTS bootstrap.
-        #   2*equity_after-1 spans the full [-1, 1] range: trailing badly
-        #   → target ≈ -0.9, leading → target ≈ +0.9. Meaningful signal.
-        # ----------------------------------------------------------------
-        v_sq   = v.squeeze(-1)
-        v_loss = (weights_t * (v_sq - rewards) ** 2).mean()
+    # Losses in fp32 regardless of autocast.
+    logp   = F.log_softmax(outcome_logits.float(), dim=-1)
+    ce     = -(targets * logp).sum(-1)                      # [B]
+    v_loss = (w * ce).mean()
 
-        p_loss = torch.tensor(0.0, device=device)
-        c_loss = torch.tensor(0.0, device=device)
-        p_count, c_count = 0, 0
+    loss = v_loss
+    if is_cube.any():
         smoothing = Config.LABEL_SMOOTHING
-
-        for i, transition in enumerate(batch):
-            is_cube       = transition[4]
-            visit_targets = transition[5]
-            weight        = weights_t[i]
-
-            if is_cube:
-                # --------------------------------------------------------
-                # Cube policy: JS divergence against ME-derived soft target.
-                #
-                # Same loss family as move policy — all losses now:
-                #   v_loss : MSE ≥ 0, scale ~[0, 1]
-                #   p_loss : JS  ≥ 0, scale ~[0, log2]
-                #   c_loss : JS  ≥ 0, scale ~[0, log2]
-                #
-                # visit_targets [2] = compute_me_soft_target() output:
-                #   target[1] = sigmoid(normalised_ev * temperature)
-                #   normalised_ev = ev_double_vs_no / equity_at_stake
-                #
-                # This gives a properly scaled [-1,1] signal before sigmoid,
-                # producing meaningful targets (not always ~0.5).
-                # --------------------------------------------------------
-                target   = smooth_distribution(
-                    visit_targets.to(device).float(), smoothing, 2
-                )
-                logp     = nn.functional.log_softmax(cube_logits[i], dim=0)
-                c_loss_i = jensen_shannon_loss(logp, target)
-
-                if torch.isfinite(c_loss_i):
-                    c_loss  += weight * c_loss_i
-                    c_count += 1
-
-            else:
-                # --------------------------------------------------------
-                # Move policy: JS divergence against MCTS visit-count targets.
-                # --------------------------------------------------------
-                target_f, target_t = visit_targets
-                tf = smooth_distribution(target_f.to(device).float(), smoothing, Config.NUM_ACTIONS)
-                tt = smooth_distribution(target_t.to(device).float(), smoothing, Config.NUM_ACTIONS)
-
-                logp_f = nn.functional.log_softmax(p_from[i], dim=0)
-                logp_t = nn.functional.log_softmax(p_to[i], dim=0)
-
-                js_f = jensen_shannon_loss(logp_f, tf)
-                js_t = jensen_shannon_loss(logp_t, tt)
-
-                if torch.isfinite(js_f).all() and torch.isfinite(js_t).all():
-                    p_loss  += weight * 0.5 * (js_f + js_t)
-                    p_count += 1
-
-        loss = v_loss
-        if p_count > 0:
-            loss = loss + p_loss / p_count
-        if c_count > 0:
-            loss = loss + (c_loss / c_count) * Config.CUBE_LOSS_WEIGHT
+        tgt   = smooth_distribution(cube_tgt[is_cube], smoothing, 2)
+        logpc = F.log_softmax(cube_logits.float()[is_cube], dim=-1)
+        js    = jensen_shannon_loss_batch(logpc, tgt)      # [Nc]
+        finite = torch.isfinite(js)
+        if finite.any():
+            c_loss = (w[is_cube][finite] * js[finite]).mean()
+            loss = loss + c_loss * Config.CUBE_LOSS_WEIGHT
 
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
@@ -104,9 +58,12 @@ def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     if torch.isfinite(grad_norm):
         scaler.step(optimizer)
         scaler.update()
-        replay_buffer.update_priorities(
-            indices, torch.abs(v_sq - rewards).detach()
-        )
+        # PER priority: equity error between predicted and target distributions.
+        mw = money_weights().to(device)
+        with torch.no_grad():
+            eq_pred = (logp.exp() * mw).sum(-1)
+            eq_tgt  = (targets * mw).sum(-1)
+        replay_buffer.update_priorities(indices, (eq_pred - eq_tgt).abs())
     else:
         scaler.update()
         return loss.item(), 0.0

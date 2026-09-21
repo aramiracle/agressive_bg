@@ -1,4 +1,20 @@
+"""Train against a frozen baseline. Stage must be set before Config is imported."""
+
+import argparse
 import os
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train vs a frozen baseline model.")
+    parser.add_argument(
+        "--stage",
+        type=int,
+        choices=(1, 2),
+        required=True,
+        help="1: 1-point games, no cube. 2: 7-point matches with cube.",
+    )
+    args = parser.parse_args()
+    os.environ["BG_STAGE"] = str(args.stage)
+
 import torch
 import torch.optim as optim
 import torch.multiprocessing as mp
@@ -7,13 +23,13 @@ from tqdm import tqdm
 from src.config import Config
 from src.engine import BackgammonGame
 from src.model import get_model
-from src.mcts import MCTS
+from src.search import Searcher
 from src.utils.checkpoint import (
     setup_checkpoint_dir, save_checkpoint, load_checkpoint,
     get_model_state_dict, load_model_state_dict, load_model_with_config,
-    build_model_from_config_path,
+    build_model_from_config_path, warm_start, baseline_artifact_paths,
 )
-from src.utils.elo import evaluate_combined, update_elo
+from src.utils.elo import evaluate_combined, update_elo, passes_gate
 from src.utils.train import train_batch
 from src.utils.game import play_self_play_match, play_vs_baseline_match
 from src.replay_buffer import get_replay_buffer
@@ -41,8 +57,6 @@ def collection_worker(args):
     model.load_state_dict(model_state)
     model.eval()
 
-    mcts_current = MCTS(model, cpuct=Config.C_PUCT, num_sims=Config.NUM_SIMULATIONS, device=device)
-
     baseline_model = None
     if baseline_state:
         # In self-play phase, opponent is the current/best model architecture,
@@ -62,6 +76,8 @@ def collection_worker(args):
         baseline_equity_table = MatchEquityTable()
         baseline_equity_table.equity_table = baseline_equity_state
 
+    searcher_current = Searcher(model, device=device, equity_table=equity_table)
+
     collected   = []
     local_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                    'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
@@ -70,11 +86,11 @@ def collection_worker(args):
         game.reset()
         if mode == "self":
             data, _, stats = play_self_play_match(
-                game, mcts_current, model, device, equity_table, False, cube_epsilon
+                game, searcher_current, model, device, equity_table, False, cube_epsilon
             )
         else:
             data, _, stats = play_vs_baseline_match(
-                game, model, baseline_model, mcts_current, device, equity_table, cube_epsilon,
+                game, model, baseline_model, searcher_current, device, equity_table, cube_epsilon,
                 baseline_equity_table=baseline_equity_table,
             )
 
@@ -143,8 +159,13 @@ def train():
     train_step  = cp_latest['step'] if cp_latest else 0
     current_elo = cp_latest['elo']  if cp_latest else Config.INITIAL_ELO
 
+    if cp_latest is None and warm_start(model, Config.INIT_FROM, device):
+        tqdm.write(f"   Warm-started weights from {Config.INIT_FROM}")
+
     cp_best  = load_checkpoint(best_path, best_model, None, device)
     best_elo = cp_best['elo'] if cp_best else current_elo
+    if cp_best is None:
+        load_model_state_dict(best_model, get_model_state_dict(model))
 
     # Initialize match equity table
     equity_table = MatchEquityTable(match_target=Config.MATCH_TARGET, learning_rate=0.01)
@@ -156,17 +177,7 @@ def train():
         except:
             tqdm.write(f"   Using fresh equity table")
 
-    # Load external baseline
-    baseline_path = os.path.join(
-        os.path.dirname(checkpoint_dir),
-        Config.BASELINE_DIR,
-        Config.BASELINE_MODEL_NAME
-    )
-    baseline_config_path = os.path.join(
-        os.path.dirname(checkpoint_dir),
-        Config.BASELINE_DIR,
-        'config.py'
-    )
+    baseline_path, baseline_config_path, baseline_equity_path = baseline_artifact_paths()
 
     baseline_model        = None
     baseline_equity_table = None
@@ -174,17 +185,21 @@ def train():
     use_baseline          = False
 
     if os.path.exists(baseline_path):
-        baseline_model, baseline_elo = load_model_with_config(
-            baseline_config_path, baseline_path, device
-        )
-        use_baseline = True
+        try:
+            baseline_model, baseline_elo = load_model_with_config(
+                baseline_config_path, baseline_path, device
+            )
+            use_baseline = True
+            tqdm.write(f"   Baseline loaded: {baseline_path} (ELO {baseline_elo:.0f})")
+        except Exception as e:
+            tqdm.write(f"   Baseline load failed ({e}), running pure self-play.")
+            baseline_model = None
+            baseline_elo   = Config.INITIAL_ELO
+    else:
+        tqdm.write(f"   No baseline at {baseline_path}, running pure self-play.")
 
-        # Load the baseline's own match equity table
-        baseline_equity_path = os.path.join(
-            os.path.dirname(checkpoint_dir),
-            Config.BASELINE_DIR,
-            'match_equity.pt',
-        )
+    if use_baseline:
+
         baseline_equity_table = MatchEquityTable(
             match_target=Config.MATCH_TARGET, learning_rate=0.01
         )
@@ -199,8 +214,9 @@ def train():
     phase = "vs_baseline" if (use_baseline and current_elo < baseline_elo) else "self_play"
 
     print(
-        f"\n🎮 Start vs Baseline: CurELO={current_elo:.0f} "
-        f"BaseELO={baseline_elo:.0f}"
+        f"\n🎮 Start vs Baseline: stage={Config.STAGE} "
+        f"target={Config.MATCH_TARGET} cube={Config.CUBE_ENABLED} "
+        f"CurELO={current_elo:.0f} BaseELO={baseline_elo:.0f}"
     )
     pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Training")
 
@@ -269,15 +285,16 @@ def train():
             eval_baseline_elo   = baseline_elo   if phase == "vs_baseline" else best_elo
             eval_baseline_cfg   = baseline_config_path if phase == "vs_baseline" else None
 
-            total_wins, total_games, opponent_elo = evaluate_combined(
+            total_wins, total_games, opponent_elo, wins_vs_best, n_vs_best = evaluate_combined(
                 model                = model,
                 best_model           = best_model,
                 baseline_model       = eval_baseline_model,
                 best_elo             = best_elo,
                 baseline_elo         = eval_baseline_elo,
-                total_games          = Config.ELO_EVAL_GAMES,
+                total_games          = Config.GATE_GAMES,
                 device               = 'cpu',
                 baseline_config_path = eval_baseline_cfg,
+                equity_table         = equity_table,
             )
 
             old_elo     = current_elo
@@ -288,8 +305,14 @@ def train():
                 f"ELO: {old_elo:.0f} -> {current_elo:.0f}"
             )
 
-            if current_elo > best_elo:
-                best_elo = current_elo
+            promoted, gate_rate = passes_gate(wins_vs_best, n_vs_best, total_wins, total_games)
+            tqdm.write(
+                f"   -> Gate: {gate_rate:.1%} vs best "
+                f"(threshold > {Config.GATE_WIN_RATE:.1%}) -> "
+                f"{'PROMOTE' if promoted else 'keep best'}"
+            )
+            if promoted:
+                best_elo = max(best_elo, current_elo)
                 load_model_state_dict(best_model, get_model_state_dict(model))
                 save_checkpoint(model, optimizer, train_step, best_elo, avg_loss, best_path)
                 tqdm.write(f"  --> New Best Model Saved (ELO {best_elo:.0f})")

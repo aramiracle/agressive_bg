@@ -1,7 +1,7 @@
 import torch
 import random
 from src.config import Config
-
+from src.utils.outcome import money_equity, match_equity_from_outcomes
 
 
 def compute_cube_features(game_equity, game, my_score, opp_score, equity_table, is_take=False):
@@ -184,24 +184,26 @@ def get_learned_cube_decision(model, game, device, my_score, opp_score,
     Returns: (action, me_soft_target, value_est)
         action          : 0=no-double/drop  1=double/take
         me_soft_target  : training target for the cube head [2]
-        value_est       : raw value head output in [-1,1]
+        value_est       : cubeless money equity of the position in [-1,1]
     """
     board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
 
-    with torch.no_grad():
-        _, _, v, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
-        value_est   = v.item()
-        cube_logits = cube_logits.squeeze(0).clone()  # [2]
+    with torch.inference_mode():
+        outcome_logits, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
+        probs       = torch.softmax(outcome_logits.float().squeeze(0), dim=0).cpu()
+        cube_logits = cube_logits.float().squeeze(0).clone().cpu()  # [2]
+    value_est = float(money_equity(probs))
 
     me_soft_target = None
     if equity_table is not None:
-        # Map value head output [-1,1] to match-equity space [0,1]
-        game_equity = (value_est + 1.0) / 2.0
+        # Match equity of playing on at the CURRENT cube, taking gammons into account.
+        game_equity = match_equity_from_outcomes(
+            probs, my_score, opp_score, game.cube, equity_table
+        )
 
-        # Clip away from extremes: a value near ±1.0 means the model is already
-        # very confident about the match outcome (e.g., 6-away 6-away behind by a
-        # lot).  Clipping prevents p_win saturation when the ME table is still
-        # being learned, while staying differentiable in practice.
+        # Clip away from extremes: a value near 0/1 means the model is already
+        # very confident about the match outcome.  Clipping prevents p_win
+        # saturation when the ME table is still being learned.
         game_equity = max(0.02, min(0.98, game_equity))
 
         _, ev_gain, equity_magnitude = compute_cube_features(

@@ -68,7 +68,8 @@ class BackgammonGame:
             p2_score == self.match_target - 1
         )
 
-        if is_match_point and not self.crawford_used:
+        # In a 1-point match every game is "match point"; Crawford has no meaning there.
+        if is_match_point and self.match_target > 1 and not self.crawford_used:
             self.crawford_active = True
         else:
             self.crawford_active = False
@@ -157,8 +158,23 @@ class BackgammonGame:
         valid_paths = []
         self._find_move_paths(self.board, self.bar, self.off, self.dice, [], valid_paths)
 
+        longest_paths = self._filter_maximal_paths(valid_paths)
+        if not longest_paths:
+            return []
+
+        # Return unique FIRST atomic actions with the specific die used
+        # Structure: ((start, end), die)
+        unique_actions = set()
+        for p in longest_paths:
+            # p[0] is ((start, end), die)
+            unique_actions.add(p[0])
+
+        return sorted(list(unique_actions), key=lambda x: str(x))
+
+    def _filter_maximal_paths(self, paths):
+        """Apply the maximality rules to a list of DFS paths."""
         # Remove empty paths (no atomic moves possible)
-        valid_paths = [p for p in valid_paths if len(p) > 0]
+        valid_paths = [p for p in paths if len(p) > 0]
         if not valid_paths:
             return []
 
@@ -178,15 +194,135 @@ class BackgammonGame:
                 elif pips == max_pips:
                     best.append(p)
             longest_paths = best
+        return longest_paths
 
-        # Return unique FIRST atomic actions with the specific die used
-        # Structure: ((start, end), die)
-        unique_actions = set()
-        for p in longest_paths:
-            # p[0] is ((start, end), die)
-            unique_actions.add(p[0])
+    def get_legal_turns(self):
+        """
+        Every legal COMPLETE play for the current dice, de-duplicated by the
+        position it produces.
 
-        return sorted(list(unique_actions), key=lambda x: str(x))
+        Returns:
+            List of (path, (board, bar, off)) where path is a tuple of atomic
+            actions ((start, end), die) in playing order and the second element
+            is the resulting position as tuples.
+        """
+        if not self.dice:
+            return []
+
+        # Layered search over (position, remaining dice). Positions reached by
+        # different orderings of the same checker moves collapse into one node,
+        # which keeps doubles tractable (the naive DFS explores every permutation).
+        start = (tuple(self.board), tuple(self.bar), tuple(self.off))
+        layer = {(start, tuple(sorted(self.dice))): ()}
+        finals = {}  # final position -> longest path reaching it
+
+        while layer:
+            next_layer = {}
+            for (state, rem), path in layer.items():
+                board, bar, off = state
+                can_bear = self._can_bear_off(board, bar, self.turn)
+                moved = False
+                for die in set(rem):
+                    for start_pt, end_pt in self._get_single_moves(board, bar, self.turn, die, can_bear):
+                        nb, nbar, noff = list(board), list(bar), list(off)
+                        self._apply_single_move_logic(nb, nbar, noff, self.turn, start_pt, end_pt)
+                        nrem = list(rem)
+                        nrem.remove(die)
+                        key = ((tuple(nb), tuple(nbar), tuple(noff)), tuple(nrem))
+                        if key not in next_layer:
+                            next_layer[key] = path + (((start_pt, end_pt), die),)
+                        moved = True
+                if not moved:
+                    prev = finals.get(state)
+                    if prev is None or len(path) > len(prev):
+                        finals[state] = path
+            layer = next_layer
+
+        paths = self._filter_maximal_paths(list(finals.values()))
+        if not paths:
+            return []
+
+        seen = {}
+        for p in paths:
+            board, bar, off = list(self.board), list(self.bar), list(self.off)
+            for (start_pt, end_pt), _ in p:
+                self._apply_single_move_logic(board, bar, off, self.turn, start_pt, end_pt)
+            key = (tuple(board), tuple(bar), tuple(off))
+            if key not in seen:
+                seen[key] = tuple(p)
+
+        return [(path, key) for key, path in seen.items()]
+
+    def apply_turn(self, path):
+        """Play a complete turn (as returned by get_legal_turns) without re-validation."""
+        for (start, end), die in path:
+            self._apply_single_move_logic(self.board, self.bar, self.off, self.turn, start, end)
+            self.dice.remove(die)
+        self.dice = []
+        return self.check_win()
+
+    # =========================
+    # POSITION FEATURES
+    # =========================
+
+    @staticmethod
+    def contact(board, bar):
+        """True while the two sides can still interact (not yet a pure race)."""
+        p1_back = 24 if bar[0] > 0 else -1
+        p2_back = -1 if bar[1] > 0 else 24
+        for i in range(Config.NUM_POINTS):
+            v = board[i]
+            if v > 0 and i > p1_back:
+                p1_back = i
+            elif v < 0 and i < p2_back:
+                p2_back = i
+        return p1_back > p2_back
+
+    @staticmethod
+    def pips(board, bar, player):
+        total = 0
+        if player == 1:
+            for i in range(Config.NUM_POINTS):
+                if board[i] > 0:
+                    total += board[i] * (i + 1)
+            total += bar[0] * 25
+        else:
+            for i in range(Config.NUM_POINTS):
+                if board[i] < 0:
+                    total += -board[i] * (Config.NUM_POINTS - i)
+            total += bar[1] * 25
+        return total
+
+    @staticmethod
+    def gammon_free_race(board, bar, off):
+        """No contact and both sides have borne off: only a single win is possible."""
+        return off[0] > 0 and off[1] > 0 and not BackgammonGame.contact(board, bar)
+
+    @staticmethod
+    def win_type_of(board, bar, off, winner):
+        """1 = single, 2 = gammon, 3 = backgammon for the given winner."""
+        loser = -winner
+        loser_idx = 0 if loser == 1 else 1
+
+        if off[loser_idx] > 0:
+            return 1
+        if bar[loser_idx] > 0:
+            return 3
+
+        home_range = range(0, 6) if winner == 1 else range(18, 24)
+        for i in home_range:
+            if (loser == 1 and board[i] > 0) or (loser == -1 and board[i] < 0):
+                return 3
+        return 2
+
+    def has_contact(self):
+        return self.contact(self.board, self.bar)
+
+    def pip_count(self, player):
+        return self.pips(self.board, self.bar, player)
+
+    def is_gammon_free_race(self):
+        return self.gammon_free_race(self.board, self.bar, self.off)
 
     # =========================
     # DFS CORE
@@ -396,60 +532,13 @@ class BackgammonGame:
             If train_mode=True: Use Config.R_WIN, Config.R_GAMMON, Config.R_BACKGAMMON (e.g., 1, 3, 5 for aggressive training)
             If train_mode=False: Use real backgammon values (1, 2, 3)
             """
-            loser = -winner
-            loser_idx = 0 if loser == 1 else 1
-
-            # Determine multiplier based on train_mode
+            wtype = self.win_type(winner)
             if self.train_mode:
                 # Training mode: use Config values (could be aggressive like 1, 3, 5)
-                mult = Config.R_WIN 
-                
-                if self.off[loser_idx] == 0:
-                    # Gammon condition met
-                    mult = Config.R_GAMMON
-                    
-                    has_bar = self.bar[loser_idx] > 0
-                    has_home = False
-
-                    home_range = (
-                        range(0, 6)
-                        if winner == 1 else
-                        range(18, 24)
-                    )
-
-                    for i in home_range:
-                        if (loser == 1 and self.board[i] > 0) or (loser == -1 and self.board[i] < 0):
-                            has_home = True
-                            break
-
-                    if has_bar or has_home:
-                        # Backgammon condition met
-                        mult = Config.R_BACKGAMMON
+                mult = {1: Config.R_WIN, 2: Config.R_GAMMON, 3: Config.R_BACKGAMMON}[wtype]
             else:
                 # Real backgammon mode: use standard values (1, 2, 3)
-                mult = 1  # Single game
-                
-                if self.off[loser_idx] == 0:
-                    # Gammon condition met
-                    mult = 2
-                    
-                    has_bar = self.bar[loser_idx] > 0
-                    has_home = False
-
-                    home_range = (
-                        range(0, 6)
-                        if winner == 1 else
-                        range(18, 24)
-                    )
-
-                    for i in home_range:
-                        if (loser == 1 and self.board[i] > 0) or (loser == -1 and self.board[i] < 0):
-                            has_home = True
-                            break
-
-                    if has_bar or has_home:
-                        # Backgammon condition met
-                        mult = 3
+                mult = wtype
 
             points = self.cube * mult
             self.match_scores[winner] += points
@@ -458,6 +547,10 @@ class BackgammonGame:
                 self.crawford_used = True
 
             return winner, points
+
+    def win_type(self, winner):
+        """1 = single, 2 = gammon, 3 = backgammon for the given winner (no side effects)."""
+        return self.win_type_of(self.board, self.bar, self.off, winner)
 
     def handle_cube_refusal(self):
         winner = self.turn
@@ -474,45 +567,60 @@ class BackgammonGame:
     # =========================
 
     def get_vector(self, my_score=None, opp_score=None, device="cpu", canonical=True):
-        vec_data = [0] * Config.BOARD_SEQ_LEN
-        flip = canonical and self.turn == -1
-
-        for i in range(Config.NUM_POINTS):
-            val = self.board[i] if not flip else -self.board[Config.NUM_POINTS - 1 - i]
-            vec_data[i] = val + Config.EMBED_OFFSET
-
-        if not flip:
-            vec_data[24] = self.bar[0] + Config.EMBED_OFFSET
-            vec_data[25] = -self.bar[1] + Config.EMBED_OFFSET
-            vec_data[26] = self.off[0] + Config.EMBED_OFFSET
-            vec_data[27] = -self.off[1] + Config.EMBED_OFFSET
-        else:
-            vec_data[24] = self.bar[1] + Config.EMBED_OFFSET
-            vec_data[25] = -self.bar[0] + Config.EMBED_OFFSET
-            vec_data[26] = self.off[1] + Config.EMBED_OFFSET
-            vec_data[27] = -self.off[0] + Config.EMBED_OFFSET
-
         if my_score is None or opp_score is None:
-            if not flip:
-                s_my, s_opp = self.match_scores[1], self.match_scores[-1]
-            else:
-                s_my, s_opp = self.match_scores[-1], self.match_scores[1]
-        else:
-            s_my, s_opp = my_score, opp_score
+            my_score = self.match_scores[self.turn]
+            opp_score = self.match_scores[-self.turn]
 
-        turn_val = 1.0 if self.turn == 1 else -1.0
-
-        ctx_data = [
-            turn_val,
-            float(self.cube),
-            float(s_my) / float(self.match_target),
-            float(s_opp) / float(self.match_target)
-        ]
-
+        vec_data, ctx_data = self.encode_state(
+            self.board, self.bar, self.off, self.turn,
+            self.cube, self.cube_owner, self.crawford_active,
+            my_score, opp_score, canonical=canonical,
+        )
         t_board = torch.tensor(vec_data, dtype=torch.long, device=device)
         t_ctx = torch.tensor(ctx_data, dtype=torch.float, device=device)
-
         return t_board, t_ctx
+
+    @staticmethod
+    def encode_state(board, bar, off, turn, cube, cube_owner, crawford_active,
+                     my_score, opp_score, canonical=True):
+        """
+        Encode an arbitrary position from the perspective of `turn` as plain
+        Python lists (board tokens, context features). Used by both get_vector
+        and the search, which evaluates many hypothetical positions.
+        """
+        vec_data = [0] * Config.BOARD_SEQ_LEN
+        flip = canonical and turn == -1
+        offset = Config.EMBED_OFFSET
+
+        if not flip:
+            for i in range(Config.NUM_POINTS):
+                vec_data[i] = board[i] + offset
+            vec_data[24] = bar[0] + offset
+            vec_data[25] = -bar[1] + offset
+            vec_data[26] = off[0] + offset
+            vec_data[27] = -off[1] + offset
+        else:
+            for i in range(Config.NUM_POINTS):
+                vec_data[i] = -board[Config.NUM_POINTS - 1 - i] + offset
+            vec_data[24] = bar[1] + offset
+            vec_data[25] = -bar[0] + offset
+            vec_data[26] = off[1] + offset
+            vec_data[27] = -off[0] + offset
+
+        if cube_owner == 0:
+            owner_val = 0.0
+        else:
+            owner_val = 1.0 if cube_owner == turn else -1.0
+
+        target = float(Config.MATCH_TARGET)
+        ctx_data = [
+            owner_val,
+            float(cube) / Config.MAX_CUBE,
+            float(my_score) / target,
+            float(opp_score) / target,
+            1.0 if crawford_active else 0.0,
+        ]
+        return vec_data, ctx_data
 
     # =========================
     # CANONICAL ACTIONS
@@ -550,6 +658,10 @@ class BackgammonGame:
     # =========================
 
     def can_double(self):
+        # 0. Cube disabled for this training stage
+        if not Config.CUBE_ENABLED:
+            return False
+
         # 1. Crawford Rule
         if self.crawford_active:
             return False

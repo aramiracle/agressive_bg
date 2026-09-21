@@ -271,6 +271,9 @@ class SimpleReplayBuffer:
         batch = [self.data[i] for i in indices]
         return batch, torch.tensor(indices), torch.ones(batch_size)
 
+    def update_priorities(self, indices, td_errors):
+        """Uniform buffer: priorities are not tracked."""
+
     def __len__(self):
         return self.size
 

@@ -145,6 +145,11 @@ class MatchEquityTable:
 
     def load(self, filepath):
         checkpoint = torch.load(filepath, weights_only=False)
+        if checkpoint['match_target'] != self.match_target:
+            raise ValueError(
+                f"Equity table at {filepath} is for a {checkpoint['match_target']}-point "
+                f"match, but the current match target is {self.match_target}"
+            )
         self.equity_table  = checkpoint['equity_table']
         self.match_target  = checkpoint['match_target']
         self.learning_rate = checkpoint['learning_rate']

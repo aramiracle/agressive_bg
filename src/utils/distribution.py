@@ -20,3 +20,16 @@ def jensen_shannon_loss(log_p, q_target):
     loss_qm = nn.functional.kl_div(q_target.log(), m, reduction='sum')
     
     return 0.5 * (loss_pm + loss_qm)
+
+
+def jensen_shannon_loss_batch(log_p, q_target):
+    """
+    Row-wise JS divergence for a batch.
+    log_p, q_target: [N, C]  ->  returns [N]
+    """
+    p = log_p.exp()
+    m = 0.5 * (p + q_target)
+    log_m = m.clamp_min(1e-12).log()
+    kl_pm = (p * (log_p - log_m)).sum(-1)
+    kl_qm = (q_target * (q_target.clamp_min(1e-12).log() - log_m)).sum(-1)
+    return 0.5 * (kl_pm + kl_qm)

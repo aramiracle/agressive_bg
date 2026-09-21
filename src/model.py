@@ -1,6 +1,8 @@
-"""Neural network models for backgammon AI (NaN-hardened, no deprecated APIs)."""
+"""Neural network models for backgammon AI.
 
-import math
+forward(board_seq, context) -> (outcome_logits [B, 6], cube_logits [B, 2])
+"""
+
 import torch
 import torch.nn as nn
 from src.config import Config
@@ -14,12 +16,11 @@ class LearnedPositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len):
         super().__init__()
         self.pos_embed = nn.Embedding(max_len, d_model)
-        self.scale = math.sqrt(d_model)
 
     def forward(self, x):
         seq_len = x.size(1)
         positions = torch.arange(seq_len, device=x.device)
-        return x + self.pos_embed(positions) * self.scale
+        return x + self.pos_embed(positions)
 
 
 # ---------------------------
@@ -69,16 +70,12 @@ class BackgammonTransformer(nn.Module):
 
         self.out_norm = nn.LayerNorm(d)
 
-        # Output heads (new stable weight norm API)
-        self.policy_from = nn.Linear(d, cfg.NUM_ACTIONS)
-        self.policy_to = nn.Linear(d, cfg.NUM_ACTIONS)
-
-        self.value_head = nn.Sequential(
+        # Output heads: outcome distribution (6-way) + cube decision (2-way)
+        self.outcome_head = nn.Sequential(
             nn.LayerNorm(d),
             nn.Linear(d, cfg.VALUE_HIDDEN),
             nn.GELU(),
-            nn.Linear(cfg.VALUE_HIDDEN, 1),
-            nn.Tanh()
+            nn.Linear(cfg.VALUE_HIDDEN, cfg.NUM_OUTCOMES)
         )
 
         self.cube_head = nn.Sequential(
@@ -99,7 +96,7 @@ class BackgammonTransformer(nn.Module):
                     nn.init.zeros_(module.bias)
 
             elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, std=0.01)
+                nn.init.normal_(module.weight, std=0.02)
 
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
@@ -109,7 +106,7 @@ class BackgammonTransformer(nn.Module):
         # Board embedding: [B, 28] -> [B, 28, D]
         x_board = self.embedding(board_seq)
 
-        # Context projection: [B, 4] -> [B, 1, D]
+        # Context projection: [B, CONTEXT_SIZE] -> [B, 1, D]
         x_ctx = self.ctx_proj(context).unsqueeze(1)
         x_ctx = self.ctx_norm(x_ctx)
 
@@ -124,12 +121,111 @@ class BackgammonTransformer(nn.Module):
         global_feat = self.out_norm(x[:, 0, :])
 
         # Heads
-        p_from = self.policy_from(global_feat)
-        p_to = self.policy_to(global_feat)
-        v = self.value_head(global_feat)
+        outcome = self.outcome_head(global_feat)
         cube = self.cube_head(global_feat)
 
-        return p_from, p_to, v, cube
+        return outcome, cube
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def _to_legacy_context(context):
+    """Map current 5-feature context onto the old 4-feature layout.
+
+    Old nets saw [turn (±1), raw cube, my_score/target, opp_score/target].
+    Search now encodes from the mover, so turn is +1; cube is un-normalised.
+    """
+    if context.size(-1) == 4:
+        return context
+    cube_raw = context[..., 1] * Config.MAX_CUBE
+    turn_val = torch.ones_like(cube_raw)
+    return torch.stack(
+        [turn_val, cube_raw, context[..., 2], context[..., 3]],
+        dim=-1,
+    )
+
+
+def _value_to_outcome_logits(value):
+    """Turn tanh equity in [-1, 1] into 6-way logits (single win/loss only)."""
+    v = value.squeeze(-1).clamp(-0.999, 0.999)
+    p_win = (v + 1.0) * 0.5
+    log_win = torch.log(p_win)
+    log_lose = torch.log(1.0 - p_win)
+    gammon = torch.full_like(log_win, -20.0)
+    return torch.stack(
+        [log_win, gammon, gammon, log_lose, gammon, gammon],
+        dim=-1,
+    )
+
+
+class LegacyValueTransformer(nn.Module):
+    """Pre-outcome-head transformer: policy + scalar value + cube.
+
+    `forward` matches the current net so Searcher can use it as a frozen
+    opponent: (outcome_logits [B, 6], cube_logits [B, 2]).
+    """
+
+    def __init__(self, config=None):
+        super().__init__()
+        cfg = config if config is not None else Config
+        d = cfg.D_MODEL
+
+        self.embedding = nn.Embedding(
+            cfg.EMBED_VOCAB_SIZE,
+            d,
+            padding_idx=0
+        )
+        self.ctx_proj = nn.Sequential(
+            nn.LayerNorm(cfg.CONTEXT_SIZE),
+            nn.Linear(cfg.CONTEXT_SIZE, d)
+        )
+        self.ctx_norm = nn.LayerNorm(d)
+        self.pos_encoder = LearnedPositionalEncoding(d, cfg.MAX_SEQ_LEN)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d,
+            nhead=cfg.N_HEAD,
+            dim_feedforward=cfg.DIM_FEEDFORWARD,
+            dropout=cfg.DROPOUT,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=cfg.N_LAYERS,
+            enable_nested_tensor=False
+        )
+        self.out_norm = nn.LayerNorm(d)
+
+        self.policy_from = nn.Linear(d, cfg.NUM_ACTIONS)
+        self.policy_to = nn.Linear(d, cfg.NUM_ACTIONS)
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, cfg.VALUE_HIDDEN),
+            nn.GELU(),
+            nn.Linear(cfg.VALUE_HIDDEN, 1),
+            nn.Tanh()
+        )
+        self.cube_head = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, cfg.VALUE_HIDDEN),
+            nn.GELU(),
+            nn.Linear(cfg.VALUE_HIDDEN, 2)
+        )
+
+    def forward(self, board_seq, context):
+        context = _to_legacy_context(context)
+        x_board = self.embedding(board_seq)
+        x_ctx = self.ctx_proj(context).unsqueeze(1)
+        x_ctx = self.ctx_norm(x_ctx)
+        x = torch.cat([x_ctx, x_board], dim=1)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        global_feat = self.out_norm(x[:, 0, :])
+        value = self.value_head(global_feat)
+        cube = self.cube_head(global_feat)
+        return _value_to_outcome_logits(value), cube
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -203,17 +299,12 @@ class BackgammonCNN(nn.Module):
 
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-        # Output heads (new weight norm API)
-        self.policy_from = nn.Linear(d, cfg.NUM_ACTIONS)
-        self.policy_to = nn.Linear(d, cfg.NUM_ACTIONS)
-
-
-        self.value_head = nn.Sequential(
+        # Output heads: outcome distribution (6-way) + cube decision (2-way)
+        self.outcome_head = nn.Sequential(
             nn.LayerNorm(d),
             nn.Linear(d, cfg.VALUE_HIDDEN),
             nn.GELU(),
-            nn.Linear(cfg.VALUE_HIDDEN, 1),
-            nn.Tanh()
+            nn.Linear(cfg.VALUE_HIDDEN, cfg.NUM_OUTCOMES)
         )
 
         self.cube_head = nn.Sequential(
@@ -238,7 +329,7 @@ class BackgammonCNN(nn.Module):
                     nn.init.zeros_(module.bias)
 
             elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, std=0.01)
+                nn.init.normal_(module.weight, std=0.02)
 
             elif isinstance(module, nn.GroupNorm):
                 nn.init.ones_(module.weight)
@@ -258,12 +349,10 @@ class BackgammonCNN(nn.Module):
 
         x = self.global_pool(x).squeeze(-1)
 
-        p_from = self.policy_from(x)
-        p_to = self.policy_to(x)
-        v = self.value_head(x)
+        outcome = self.outcome_head(x)
         cube = self.cube_head(x)
 
-        return p_from, p_to, v, cube
+        return outcome, cube
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

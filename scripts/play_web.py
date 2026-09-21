@@ -13,10 +13,11 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 import threading
 
 from src.engine import BackgammonGame
-from src.mcts import MCTS
+from src.search import Searcher
 from src.model import get_model
 from src.config import Config
 from src.utils.cube import get_learned_cube_decision
+from src.utils.checkpoint import load_model_with_config, default_model_paths
 from src.utils.match_equity import MatchEquityTable
 
 
@@ -27,9 +28,8 @@ HOST = "0.0.0.0"
 PORT = 8765
 HTTP_PORT = 8080
 DEVICE = Config.DEVICE
-CHECKPOINTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints")
-MODEL_PATH = os.path.join(CHECKPOINTS_DIR, "best_model.pt")
-UI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UI_DIR = os.path.join(REPO_ROOT, "ui")
 
 
 # =========================
@@ -41,6 +41,7 @@ class BackgammonServer:
         self.game = BackgammonGame(train_mode=False)
         self.model = None
         self.mcts = None
+        self._planned_turn = []
         self.model_filename = None
         self.game_mode = "human_vs_ai"  # human_vs_ai, ai_vs_human, ai_vs_ai
         self.game_over = False
@@ -58,59 +59,48 @@ class BackgammonServer:
         self._try_load_default_model()
 
     def _try_load_equity_table(self):
-        equity_path = os.path.join(CHECKPOINTS_DIR, "equity_table.pt")
-        if os.path.exists(equity_path):
-            self.equity_table.load(equity_path)
-            print(f"✅ Match Equity Table loaded: {equity_path}")
+        for path in default_model_paths(REPO_ROOT):
+            equity_path = os.path.join(os.path.dirname(path), "match_equity.pt")
+            if os.path.exists(equity_path):
+                self.equity_table.load(equity_path)
+                print(f"✅ Match Equity Table loaded: {equity_path}")
+                return
 
     def _try_load_default_model(self):
-        """Try to load default model from checkpoints folder"""
-        paths_to_try = [MODEL_PATH, MODEL_PATH.replace("best_model.pt", "latest_model.pt")]
-        
-        for path in paths_to_try:
+        """Load the newest trained model, falling back to the frozen baseline."""
+        for path in default_model_paths(REPO_ROOT):
             if not os.path.exists(path):
                 continue
-                
             try:
-                checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
-                
-                # Check model type from checkpoint config
-                checkpoint_model_type = None
-                if isinstance(checkpoint, dict) and 'config' in checkpoint:
-                    checkpoint_model_type = checkpoint['config'].get('model_type', None)
-                
-                # Warn if types don't match
-                if checkpoint_model_type and checkpoint_model_type != Config.MODEL_TYPE:
-                    print(f"⚠️ Skipping {path}: model type mismatch (checkpoint: {checkpoint_model_type}, config: {Config.MODEL_TYPE})")
-                    continue
-                
-                model = get_model().to(DEVICE)
-                
-                # Load state dict
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                elif isinstance(checkpoint, dict) and 'model' in checkpoint:
-                    model.load_state_dict(checkpoint['model'])
+                config_path = os.path.join(os.path.dirname(path), "config.py")
+                if os.path.exists(config_path):
+                    model, elo = load_model_with_config(config_path, path, DEVICE)
+                    step = "N/A"
                 else:
-                    model.load_state_dict(checkpoint)
-                
-                model.eval()
+                    checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+                    model = get_model().to(DEVICE)
+                    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                        model.load_state_dict(checkpoint["model_state_dict"])
+                        elo = checkpoint.get("elo", "N/A")
+                        step = checkpoint.get("step", "N/A")
+                    else:
+                        model.load_state_dict(checkpoint)
+                        elo, step = "N/A", "N/A"
+                    model.eval()
+
                 self.model = model
-                self.mcts = MCTS(self.model, device=DEVICE)
+                self.mcts = Searcher(self.model, device=DEVICE, equity_table=self.equity_table)
                 self.model_filename = os.path.basename(path)
-                
-                elo = checkpoint.get('elo', 'N/A') if isinstance(checkpoint, dict) else 'N/A'
-                step = checkpoint.get('step', 'N/A') if isinstance(checkpoint, dict) else 'N/A'
-                model_info = checkpoint_model_type or Config.MODEL_TYPE
-                
+                equity_path = os.path.join(os.path.dirname(path), "match_equity.pt")
+                if os.path.exists(equity_path):
+                    self.equity_table.load(equity_path)
                 print(f"✅ Model loaded: {path}")
-                print(f"   Type: {model_info}, ELO: {elo}, Step: {step}")
+                print(f"   ELO: {elo}, Step: {step}")
                 return
-                
             except Exception as e:
                 print(f"⚠️ Error loading {path}: {e}")
-        
-        print(f"⚠️ No compatible model found - AI will not work until model is loaded")
+
+        print("⚠️ No compatible model found - AI will not work until model is loaded")
 
     def load_model_from_data(self, filename, data_base64):
         """Load model from base64 encoded data sent from client"""
@@ -138,7 +128,7 @@ class BackgammonServer:
             
             model.eval()
             self.model = model
-            self.mcts = MCTS(self.model, device=DEVICE)
+            self.mcts = Searcher(self.model, device=DEVICE, equity_table=self.equity_table)
             self.model_filename = filename
             
             return {
@@ -525,20 +515,21 @@ class BackgammonServer:
             await asyncio.sleep(0.4)
 
         # 3. Atomic Move Loop
+        self._planned_turn = []
         while self.game.dice and not self.game_over:
             legal = self.game.get_legal_moves()
             if not legal:
                 break
 
-            self.mcts.reset() 
-            root = self.mcts.search(self.game, my_score, opp_score)
+            # Search once per roll and replay the chosen turn atomically so
+            # the client sees every checker move.
+            if not self._planned_turn:
+                result = self.mcts.search(self.game, my_score, opp_score)
+                best = result.best()
+                self._planned_turn = list(best.path) if best is not None else []
 
-            if root.children:
-                legal_children = [c for c in root.children if c.action in legal]
-                if legal_children:
-                    best_action = max(legal_children, key=lambda n: n.visits).action
-                else:
-                    best_action = random.choice(legal)
+            if self._planned_turn:
+                best_action = self._planned_turn.pop(0)
             else:
                 best_action = random.choice(legal)
 

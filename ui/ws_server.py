@@ -59,7 +59,7 @@ from backgammon.config import Config
 HOST = "0.0.0.0"
 PORT = 8765
 DEVICE = Config.DEVICE
-MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints", "best_model.pt")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints", "baseline", "best_model.pt")
 
 
 # =========================

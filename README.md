@@ -10,7 +10,7 @@ A neural network-based Backgammon AI using Monte Carlo Tree Search (MCTS) with s
 - **ELO Rating System**: Track model improvement over training
 - **Doubling Cube**: Full support for doubling cube strategy
 - **Crawford Rule**: Proper match play with Crawford rule
-- **Multiple UIs**: Web-based and desktop (Kivy) interfaces
+- **Web UI**: Play against the AI in the browser
 
 ## Project Structure
 
@@ -31,10 +31,11 @@ agressive_bg/
 │       └── ui_web/
 │           └── html_ui.html   # Web UI (HTML/CSS/JS)
 ├── scripts/
-│   ├── train.py               # Training entry point
-│   ├── play_web.py            # WebSocket server for web UI
-│   └── play_desktop.py        # Desktop UI entry point
-├── checkpoints/               # Saved model checkpoints
+│   └── play_web.py            # WebSocket server for web UI
+├── checkpoints/
+│   ├── baseline/          # Frozen opponent for vs-baseline training
+│   ├── stage1/            # Live stage-1 training
+│   └── stage2/            # Live stage-2 training
 ├── tests/                     # Unit tests
 ├── requirements.txt
 ├── pyproject.toml
@@ -78,10 +79,7 @@ pip install -e ".[dev]"
 ### Training
 
 ```bash
-# Start training
-python scripts/train.py
-
-# Or if installed as package
+# Start training (if installed as a package)
 bg-train
 ```
 
@@ -107,16 +105,6 @@ Features:
 - Model loading from file
 - Match scoring with Crawford rule
 - Doubling cube support
-
-### Playing (Desktop UI)
-
-```bash
-# Requires Kivy
-pip install kivy
-
-# Start the desktop app
-python scripts/play_desktop.py
-```
 
 ## Configuration
 
@@ -150,9 +138,9 @@ class Config:
 
 ## Model Checkpoints
 
-Checkpoints are saved to `checkpoints/`:
-- `best_model.pt`: Best performing model by ELO
-- `latest_model.pt`: Most recent checkpoint
+Checkpoints live under `checkpoints/`:
+- `baseline/`: frozen opponent used by `python src/trainer_vs_baseline.py --stage 1`
+- `stage1/`, `stage2/`: live training runs (`best_model.pt`, `latest_model.pt`)
 
 Checkpoint structure:
 ```python

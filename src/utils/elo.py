@@ -4,8 +4,9 @@ import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
 from src.config import Config
-from src.mcts import MCTS
+from src.search import Searcher
 from src.engine import BackgammonGame
+from src.utils.match_equity import MatchEquityTable
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -32,18 +33,20 @@ def get_cube_action(model, game, device, my_score=0, opp_score=0):
     """Consult the model's learned cube policy."""
     board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
 
-    with torch.no_grad():
-        _, _, _, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
+    with torch.inference_mode():
+        _, cube_logits = model(board_t.unsqueeze(0), ctx_t.unsqueeze(0))
         action = torch.argmax(cube_logits.squeeze(0)).item()
     return action
 
 
-def play_single_game(game, model_a, model_b, mcts_a, mcts_b, a_is_white, device,
+def play_single_game(game, model_a, model_b, searcher_a, searcher_b, a_is_white, device,
                      score_a, score_b, max_moves=1000):
-    """Plays a single game within a match context."""
+    """Plays a single game within a match context (greedy, no exploration)."""
     game.reset()
-    mcts_a.reset()
-    mcts_b.reset()
+    game.set_match_scores(score_a if a_is_white else score_b,
+                          score_b if a_is_white else score_a)
+    searcher_a.reset()
+    searcher_b.reset()
 
     move_count = 0
     while move_count < max_moves:
@@ -53,9 +56,9 @@ def play_single_game(game, model_a, model_b, mcts_a, mcts_b, a_is_white, device,
         is_a_turn = (game.turn == 1 and a_is_white) or (game.turn == -1 and not a_is_white)
         p1_score, p2_score = (score_a, score_b) if is_a_turn else (score_b, score_a)
 
-        active_model = model_a if is_a_turn else model_b
-        opp_model    = model_b if is_a_turn else model_a
-        active_mcts  = mcts_a  if is_a_turn else mcts_b
+        active_model    = model_a    if is_a_turn else model_b
+        opp_model       = model_b    if is_a_turn else model_a
+        active_searcher = searcher_a if is_a_turn else searcher_b
 
         # ---------------- 1. Learned Doubling ----------------
         if game.can_double():
@@ -72,27 +75,21 @@ def play_single_game(game, model_a, model_b, mcts_a, mcts_b, a_is_white, device,
 
         # ---------------- 2. Movement ----------------
         game.roll_dice()
-        while game.dice:
-            legal = game.get_legal_moves()
-            if not legal: break
-
-            root   = active_mcts.search(game, p1_score, p2_score)
-            action = max(root.children, key=lambda n: n.visits).action
-
-            game.step_atomic(action)
-            active_mcts.advance_to_child(action)
+        result = active_searcher.search(game, p1_score, p2_score, stochastic=False)
+        if len(result) > 0:
+            game.apply_turn(result.best().path)
             move_count += 1
             if game.check_win()[0] != 0: break
 
-        if game.check_win()[0] == 0:
-            game.switch_turn()
+        game.switch_turn()
 
     winner, points = game.check_win()
-    return winner, points * game.cube
+    return winner, points
 
 
 def _worker_play_match(args):
-    match_idx, model_a_state, model_b_state, model_b_config_path, device = args
+    (match_idx, model_a_state, model_b_state, model_b_config_path,
+     device, equity_table_state) = args
 
     torch.set_num_threads(1)
 
@@ -110,9 +107,14 @@ def _worker_play_match(args):
     model_b.load_state_dict(model_b_state)
     model_b.eval()
 
+    equity_table = None
+    if equity_table_state is not None:
+        equity_table = MatchEquityTable()
+        equity_table.equity_table = equity_table_state
+
     game_instance = BackgammonGame()
-    mcts_a = MCTS(model_a, device=device)
-    mcts_b = MCTS(model_b, device=device)
+    searcher_a = Searcher(model_a, device=device, equity_table=equity_table)
+    searcher_b = Searcher(model_b, device=device, equity_table=equity_table)
 
     score_a, score_b = 0, 0
     target = Config.MATCH_TARGET
@@ -122,7 +124,7 @@ def _worker_play_match(args):
         winner, points = play_single_game(
             game_instance,
             model_a, model_b,
-            mcts_a, mcts_b,
+            searcher_a, searcher_b,
             a_is_white, device,
             score_a, score_b
         )
@@ -140,7 +142,8 @@ def evaluate_vs_opponent(args):
     Play num_games matches of model_a vs model_b.
     Returns (wins_by_model_a, num_games).
     """
-    game, model_a, model_b, num_games, device, num_processes, model_b_config_path = args
+    (game, model_a, model_b, num_games, device, num_processes,
+     model_b_config_path, equity_table_state) = args
 
     if num_processes is None:
         num_processes = mp.cpu_count()
@@ -159,7 +162,7 @@ def evaluate_vs_opponent(args):
     )
 
     worker_args = [
-        (i, model_a_state, model_b_state, model_b_config_path, device)
+        (i, model_a_state, model_b_state, model_b_config_path, device, equity_table_state)
         for i in range(num_games)
     ]
 
@@ -176,38 +179,27 @@ def evaluate_vs_opponent(args):
 def evaluate_combined(model, best_model, baseline_model,
                       best_elo, baseline_elo,
                       total_games, device, num_processes=None,
-                      baseline_config_path=None):
+                      baseline_config_path=None, equity_table=None):
     """
-    Split eval games between baseline and best model according to
-    Config.BASELINE_SELF_PLAY_RATIO, accumulate results, and compute
-    the weighted opponent ELO.
-
-    Split rule (matching the spec example):
-        BASELINE_SELF_PLAY_RATIO = 0.7, ELO_EVAL_GAMES = 100
-        n_vs_baseline = round(100 * 0.7) = 70   <- vs external baseline
-        n_vs_best     = 100 - 70          = 30   <- vs best self-play model
-        opponent_elo  = 1000*0.7 + 500*0.3 = 850
-
-    When baseline_model is None (pure self-play trainer), all games are
-    played against best_model and opponent_elo = best_elo.
+    E3 gating eval: play `total_games` matches against best_model
+    (trainers pass GATE_GAMES). Optional extra matches against an external
+    baseline contribute only to the mixed opponent ELO, never to the gate.
 
     Returns:
         total_wins    (float)  – accumulated wins across all games
-        total_games   (int)    – == total_games argument
+        played        (int)    – games actually played
         opponent_elo  (float)  – weighted ELO of the mixed opponent pool
+        wins_vs_best  (float)  – wins in the games against best_model (gating)
+        n_vs_best     (int)    – number of games against best_model
     """
+    equity_table_state = equity_table.equity_table.copy() if equity_table is not None else None
     if num_processes is None:
         num_processes = mp.cpu_count()
 
-    ratio = Config.BASELINE_SELF_PLAY_RATIO  # fraction of eval games vs baseline
-
-    if baseline_model is None:
-        # No external baseline available – fall back to best model only
-        n_vs_baseline = 0
-        n_vs_best     = total_games
-    else:
-        n_vs_baseline = round(total_games * ratio)
-        n_vs_best     = total_games - n_vs_baseline
+    # Gate always uses the full `total_games` vs best. Baseline matches are
+    # extra and do not reduce that count.
+    n_vs_best = total_games
+    n_vs_baseline = 0
 
     wins_vs_baseline = 0.0
     wins_vs_best     = 0.0
@@ -218,7 +210,8 @@ def evaluate_combined(model, best_model, baseline_model,
             f"   ELO eval: {n_vs_baseline} games vs baseline (ELO {baseline_elo:.0f})"
         )
         wins_vs_baseline, _ = evaluate_vs_opponent(
-            (None, model, baseline_model, n_vs_baseline, device, num_processes, baseline_config_path)
+            (None, model, baseline_model, n_vs_baseline, device, num_processes,
+             baseline_config_path, equity_table_state)
         )
 
     # --- Games vs best model ---
@@ -227,7 +220,7 @@ def evaluate_combined(model, best_model, baseline_model,
             f"   ELO eval: {n_vs_best} games vs best (ELO {best_elo:.0f})"
         )
         wins_vs_best, _ = evaluate_vs_opponent(
-            (None, model, best_model, n_vs_best, device, num_processes, None)
+            (None, model, best_model, n_vs_best, device, num_processes, None, equity_table_state)
         )
 
     total_wins = wins_vs_baseline + wins_vs_best
@@ -248,4 +241,19 @@ def evaluate_combined(model, best_model, baseline_model,
         f"(baseline×{n_vs_baseline} + best×{n_vs_best})"
     )
 
-    return total_wins, total_games, opponent_elo
+    return total_wins, total_games, opponent_elo, wins_vs_best, n_vs_best
+
+
+def passes_gate(wins_vs_best, n_vs_best, total_wins, total_games):
+    """
+    E3 gating: promote only if the candidate's win rate against best_model
+    exceeds Config.GATE_WIN_RATE. Falls back to the overall win rate when no
+    games against best_model were played.
+    """
+    if n_vs_best > 0:
+        rate = wins_vs_best / n_vs_best
+    elif total_games > 0:
+        rate = total_wins / total_games
+    else:
+        return False, 0.0
+    return rate > Config.GATE_WIN_RATE, rate

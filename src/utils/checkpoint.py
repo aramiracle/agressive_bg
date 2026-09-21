@@ -4,7 +4,7 @@ import os
 import torch
 from src.config import Config
 import importlib.util
-from src.model import BackgammonTransformer, BackgammonCNN
+from src.model import BackgammonTransformer, BackgammonCNN, LegacyValueTransformer
 
 def setup_checkpoint_dir():
     """
@@ -20,6 +20,26 @@ def setup_checkpoint_dir():
     latest_path = os.path.join(checkpoint_dir, "latest_model.pt")
     
     return checkpoint_dir, best_path, latest_path
+
+
+def baseline_artifact_paths():
+    """Return (model_path, config_path, equity_path) for the frozen baseline."""
+    directory = Config.BASELINE_DIR
+    return (
+        os.path.join(directory, Config.BASELINE_MODEL_NAME),
+        os.path.join(directory, "config.py"),
+        os.path.join(directory, "match_equity.pt"),
+    )
+
+
+def default_model_paths(repo_root="."):
+    """Preferred play/eval order: newest training stage, then frozen baseline."""
+    root = os.path.join(repo_root, "checkpoints")
+    paths = []
+    for folder in ("stage2", "stage1", "baseline"):
+        for name in ("best_model.pt", "latest_model.pt"):
+            paths.append(os.path.join(root, folder, name))
+    return paths
 
 
 def save_checkpoint(model, optimizer, step, elo, loss, path):
@@ -90,6 +110,19 @@ def load_checkpoint(path, model, optimizer=None, device='cpu'):
     }
 
 
+def warm_start(model, path, device='cpu'):
+    """
+    Load only the model weights from `path` (e.g. the stage-1 best model when
+    starting stage 2). Returns True if weights were loaded.
+    """
+    if not path or not os.path.exists(path):
+        return False
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    state = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    load_model_state_dict(model, state)
+    return True
+
+
 def get_model_state_dict(model):
     """Get state dict, handling compiled models."""
     if hasattr(model, '_orig_mod'):
@@ -104,56 +137,45 @@ def load_model_state_dict(model, state_dict):
     else:
         model.load_state_dict(state_dict)
 
+def _config_class_from_path(config_path):
+    spec = importlib.util.spec_from_file_location("baseline_config", config_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Config
+
+
+def _instantiate_saved_model(saved_config):
+    head_kind = getattr(saved_config, "HEAD_KIND", "outcome")
+    if saved_config.MODEL_TYPE == "transformer":
+        if head_kind == "value_policy":
+            return LegacyValueTransformer(config=saved_config)
+        return BackgammonTransformer(config=saved_config)
+    if saved_config.MODEL_TYPE == "cnn":
+        return BackgammonCNN(config=saved_config)
+    raise ValueError(f"Unknown MODEL_TYPE in baseline: {saved_config.MODEL_TYPE}")
+
+
 def build_model_from_config_path(config_path, device):
     """Instantiate a model using the architecture defined in a saved config file."""
-    spec = importlib.util.spec_from_file_location("baseline_config", config_path)
-    base_cfg_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(base_cfg_mod)
-    BConfig = base_cfg_mod.Config
-
-    if BConfig.MODEL_TYPE == "transformer":
-        model = BackgammonTransformer(config=BConfig)
-    elif BConfig.MODEL_TYPE == "cnn":
-        model = BackgammonCNN(config=BConfig)
-    else:
-        raise ValueError(f"Unknown MODEL_TYPE in baseline: {BConfig.MODEL_TYPE}")
-
-    return model.to(device)
+    saved_config = _config_class_from_path(config_path)
+    return _instantiate_saved_model(saved_config).to(device)
 
 
 def load_model_with_config(config_path, model_path, device):
     """
-    Dynamically loads a baseline model using its own saved config file.
-    This ensures architecture compatibility even if the main Config has changed.
+    Load a frozen baseline using its own config file so an older architecture
+    still works after the training Config has changed.
     """
-    # 1. Dynamically load the baseline's Config class
-    spec = importlib.util.spec_from_file_location("baseline_config", config_path)
-    base_cfg_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(base_cfg_mod)
-    BConfig = base_cfg_mod.Config
+    model = build_model_from_config_path(config_path, device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
-    # 2. Instantiate the correct model type based on the baseline's config
-    if BConfig.MODEL_TYPE == "transformer":
-        model = BackgammonTransformer(config=BConfig)
-    elif BConfig.MODEL_TYPE == "cnn":
-        model = BackgammonCNN(config=BConfig)
-    else:
-        raise ValueError(f"Unknown MODEL_TYPE in baseline: {BConfig.MODEL_TYPE}")
-
-    model = model.to(device)
-
-    # 3. Load the checkpoint
-    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
-    
-    # Handle full checkpoints (dict) vs raw state_dicts
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
-        elo = checkpoint.get('elo', 200)
+        elo = checkpoint.get('elo', Config.INITIAL_ELO)
     else:
         state_dict = checkpoint
-        elo = 200
+        elo = Config.INITIAL_ELO
 
-    model.load_state_dict(state_dict)
+    load_model_state_dict(model, state_dict)
     model.eval()
-    
     return model, elo
