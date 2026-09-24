@@ -724,8 +724,10 @@ def start_http_server():
 
 
 async def main():
+    candidates = [p for p in default_model_paths(REPO_ROOT) if os.path.exists(p)]
+    chosen = candidates[0] if candidates else "(none found)"
     print(f"🎲 Starting Backgammon AI WebSocket on ws://{HOST}:{PORT}")
-    print(f"📁 Model path: {MODEL_PATH}")
+    print(f"📁 Model path: {chosen}")
     print(f"🖥️  Device: {DEVICE}")
     
     http_thread = threading.Thread(target=start_http_server, daemon=True)
