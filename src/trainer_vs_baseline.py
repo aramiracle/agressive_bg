@@ -237,13 +237,13 @@ def train():
         if new_phase != phase:
             if new_phase == "vs_baseline":
                 tqdm.write(
-                    f">>> Elo under baseline "
+                    f">>> Best under baseline "
                     f"(cur {current_elo:.0f}, best {best_elo:.0f}, base {baseline_elo:.0f}). "
                     f"Collecting vs baseline."
                 )
             elif phase == "vs_baseline":
                 tqdm.write(
-                    f">>> Elo at or above baseline "
+                    f">>> Best at or above baseline "
                     f"(cur {current_elo:.0f}, best {best_elo:.0f}, base {baseline_elo:.0f}). "
                     f"Collecting vs best."
                 )

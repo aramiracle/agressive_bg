@@ -133,8 +133,7 @@ def train():
         except:
             tqdm.write(f"   Failed to load equity table, using fresh initialization")
 
-    # Frozen baseline: eval mixes it in while best is weaker, and training
-    # games do too while either rating is still under it.
+    # Frozen baseline: eval and training games use it only while best is weaker.
     baseline_model = None
     baseline_equity_table = None
     baseline_elo   = Config.INITIAL_ELO

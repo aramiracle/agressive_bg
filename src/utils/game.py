@@ -190,6 +190,8 @@ def _play_single_game(
         # MAX_GAME_MOVES hit with nobody borne off (random nets can loop).
         winner = _winner_by_pips(game)
         total_points = _single_win_points(game)
+        if game.crawford_active:
+            game.crawford_used = True
     return winner, total_points, history, stats, None
 
 

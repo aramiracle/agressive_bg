@@ -206,21 +206,21 @@ def evaluate_vs_opponent(args):
     return wins, num_games
 
 
-def plays_against_baseline(has_baseline, current_elo, best_elo, baseline_elo):
+def plays_against_baseline(has_baseline, _current_elo, best_elo, baseline_elo):
     """
     Whether this iteration's training games should face the frozen baseline.
 
-    Eval already splits onto the baseline while best is below it. Collection
-    follows that, and also while the running rating is below it, so a later
-    drop turns baseline games back on. Matching the baseline is enough to
-    stop; there is no separate latch.
+    Eval already splits onto the baseline while best_model is below it.
+    Collection follows that published rating only. The running rating lags
+    on failed gates and, with K=1, does not catch up on a pass, so it must
+    not abandon self-play while the weights are still the champion.
 
     Returns:
-        True when a baseline is loaded and either rating is still under it.
+        True when a baseline is loaded and best_model is still under it.
     """
     if not has_baseline:
         return False
-    return current_elo < baseline_elo or best_elo < baseline_elo
+    return best_elo < baseline_elo
 
 
 def split_eval_games(total_games, best_elo, baseline_elo, has_baseline):

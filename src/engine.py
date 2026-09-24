@@ -709,7 +709,12 @@ class BackgammonGame:
         if self.cube >= limit:
             return False
 
-        # 4. Owner Check
+        # 4. The roll is already out. A double is offered before rolling,
+        #    and the opening roll is played as rolled.
+        if self.dice:
+            return False
+
+        # 5. Owner Check
         return self.cube_owner == 0 or self.cube_owner == self.turn
 
     def apply_double(self):

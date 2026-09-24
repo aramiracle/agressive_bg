@@ -194,6 +194,14 @@ def run_regression_suite():
     g7.match_target = 7
     g7.set_match_scores(0, 0)
     all_ok &= check(g7.can_double(), "A4: 7-point opening can double", "cube blocked at 7-pt 0-0")
+    g7.roll_opening()
+    all_ok &= check(not g7.can_double() and g7.must_play_dice(),
+                    "opening roll is played; the cube waits until the next turn",
+                    "cube offered with the opening dice already rolled")
+    g7.switch_turn()
+    all_ok &= check(g7.can_double(),
+                    "next turn can double before rolling",
+                    "cube stayed closed after the opening roll was played")
     Config.CUBE_ENABLED = old_cube
     Config.MATCH_TARGET = old_target
 
@@ -214,9 +222,9 @@ def run_regression_suite():
                     "promotion rates the new best from the champion it beat (520.7 -> 522.7)",
                     f"promoted elo {raised}")
 
-    all_ok &= check(plays_against_baseline(True, 400.0, 600.0, 500.0),
-                    "running elo under baseline enables training vs baseline",
-                    "running elo under baseline stayed on self-play")
+    all_ok &= check(not plays_against_baseline(True, 400.0, 600.0, 500.0),
+                    "a lagged running elo keeps training on self-play while best is ahead",
+                    "lagged running elo switched training onto the baseline")
     all_ok &= check(plays_against_baseline(True, 600.0, 400.0, 500.0),
                     "best elo under baseline enables training vs baseline",
                     "best elo under baseline stayed on self-play")
