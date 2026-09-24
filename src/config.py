@@ -81,7 +81,7 @@ class Config:
     EXPLORE_TURNS = 8
     EXPLORE_TEMPERATURE = 0.05
     TD_LAMBDA = 0.7
-    MAX_GAME_MOVES = 400
+    MAX_GAME_MOVES = 1000
 
     # Cube. Epsilon is the random-action rate; cube_weight scales the cube loss.
     CUBE_CURRICULUM_STAGES = [
@@ -97,7 +97,7 @@ class Config:
     CUBE_ME_TEMPERATURE = 2.0
 
     # Optimisation
-    MATCHES_PER_ITERATION = 8
+    MATCHES_PER_ITERATION = 40
     TRAIN_UPDATES_PER_ITER = 200
     BATCH_SIZE = 512 if torch.cuda.is_available() else 256
     BUFFER_SIZE = _env_int("BG_BUFFER_SIZE", 50000 if STAGE == 1 else 300000)

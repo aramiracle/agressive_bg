@@ -280,33 +280,34 @@ def evaluate_combined(model, best_model, baseline_model,
     wins_vs_baseline = 0.0
     wins_vs_best     = 0.0
 
+    def _block(label, n, elo, wins):
+        rate = wins / n if n else 0.0
+        tqdm.write(f"  {label:<12} {int(wins):>3}/{n:<3} {rate:>6.1%}   elo {elo:.0f}")
+
     if n_vs_baseline > 0:
-        tqdm.write(
-            f"   ELO eval: {n_vs_baseline} games vs baseline (ELO {baseline_elo:.0f})"
-        )
+        tqdm.write(f"  vs baseline   {n_vs_baseline} matches   elo {baseline_elo:.0f}")
         wins_vs_baseline, _ = evaluate_vs_opponent(
             (None, model, baseline_model, n_vs_baseline, device, num_processes,
              baseline_config_path, equity_table_state)
         )
+        _block("baseline", n_vs_baseline, baseline_elo, wins_vs_baseline)
 
     if n_vs_best > 0:
-        tqdm.write(
-            f"   ELO eval: {n_vs_best} games vs best (ELO {best_elo:.0f})"
-        )
+        tqdm.write(f"  vs best       {n_vs_best} matches   elo {best_elo:.0f}")
         wins_vs_best, _ = evaluate_vs_opponent(
             (None, model, best_model, n_vs_best, device, num_processes, None, equity_table_state)
         )
+        _block("best", n_vs_best, best_elo, wins_vs_best)
 
     played = n_vs_best + n_vs_baseline
     total_wins = wins_vs_baseline + wins_vs_best
     opponent_elo = mixed_opponent_elo(
         best_elo, baseline_elo, n_vs_best, n_vs_baseline,
     )
-
+    rate = total_wins / played if played else 0.0
     tqdm.write(
-        f"   ELO eval total: {int(total_wins)}/{played} wins "
-        f"| opponent_elo={opponent_elo:.1f} "
-        f"(baseline×{n_vs_baseline} + best×{n_vs_best})"
+        f"  {'total':<12} {int(total_wins):>3}/{played:<3} {rate:>6.1%}   "
+        f"opp elo {opponent_elo:.0f}"
     )
 
     return total_wins, played, opponent_elo, wins_vs_best, n_vs_best

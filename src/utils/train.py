@@ -5,6 +5,24 @@ from src.utils.distribution import smooth_distribution, jensen_shannon_loss_batc
 from src.utils.outcome import money_weights
 
 
+def cube_stats_text(stats):
+    """One line of collection counts: games, doubles, take/drop, equity at the decision."""
+    games = int(stats.get("games", 0))
+    doubles = int(stats.get("doubles", 0))
+    takes = int(stats.get("takes", 0))
+    drops = int(stats.get("drops", 0))
+    if games <= 0:
+        return "no games"
+    parts = [f"games {games}", f"doubles {doubles / games:.2f}/game"]
+    if doubles > 0:
+        parts.append(f"take {takes / doubles:.0%}")
+        parts.append(f"drop {drops / doubles:.0%}")
+        parts.append(f"eq@double {stats.get('sum_val_double', 0.0) / doubles:+.2f}")
+        if drops:
+            parts.append(f"eq@drop {stats.get('sum_val_drop', 0.0) / drops:+.2f}")
+    return "  ".join(parts)
+
+
 def train_batch(model, optimizer, replay_buffer, batch_size, device, scaler):
     """
     One optimisation step. Transitions are

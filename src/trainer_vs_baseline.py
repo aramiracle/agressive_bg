@@ -32,7 +32,7 @@ from src.utils.checkpoint import (
 from src.utils.elo import (
     evaluate_combined, update_elo, passes_gate, promoted_elo, plays_against_baseline,
 )
-from src.utils.train import train_batch
+from src.utils.train import cube_stats_text, train_batch
 from src.utils.game import play_self_play_match, play_vs_baseline_match
 from src.replay_buffer import get_replay_buffer
 from src.utils.match_equity import MatchEquityTable
@@ -167,7 +167,7 @@ def train():
     current_elo = cp_latest['elo']  if cp_latest else Config.INITIAL_ELO
 
     if cp_latest is None and warm_start(model, Config.INIT_FROM, device):
-        tqdm.write(f"   Warm-started weights from {Config.INIT_FROM}")
+        tqdm.write(f"load  warm start  {Config.INIT_FROM}")
 
     cp_best  = load_checkpoint(best_path, best_model, None, device)
     best_elo = cp_best['elo'] if cp_best else current_elo
@@ -180,9 +180,9 @@ def train():
     if os.path.exists(equity_path):
         try:
             equity_table.load(equity_path)
-            tqdm.write(f"   Loaded match equity table")
-        except:
-            tqdm.write(f"   Using fresh equity table")
+            tqdm.write(f"load  equity table  {equity_path}")
+        except Exception:
+            tqdm.write("load  equity table  fresh (checkpoint unreadable)")
 
     baseline_path, baseline_config_path, baseline_equity_path = baseline_artifact_paths()
 
@@ -197,13 +197,13 @@ def train():
                 baseline_config_path, baseline_path, device
             )
             use_baseline = True
-            tqdm.write(f"   Baseline loaded: {baseline_path} (ELO {baseline_elo:.0f})")
+            tqdm.write(f"load  baseline  elo {baseline_elo:.0f}  {baseline_path}")
         except Exception as e:
-            tqdm.write(f"   Baseline load failed ({e}), running pure self-play.")
+            tqdm.write(f"load  baseline  failed ({e})  pure self-play")
             baseline_model = None
             baseline_elo   = Config.INITIAL_ELO
     else:
-        tqdm.write(f"   No baseline at {baseline_path}, running pure self-play.")
+        tqdm.write(f"load  baseline  none at {baseline_path}")
 
     if use_baseline:
 
@@ -213,17 +213,29 @@ def train():
         if os.path.exists(baseline_equity_path):
             try:
                 baseline_equity_table.load(baseline_equity_path)
-                tqdm.write(f"   Loaded baseline match equity table")
+                tqdm.write("load  baseline equity")
             except Exception:
-                tqdm.write(f"   Using fresh equity table for baseline")
+                tqdm.write("load  baseline equity  fresh")
 
     replay_buffer = get_replay_buffer(Config.BUFFER_SIZE, prioritized=True, device=device)
     phase = None
 
-    print(
-        f"\n🎮 Start vs Baseline: stage={Config.STAGE} "
-        f"target={Config.MATCH_TARGET} cube={Config.CUBE_ENABLED} "
-        f"CurELO={current_elo:.0f} BaseELO={baseline_elo:.0f}"
+    tqdm.write("")
+    tqdm.write(
+        f"train  stage {Config.STAGE}  match to {Config.MATCH_TARGET}  "
+        f"cube {'on' if Config.CUBE_ENABLED else 'off'}  "
+        f"device {Config.DEVICE}"
+    )
+    tqdm.write(
+        f"       step {train_step}  elo {current_elo:.0f}  best {best_elo:.0f}  "
+        f"baseline {baseline_elo:.0f}"
+    )
+    tqdm.write(
+        f"       matches {Config.MATCHES_PER_ITERATION}  "
+        f"updates {Config.TRAIN_UPDATES_PER_ITER}  "
+        f"batch {Config.BATCH_SIZE}  buffer {Config.BUFFER_SIZE}  "
+        f"eval every {Config.ELO_EVAL_INTERVAL}  "
+        f"gate {Config.GATE_GAMES} > {Config.GATE_WIN_RATE:.0%}"
     )
     pbar = tqdm(total=Config.TRAIN_STEPS, initial=train_step, desc="Training")
 
@@ -237,15 +249,13 @@ def train():
         if new_phase != phase:
             if new_phase == "vs_baseline":
                 tqdm.write(
-                    f">>> Best under baseline "
-                    f"(cur {current_elo:.0f}, best {best_elo:.0f}, base {baseline_elo:.0f}). "
-                    f"Collecting vs baseline."
+                    f"[{train_step}] phase    vs baseline  "
+                    f"elo {current_elo:.0f}  best {best_elo:.0f}  baseline {baseline_elo:.0f}"
                 )
             elif phase == "vs_baseline":
                 tqdm.write(
-                    f">>> Best at or above baseline "
-                    f"(cur {current_elo:.0f}, best {best_elo:.0f}, base {baseline_elo:.0f}). "
-                    f"Collecting vs best."
+                    f"[{train_step}] phase    vs best  "
+                    f"elo {current_elo:.0f}  best {best_elo:.0f}  baseline {baseline_elo:.0f}"
                 )
             phase = new_phase
 
@@ -259,14 +269,14 @@ def train():
                       'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
 
         if num_self > 0:
-            tqdm.write(f"--- Epoch Phase: Collecting {num_self} self-play games ---")
+            tqdm.write(f"[{train_step}] collect  {num_self} self-play")
             stats_self = parallel_collect(
                 "self", model, None, equity_table, replay_buffer, num_self, device, cube_epsilon,
             )
 
         if opponent is not None and num_opponent > 0:
             opponent_name = "baseline" if phase == "vs_baseline" else "best"
-            tqdm.write(f"--- Epoch Phase: Collecting {num_opponent} games vs {opponent_name} ---")
+            tqdm.write(f"[{train_step}] collect  {num_opponent} vs {opponent_name}")
             opp_equity = baseline_equity_table if phase == "vs_baseline" else None
             stats_opp = parallel_collect(
                 "baseline", model, opponent, equity_table, replay_buffer, num_opponent, device, cube_epsilon,
@@ -274,37 +284,54 @@ def train():
                 baseline_equity_table=opp_equity,
             )
 
+        merged = {
+            key: stats_self[key] + stats_opp[key]
+            for key in stats_self
+        }
+        tqdm.write(
+            f"           done  {cube_stats_text(merged)}  buffer {len(replay_buffer)}"
+        )
         if len(replay_buffer) < Config.BATCH_SIZE:
+            tqdm.write(
+                f"           wait  buffer {len(replay_buffer)}/{Config.BATCH_SIZE}"
+            )
             continue
 
         model.train()
         avg_loss = 0.0
-        tqdm.write(f"--- Epoch Phase: Training on {Config.TRAIN_UPDATES_PER_ITER} batches ---")
+        avg_gnorm = 0.0
+        step_before = train_step
+        tqdm.write(
+            f"[{train_step}] train    {Config.TRAIN_UPDATES_PER_ITER} updates  "
+            f"cube_w {cube_weight:.2f}  eps {cube_epsilon:.3f}"
+        )
         for _ in range(Config.TRAIN_UPDATES_PER_ITER):
             Config.CUBE_LOSS_WEIGHT = cube_weight
             loss, gnorm = train_batch(
                 model, optimizer, replay_buffer, Config.BATCH_SIZE, device, scaler
             )
             avg_loss   += loss
+            avg_gnorm  += gnorm
             train_step += 1
             pbar.update(1)
         avg_loss /= Config.TRAIN_UPDATES_PER_ITER
+        avg_gnorm /= Config.TRAIN_UPDATES_PER_ITER
+        tqdm.write(
+            f"           done  loss {avg_loss:.4f}  grad {avg_gnorm:.3f}  "
+            f"step {step_before} -> {train_step}  "
+            f"elo {current_elo:.0f}  best {best_elo:.0f}"
+        )
 
-        s_d  = stats_self['doubles']        + stats_opp['doubles']
-        s_g  = stats_self['games']          + stats_opp['games']
-        s_t  = stats_self['takes']          + stats_opp['takes']
-        s_vd = stats_self['sum_val_double'] + stats_opp['sum_val_double']
-        n_d  = max(1, s_d)
-        n_g  = max(1, s_g)
-
+        n_d = max(1, merged['doubles'])
+        n_g = max(1, merged['games'])
         pbar.set_postfix({
             'L':    f'{avg_loss:.3f}',
             'ELO':  f'{current_elo:.0f}',
-            'Cube': f'D/G:{s_d/n_g:.1f} Tk:{s_t/n_d:.0%} VD:{s_vd/n_d:.2f}'
+            'Cube': f'D/G:{merged["doubles"]/n_g:.1f} Tk:{merged["takes"]/n_d:.0%}'
         })
 
         if train_step % Config.ELO_EVAL_INTERVAL == 0:
-            tqdm.write("--- Epoch Phase: Evaluating (Interval Reached) ---")
+            tqdm.write(f"[{train_step}] eval     {Config.GATE_GAMES} matches")
             model.eval()
             best_model.eval()
 
@@ -327,21 +354,19 @@ def train():
                 old_elo = best_elo
                 current_elo = promoted_elo(best_elo, wins_vs_best, n_vs_best)
                 best_elo = current_elo
+            decision = "promoted" if promoted else "kept best"
             tqdm.write(
-                f"   -> Eval: {int(total_wins)}/{total_games} wins | "
-                f"opp_elo={opponent_elo:.0f} | "
-                f"ELO: {old_elo:.0f} -> {current_elo:.0f}"
+                f"  rating       {old_elo:.1f} -> {current_elo:.1f} "
+                f"({current_elo - old_elo:+.1f})   opp elo {opponent_elo:.0f}"
             )
-
             tqdm.write(
-                f"   -> Gate: {gate_rate:.1%} vs best "
-                f"(threshold > {Config.GATE_WIN_RATE:.1%}) -> "
-                f"{'PROMOTE' if promoted else 'keep best'}"
+                f"  gate         {gate_rate:.1%} vs best   "
+                f"need > {Config.GATE_WIN_RATE:.1%}   {decision}  best {best_elo:.0f}"
             )
             if promoted:
                 load_model_state_dict(best_model, get_model_state_dict(model))
                 save_checkpoint(model, optimizer, train_step, best_elo, avg_loss, best_path)
-                tqdm.write(f"  --> New Best Model Saved (ELO {best_elo:.0f})")
+                tqdm.write(f"  saved        best  elo {best_elo:.0f}  step {train_step}")
 
             save_checkpoint(model, optimizer, train_step, current_elo, avg_loss, latest_path)
             equity_table.save(equity_path)
