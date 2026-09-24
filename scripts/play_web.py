@@ -48,6 +48,7 @@ class BackgammonServer:
         self.winner = 0
         self.waiting_for_cube_decision = False
         self.has_rolled = False  # Track if current player has rolled
+        self.opening_pending = False
         self.match_target = Config.MATCH_TARGET
         
         # Ensure engine knows the config target
@@ -206,11 +207,16 @@ class BackgammonServer:
     # =====================
     def new_game(self):
         self.game.reset()
+        dice = self.game.roll_opening()
         self.game_over = False
         self.winner = 0
-        self.has_rolled = False
+        self.has_rolled = True
+        self.opening_pending = True
+        who = "White" if self.game.turn == 1 else "Black"
         crawford_msg = " (Crawford Game!)" if self.game.crawford_active else ""
-        return self.serialize(f"New game started!{crawford_msg} Roll dice to begin.")
+        return self.serialize(
+            f"Opening roll {dice[0]}-{dice[1]}. {who} to play.{crawford_msg}"
+        )
     
     def new_match(self, target=None):
         if target is not None:
@@ -219,12 +225,17 @@ class BackgammonServer:
             
         self.game.match_scores = {1: 0, -1: 0}
         self.game.crawford_used = False
-        self.game.reset() 
-        
+        self.game.reset()
+        dice = self.game.roll_opening()
+
         self.game_over = False
         self.winner = 0
-        self.has_rolled = False
-        return self.serialize(f"New match started! First to {self.match_target} points.")
+        self.has_rolled = True
+        self.opening_pending = True
+        who = "White" if self.game.turn == 1 else "Black"
+        return self.serialize(
+            f"New match to {self.match_target}. Opening roll {dice[0]}-{dice[1]}. {who} to play."
+        )
     
     def _calculate_multiplier(self, winner):
         loser = -winner
@@ -307,7 +318,10 @@ class BackgammonServer:
             return self.serialize("Game is over")
         if not self.has_rolled:
             return self.serialize("Roll dice first!")
-        
+        if self.game.must_play_dice():
+            return self.serialize("You still have a legal move.")
+
+        self.opening_pending = False
         self.game.switch_turn()
         self.has_rolled = False
         
@@ -349,7 +363,8 @@ class BackgammonServer:
         
         if not move_exists:
             return self.serialize(f"Illegal move: {src} -> {dst}")
-        
+
+        self.opening_pending = False
         try:
             # Execute the move (engine should handle its own format)
             winner, points = self.game.step_atomic(chosen_move)
@@ -379,7 +394,7 @@ class BackgammonServer:
         player = g.turn
         opponent = -player
 
-        if self.has_rolled:
+        if self.has_rolled and not self.opening_pending:
             return False
 
         if g.crawford_active:
@@ -405,6 +420,7 @@ class BackgammonServer:
         
         self.waiting_for_cube_decision = True
         self.game.turn *= -1
+        self.game.cube_offered = True
         
         response = self.serialize("Double offered! Take or Pass?")
         await websocket.send(json.dumps(response))
@@ -427,10 +443,11 @@ class BackgammonServer:
             my_score = self.game.match_scores.get(self.game.turn, 0)
             opp_score = self.game.match_scores.get(-self.game.turn, 0)
             
-            take_choice, _, _ = get_learned_cube_decision(
-                self.model, self.game, DEVICE, my_score, opp_score, 
-                equity_table=self.equity_table,  # Pass the table here
-                stochastic=False
+            take_choice, _, _, _ = get_learned_cube_decision(
+                self.model, self.game, DEVICE, my_score, opp_score,
+                equity_table=self.equity_table,
+                stochastic=False,
+                is_take=True,
             )
             choice = (take_choice == 1)
         
@@ -444,6 +461,7 @@ class BackgammonServer:
         if not self.waiting_for_cube_decision:
             return self.serialize("No double offered.")
 
+        self.game.cube_offered = False
         self.game.turn *= -1
         if not self.game.apply_double():
             self.waiting_for_cube_decision = False
@@ -457,6 +475,7 @@ class BackgammonServer:
         if not self.waiting_for_cube_decision:
             return self.serialize("No double offered.")
 
+        self.game.cube_offered = False
         self.game.turn *= -1
         winner, points = self.game.handle_cube_refusal()
         
@@ -491,10 +510,8 @@ class BackgammonServer:
         opp_score = self.game.match_scores.get(-self.game.turn, 0)
 
         # 1. AI Doubling Logic (Pre-Roll)
-        if not self.has_rolled and self.can_offer_double():
-            # Query model for doubling decision
-            # Returns: action (0/1), probs, value_est
-            double_action, _, _ = get_learned_cube_decision(
+        if self.can_offer_double() and (not self.has_rolled or self.opening_pending):
+            double_action, _, _, _ = get_learned_cube_decision(
                 self.model, self.game, DEVICE, my_score, opp_score,
                 equity_table=self.equity_table, stochastic=False
             )
@@ -566,6 +583,7 @@ class BackgammonServer:
 
         # 4. End AI Turn
         if not self.game_over:
+            self.opening_pending = False
             self.game.switch_turn()
             self.has_rolled = False
             turn_name = "White" if self.game.turn == 1 else "Black"
@@ -584,11 +602,17 @@ class BackgammonServer:
             return self.serialize("Connected to Backgammon AI")
 
         if t == "new_game":
-            return self.new_game()
-        
+            await websocket.send(json.dumps(self.new_game()))
+            if self.is_ai_turn() and not self.game_over:
+                await self.ai_move(websocket)
+            return None
+
         if t == "new_match":
             target = msg.get("target", None)
-            return self.new_match(target)
+            await websocket.send(json.dumps(self.new_match(target)))
+            if self.is_ai_turn() and not self.game_over:
+                await self.ai_move(websocket)
+            return None
 
         if t == "roll":
             result = self.roll()

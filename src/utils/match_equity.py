@@ -31,6 +31,7 @@ class MatchEquityTable:
         self.match_target  = match_target if match_target is not None else Config.MATCH_TARGET
         self.learning_rate = learning_rate
         self.equity_table  = {}
+        self._observations = []
         self._initialize_table()
 
     # ------------------------------------------------------------------
@@ -71,13 +72,18 @@ class MatchEquityTable:
     # ------------------------------------------------------------------
     # Update — ONE PERSPECTIVE PER CALL
     # ------------------------------------------------------------------
-    def update_from_match(self, scores_seen_my_perspective, i_won):
+    def update_from_match(self, scores_seen_my_perspective, i_won, record=True):
         """
         Update equity table for ONE player's perspective.
 
         Call TWICE per match — once per player — with the correct i_won flag.
         Do NOT mix both players' tuples in the same call.
+
+        record=True keeps the observation so a parent process can replay it
+        once. Workers pass record=True; the parent replays with record=False.
         """
+        if record:
+            self._observations.append((list(scores_seen_my_perspective), bool(i_won)))
         target_equity = 1.0 if i_won else 0.0
         for my_score, opp_score in scores_seen_my_perspective:
             key = (my_score, opp_score)
@@ -85,6 +91,12 @@ class MatchEquityTable:
                 continue
             current = self.equity_table[key]
             self.equity_table[key] += self.learning_rate * (target_equity - current)
+
+    def pop_observations(self):
+        """Return recorded match updates and clear the log."""
+        found = self._observations
+        self._observations = []
+        return found
 
     # ------------------------------------------------------------------
     # Value target — what the value head trains on

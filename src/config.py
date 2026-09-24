@@ -38,9 +38,12 @@ class Config:
     BOARD_SEQ_LEN = 28
     EMBED_VOCAB_SIZE = 31
     EMBED_OFFSET = 15
-    # ctx = [cube_owner (canonical: +1 mine, -1 opp, 0 centred), cube / MAX_CUBE,
-    #        my_score / target, opp_score / target, crawford_active]
+    # ctx = [cube_owner, cube / MAX_CUBE, my_score / target, opp_score / target,
+    #        crawford_active]
+    # cube_owner is +1 mine, -1 opp, 0 centred. CUBE_OFFERED (2) is reserved
+    # for the responder to a double: that side will not roll.
     CONTEXT_SIZE = 5
+    CUBE_OFFERED = 2.0
     MAX_CUBE = 64.0
 
     INITIAL_SETUP = {

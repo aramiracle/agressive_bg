@@ -21,7 +21,13 @@ from src.utils.train import train_batch
 from src.utils.outcome import flip, money_equity, terminal_distribution, race_win_probability
 from src.utils.game import _assign_targets, play_self_play_match
 from src.utils.match_equity import MatchEquityTable
-from src.utils.elo import passes_gate
+from src.utils.elo import (
+    mixed_opponent_elo, passes_gate, play_single_game as eval_play_game,
+    plays_against_baseline, promoted_elo, split_eval_games, update_elo,
+)
+from src.utils.cube import cube_decision_gain
+from src.utils.outcome import match_equity_from_outcomes
+from src.trainer_vs_baseline import split_matches
 from src.replay_buffer import SimpleReplayBuffer
 
 
@@ -199,6 +205,50 @@ def run_regression_suite():
     all_ok &= check(promote is True, "E3: 22/40 > 52.5% promotes", "did not promote above 52.5%")
     Config.GATE_WIN_RATE = old_rate
 
+    lagged = update_elo(511.0, 520.7, 22, 40)
+    all_ok &= check(round(lagged) == 514 and max(520.7, lagged) == 520.7,
+                    "22/40 from a lagged 511 stays under the 521 champion",
+                    f"lagged rating {lagged} would have moved the champion")
+    raised = promoted_elo(520.7, 22, 40)
+    all_ok &= check(abs(raised - 522.7) < 1e-9,
+                    "promotion rates the new best from the champion it beat (520.7 -> 522.7)",
+                    f"promoted elo {raised}")
+
+    all_ok &= check(plays_against_baseline(True, 400.0, 600.0, 500.0),
+                    "running elo under baseline enables training vs baseline",
+                    "running elo under baseline stayed on self-play")
+    all_ok &= check(plays_against_baseline(True, 600.0, 400.0, 500.0),
+                    "best elo under baseline enables training vs baseline",
+                    "best elo under baseline stayed on self-play")
+    all_ok &= check(not plays_against_baseline(True, 500.0, 500.0, 500.0),
+                    "matching baseline elo collects against best",
+                    "equal elo still played the baseline")
+    all_ok &= check(not plays_against_baseline(False, 100.0, 100.0, 500.0),
+                    "no baseline loaded stays off baseline games",
+                    "baseline games enabled without a baseline")
+
+    n_best, n_base = split_eval_games(40, best_elo=100.0, baseline_elo=500.0, has_baseline=True)
+    all_ok &= check((n_best, n_base) == (20, 20),
+                    "eval splits 20/20 vs best/baseline while best is weaker",
+                    f"split was {n_best}/{n_base}")
+    n_best, n_base = split_eval_games(40, best_elo=500.0, baseline_elo=500.0, has_baseline=True)
+    all_ok &= check((n_best, n_base) == (40, 0),
+                    "eval is all vs best once best matches baseline",
+                    f"split was {n_best}/{n_base}")
+    n_best, n_base = split_eval_games(40, best_elo=100.0, baseline_elo=500.0, has_baseline=False)
+    all_ok &= check((n_best, n_base) == (40, 0),
+                    "eval is all vs best when no baseline is loaded",
+                    f"split was {n_best}/{n_base}")
+    avg_elo = mixed_opponent_elo(100.0, 500.0, 20, 20)
+    all_ok &= check(avg_elo == 300.0,
+                    "opponent ELO is the game-weighted average (300)",
+                    f"opponent ELO {avg_elo}")
+    whites = sum(1 for i in range(20) if i % 2 == 0)
+    blacks = 20 - whites
+    all_ok &= check(whites == blacks == 10,
+                    "each 20-game block is 10 white / 10 black",
+                    f"color split {whites}W/{blacks}B")
+
     print("\n[legacy baseline adapter]")
     class TinyLegacyConfig:
         MODEL_TYPE = "transformer"
@@ -259,6 +309,64 @@ def run_regression_suite():
         f"stage1/stage2 AdamW checkpoint {ckpt_mb:.2f}MB < 15MB",
         f"checkpoint {ckpt_mb:.2f}MB exceeds 15MB",
     )
+
+    print("\n[10] Opening roll, cube price, collection, eval cap")
+    opener = BackgammonGame(train_mode=False)
+    for _ in range(30):
+        rolled = opener.roll_opening()
+        higher = 1 if rolled[0] > rolled[1] else -1
+        if rolled[0] == rolled[1] or opener.turn != higher or not opener.must_play_dice():
+            all_ok &= check(False, "", f"opening roll {rolled} turn {opener.turn}")
+            break
+    else:
+        all_ok &= check(True, "higher die opens and must play that roll", "opening roll")
+
+    _, plain = opener.get_vector(0, 0)
+    opener.cube_offered = True
+    _, offered = opener.get_vector(0, 0)
+    all_ok &= check(
+        float(plain[0]) != Config.CUBE_OFFERED and float(offered[0]) == Config.CUBE_OFFERED,
+        "a take is encoded differently from an on-roll double",
+        f"owner features {float(plain[0])} vs {float(offered[0])}",
+    )
+    opener.fast_restore(opener.fast_save())
+    all_ok &= check(opener.cube_offered, "cube-offered survives save/restore", "snapshot dropped the flag")
+    all_ok &= check(model.embedding.padding_idx is None,
+                    "15 opposing checkers is a trainable token",
+                    "embedding still treats token 0 as padding")
+
+    old_target, old_train = Config.MATCH_TARGET, Config.TRAIN_MODE
+    Config.MATCH_TARGET, Config.TRAIN_MODE = 7, False
+    try:
+        table7 = MatchEquityTable(match_target=7)
+        lose_bg = torch.zeros(6)
+        lose_bg[5] = 1.0
+        gain, _ = cube_decision_gain(lose_bg, 0, 0, 1, table7, is_take=False)
+        now = match_equity_from_outcomes(lose_bg, 0, 0, 1, table7)
+        doubled = match_equity_from_outcomes(lose_bg, 0, 0, 2, table7)
+        all_ok &= check(
+            gain < 0 and abs(gain - (doubled - now)) < 1e-6,
+            f"certain backgammon loss is a bad double ({gain:+.3f})",
+            f"cube price {gain:+.3f}, doubled-now {doubled - now:+.3f}",
+        )
+    finally:
+        Config.MATCH_TARGET, Config.TRAIN_MODE = old_target, old_train
+
+    all_ok &= check(split_matches(4, 16) == [1, 1, 1, 1] and sum(split_matches(10, 4)) == 10,
+                    "workers play exactly the requested number of matches",
+                    f"split 4/16={split_matches(4, 16)} 10/4={split_matches(10, 4)}")
+
+    class _Reset:
+        def reset(self):
+            pass
+
+    capped_game = BackgammonGame(train_mode=False)
+    cap_winner, cap_points = eval_play_game(
+        capped_game, None, None, _Reset(), _Reset(), True, "cpu", 0, 0, max_moves=0
+    )
+    all_ok &= check(cap_winner in (1, -1) and cap_points == 1,
+                    "eval move cap names a one-point winner",
+                    f"eval cap returned {(cap_winner, cap_points)}")
 
     print("\n" + "=" * 40 + ("\n🏁 ALL CHECKS PASSED" if all_ok else "\n🏁 SOME CHECKS FAILED"))
     return all_ok

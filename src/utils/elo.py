@@ -6,6 +6,7 @@ from tqdm import tqdm
 from src.config import Config
 from src.search import Searcher
 from src.engine import BackgammonGame
+from src.utils.game import _single_win_points, _winner_by_pips
 from src.utils.match_equity import MatchEquityTable
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -29,6 +30,20 @@ def update_elo(current_elo, opponent_elo, wins, total_games):
     return current_elo + delta * total_games
 
 
+def promoted_elo(champion_elo, wins_vs_champion, games_vs_champion):
+    """
+    Rating to store when a candidate replaces the champion.
+
+    The running rating falls on failed gates and, with K=1, a gate pass
+    (just over 53%) cannot close that gap. max(champion, running) then
+    saves the new weights under the old rating. After promotion both
+    checkpoints are the same weights, and those weights just played
+    `games_vs_champion` against the previous champion, so the published
+    rating is the champion rating updated by that match.
+    """
+    return update_elo(champion_elo, champion_elo, wins_vs_champion, games_vs_champion)
+
+
 def get_cube_action(model, game, device, my_score=0, opp_score=0):
     """Consult the model's learned cube policy."""
     board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
@@ -47,9 +62,11 @@ def play_single_game(game, model_a, model_b, searcher_a, searcher_b, a_is_white,
                           score_b if a_is_white else score_a)
     searcher_a.reset()
     searcher_b.reset()
+    game.roll_opening()
 
     move_count = 0
     while move_count < max_moves:
+        move_count += 1
         winner, points = game.check_win()
         if winner != 0: break
 
@@ -64,7 +81,9 @@ def play_single_game(game, model_a, model_b, searcher_a, searcher_b, a_is_white,
         if game.can_double():
             if get_cube_action(active_model, game, device, p1_score, p2_score) == 1:
                 game.switch_turn()
+                game.cube_offered = True
                 take_decision = get_cube_action(opp_model, game, device, p2_score, p1_score)
+                game.cube_offered = False
                 game.switch_turn()
 
                 if take_decision == 1:
@@ -74,16 +93,21 @@ def play_single_game(game, model_a, model_b, searcher_a, searcher_b, a_is_white,
                     return win_side, cube_val
 
         # ---------------- 2. Movement ----------------
-        game.roll_dice()
+        if not game.dice:
+            game.roll_dice()
         result = active_searcher.search(game, p1_score, p2_score, stochastic=False)
         if len(result) > 0:
             game.apply_turn(result.best().path)
-            move_count += 1
             if game.check_win()[0] != 0: break
 
         game.switch_turn()
 
     winner, points = game.check_win()
+    if winner == 0:
+        winner = _winner_by_pips(game)
+        points = _single_win_points(game)
+        if game.crawford_active:
+            game.crawford_used = True
     return winner, points
 
 
@@ -118,6 +142,7 @@ def _worker_play_match(args):
 
     score_a, score_b = 0, 0
     target = Config.MATCH_TARGET
+    # Even match_idx starts as white so each opponent block is 50/50 color.
     a_is_white = (match_idx % 2 == 0)
 
     while score_a < target and score_b < target:
@@ -134,13 +159,18 @@ def _worker_play_match(args):
         else:
             score_b += points
 
+        a_is_white = not a_is_white
+
     return 1.0 if score_a >= target else 0.0
 
 
 def evaluate_vs_opponent(args):
     """
     Play num_games matches of model_a vs model_b.
-    Returns (wins_by_model_a, num_games).
+
+    Color: even match_idx starts as white, odd as black, and sides swap
+    after every game inside a match so the candidate plays both colours
+    equally. Returns (wins_by_model_a, num_games).
     """
     (game, model_a, model_b, num_games, device, num_processes,
      model_b_config_path, equity_table_state) = args
@@ -176,19 +206,66 @@ def evaluate_vs_opponent(args):
     return wins, num_games
 
 
+def plays_against_baseline(has_baseline, current_elo, best_elo, baseline_elo):
+    """
+    Whether this iteration's training games should face the frozen baseline.
+
+    Eval already splits onto the baseline while best is below it. Collection
+    follows that, and also while the running rating is below it, so a later
+    drop turns baseline games back on. Matching the baseline is enough to
+    stop; there is no separate latch.
+
+    Returns:
+        True when a baseline is loaded and either rating is still under it.
+    """
+    if not has_baseline:
+        return False
+    return current_elo < baseline_elo or best_elo < baseline_elo
+
+
+def split_eval_games(total_games, best_elo, baseline_elo, has_baseline):
+    """
+    How many GATE_GAMES go to best vs baseline.
+
+    While best_model is weaker than the frozen baseline, split the eval
+    set in half so the rating is not only vs a weak clone of itself.
+    Once best catches up, every game is vs best_model.
+
+    Returns:
+        (n_vs_best, n_vs_baseline)
+    """
+    if has_baseline and best_elo < baseline_elo:
+        n_vs_baseline = total_games // 2
+        n_vs_best = total_games - n_vs_baseline
+        return n_vs_best, n_vs_baseline
+    return total_games, 0
+
+
+def mixed_opponent_elo(best_elo, baseline_elo, n_vs_best, n_vs_baseline):
+    """Average opponent ELO, weighted by games actually played against each."""
+    played = n_vs_best + n_vs_baseline
+    if played == 0:
+        return best_elo
+    return (best_elo * n_vs_best + baseline_elo * n_vs_baseline) / played
+
+
 def evaluate_combined(model, best_model, baseline_model,
                       best_elo, baseline_elo,
                       total_games, device, num_processes=None,
                       baseline_config_path=None, equity_table=None):
     """
-    E3 gating eval: play `total_games` matches against best_model
-    (trainers pass GATE_GAMES). Optional extra matches against an external
-    baseline contribute only to the mixed opponent ELO, never to the gate.
+    Play `total_games` matches (trainers pass GATE_GAMES).
+
+    When best_elo is below baseline_elo, half the matches are vs the
+    baseline and half vs best_model; otherwise all matches are vs best.
+    Each block alternates color so the candidate plays white and black
+    equally against both opponents. Opponent ELO is the game-weighted
+    average. The gate still uses only the games against best_model.
 
     Returns:
         total_wins    (float)  – accumulated wins across all games
         played        (int)    – games actually played
-        opponent_elo  (float)  – weighted ELO of the mixed opponent pool
+        opponent_elo  (float)  – weighted average ELO of opponents faced
         wins_vs_best  (float)  – wins in the games against best_model (gating)
         n_vs_best     (int)    – number of games against best_model
     """
@@ -196,15 +273,13 @@ def evaluate_combined(model, best_model, baseline_model,
     if num_processes is None:
         num_processes = mp.cpu_count()
 
-    # Gate always uses the full `total_games` vs best. Baseline matches are
-    # extra and do not reduce that count.
-    n_vs_best = total_games
-    n_vs_baseline = 0
+    n_vs_best, n_vs_baseline = split_eval_games(
+        total_games, best_elo, baseline_elo, baseline_model is not None,
+    )
 
     wins_vs_baseline = 0.0
     wins_vs_best     = 0.0
 
-    # --- Games vs baseline ---
     if n_vs_baseline > 0:
         tqdm.write(
             f"   ELO eval: {n_vs_baseline} games vs baseline (ELO {baseline_elo:.0f})"
@@ -214,7 +289,6 @@ def evaluate_combined(model, best_model, baseline_model,
              baseline_config_path, equity_table_state)
         )
 
-    # --- Games vs best model ---
     if n_vs_best > 0:
         tqdm.write(
             f"   ELO eval: {n_vs_best} games vs best (ELO {best_elo:.0f})"
@@ -223,25 +297,19 @@ def evaluate_combined(model, best_model, baseline_model,
             (None, model, best_model, n_vs_best, device, num_processes, None, equity_table_state)
         )
 
+    played = n_vs_best + n_vs_baseline
     total_wins = wins_vs_baseline + wins_vs_best
-
-    # Weighted opponent ELO: baseline contributes its fraction, best contributes remainder
-    if n_vs_baseline == 0:
-        opponent_elo = best_elo
-    elif n_vs_best == 0:
-        opponent_elo = baseline_elo
-    else:
-        w_base = n_vs_baseline / total_games   # == ratio
-        w_best = n_vs_best     / total_games   # == 1 - ratio
-        opponent_elo = baseline_elo * w_base + best_elo * w_best
+    opponent_elo = mixed_opponent_elo(
+        best_elo, baseline_elo, n_vs_best, n_vs_baseline,
+    )
 
     tqdm.write(
-        f"   ELO eval total: {int(total_wins)}/{total_games} wins "
+        f"   ELO eval total: {int(total_wins)}/{played} wins "
         f"| opponent_elo={opponent_elo:.1f} "
         f"(baseline×{n_vs_baseline} + best×{n_vs_best})"
     )
 
-    return total_wins, total_games, opponent_elo, wins_vs_best, n_vs_best
+    return total_wins, played, opponent_elo, wins_vs_best, n_vs_best
 
 
 def passes_gate(wins_vs_best, n_vs_best, total_wins, total_games):

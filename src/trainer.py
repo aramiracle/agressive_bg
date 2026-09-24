@@ -13,10 +13,13 @@ from src.utils.checkpoint import (
     get_model_state_dict, load_model_state_dict, warm_start,
     load_model_with_config, baseline_artifact_paths,
 )
-from src.utils.elo import evaluate_combined, update_elo, passes_gate
+from src.utils.elo import (
+    evaluate_combined, update_elo, passes_gate, promoted_elo, plays_against_baseline,
+)
 from src.replay_buffer import get_replay_buffer
 from src.utils.game import play_self_play_match
 from src.utils.train import train_batch
+from src.trainer_vs_baseline import parallel_collect, split_matches
 from src.utils.match_equity import MatchEquityTable
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -60,8 +63,7 @@ def collection_worker(args):
         for k in local_stats:
             local_stats[k] += match_stats[k]
 
-    # Return updated equity table state
-    return collected, local_stats, equity_table.equity_table
+    return collected, local_stats, equity_table.pop_observations()
 
 
 def collect_worker_wrapper(args):
@@ -70,38 +72,30 @@ def collect_worker_wrapper(args):
 
 def parallel_collect_self_play(model, equity_table, replay_buffer, total_matches, device="cpu", cube_epsilon=0.0):
     collection_device = getattr(Config, 'SELF_PLAY_DEVICE', device)
-    num_workers       = mp.cpu_count()
-    matches_per_worker = max(1, total_matches // num_workers)
+    counts = split_matches(total_matches, mp.cpu_count())
 
     model_state = model.state_dict()
     equity_table_state = equity_table.equity_table.copy()  # Send current table to workers
     ctx         = mp.get_context("spawn")
 
     args_list = [
-        (model_state, equity_table_state, matches_per_worker, collection_device, cube_epsilon)
-        for _ in range(num_workers)
+        (model_state, equity_table_state, count, collection_device, cube_epsilon)
+        for count in counts
     ]
 
     collected_data = []
     agg_stats = {'doubles': 0, 'takes': 0, 'drops': 0,
                  'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
-    
-    # Collect updated equity tables from workers
-    worker_equity_tables = []
 
-    with ctx.Pool(processes=num_workers) as pool:
-        results = pool.map(collect_worker_wrapper, args_list)
-        for data, stats, worker_equity in results:
-            collected_data.extend(data)
-            for k in agg_stats:
-                agg_stats[k] += stats[k]
-            worker_equity_tables.append(worker_equity)
-    
-    # Merge worker equity tables back into main table
-    # Average the updates from all workers
-    for key in equity_table.equity_table.keys():
-        values = [wt.get(key, equity_table.equity_table[key]) for wt in worker_equity_tables]
-        equity_table.equity_table[key] = sum(values) / len(values)
+    if args_list:
+        with ctx.Pool(processes=len(args_list)) as pool:
+            results = pool.map(collect_worker_wrapper, args_list)
+            for data, stats, observations in results:
+                collected_data.extend(data)
+                for k in agg_stats:
+                    agg_stats[k] += stats[k]
+                for scores_seen, i_won in observations:
+                    equity_table.update_from_match(scores_seen, i_won, record=False)
 
     replay_buffer.extend(collected_data)
     return agg_stats
@@ -139,19 +133,31 @@ def train():
         except:
             tqdm.write(f"   Failed to load equity table, using fresh initialization")
 
-    # Optionally load an external baseline for richer eval signal
+    # Frozen baseline: eval mixes it in while best is weaker, and training
+    # games do too while either rating is still under it.
     baseline_model = None
+    baseline_equity_table = None
     baseline_elo   = Config.INITIAL_ELO
-    baseline_path, baseline_config_path, _ = baseline_artifact_paths()
+    baseline_path, baseline_config_path, baseline_equity_path = baseline_artifact_paths()
     if os.path.exists(baseline_path):
         try:
             baseline_model, baseline_elo = load_model_with_config(
                 baseline_config_path, baseline_path, device
             )
-            tqdm.write(f"   Baseline loaded for eval: ELO {baseline_elo:.0f}")
+            tqdm.write(f"   Baseline loaded: ELO {baseline_elo:.0f}")
+            baseline_equity_table = MatchEquityTable(
+                match_target=Config.MATCH_TARGET, learning_rate=0.01
+            )
+            if os.path.exists(baseline_equity_path):
+                try:
+                    baseline_equity_table.load(baseline_equity_path)
+                    tqdm.write("   Loaded baseline match equity table")
+                except Exception:
+                    tqdm.write("   Using fresh equity table for baseline")
         except Exception as e:
-            tqdm.write(f"   Baseline load failed ({e}), eval vs best_model only.")
+            tqdm.write(f"   Baseline load failed ({e}), self-play and eval vs best only.")
             baseline_model = None
+            baseline_equity_table = None
             baseline_elo   = Config.INITIAL_ELO
 
     replay_buffer = get_replay_buffer(Config.BUFFER_SIZE, prioritized=True, device=device)
@@ -166,10 +172,38 @@ def train():
     while train_step < Config.TRAIN_STEPS:
         cube_epsilon, cube_weight = get_cube_epsilon(train_step)
 
-        tqdm.write(f"--- Epoch Phase 1: Collecting {Config.MATCHES_PER_ITERATION} self-play games ---")
-        stats = parallel_collect_self_play(
-            model, equity_table, replay_buffer, Config.MATCHES_PER_ITERATION, device, cube_epsilon
+        play_baseline = plays_against_baseline(
+            baseline_model is not None, current_elo, best_elo, baseline_elo,
         )
+        if play_baseline:
+            num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
+            num_base = Config.MATCHES_PER_ITERATION - num_self
+            tqdm.write(
+                f"--- Epoch Phase 1: Collecting {num_self} self-play "
+                f"+ {num_base} vs baseline ---"
+            )
+            stats = {'doubles': 0, 'takes': 0, 'drops': 0,
+                     'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
+            if num_self > 0:
+                stats_self = parallel_collect_self_play(
+                    model, equity_table, replay_buffer, num_self, device, cube_epsilon
+                )
+                for key in stats:
+                    stats[key] += stats_self[key]
+            if num_base > 0:
+                stats_base = parallel_collect(
+                    "baseline", model, baseline_model, equity_table, replay_buffer,
+                    num_base, Config.SELF_PLAY_DEVICE, cube_epsilon,
+                    baseline_config_path=baseline_config_path,
+                    baseline_equity_table=baseline_equity_table,
+                )
+                for key in stats:
+                    stats[key] += stats_base[key]
+        else:
+            tqdm.write(f"--- Epoch Phase 1: Collecting {Config.MATCHES_PER_ITERATION} self-play games ---")
+            stats = parallel_collect_self_play(
+                model, equity_table, replay_buffer, Config.MATCHES_PER_ITERATION, device, cube_epsilon
+            )
 
         if len(replay_buffer) < Config.BATCH_SIZE:
             continue
@@ -217,25 +251,29 @@ def train():
                 baseline_elo  = baseline_elo,
                 total_games   = Config.GATE_GAMES,
                 device        = 'cpu',
+                baseline_config_path = baseline_config_path if baseline_model is not None else None,
                 equity_table  = equity_table,
             )
 
             old_elo     = current_elo
             current_elo = update_elo(current_elo, opponent_elo, total_wins, total_games)
+            promoted, gate_rate = passes_gate(wins_vs_best, n_vs_best, total_wins, total_games)
+            if promoted:
+                old_elo = best_elo
+                current_elo = promoted_elo(best_elo, wins_vs_best, n_vs_best)
+                best_elo = current_elo
             tqdm.write(
                 f"   -> Eval: {int(total_wins)}/{total_games} wins | "
                 f"opp_elo={opponent_elo:.0f} | "
                 f"ELO: {old_elo:.0f} -> {current_elo:.0f}"
             )
 
-            promoted, gate_rate = passes_gate(wins_vs_best, n_vs_best, total_wins, total_games)
             tqdm.write(
                 f"   -> Gate: {gate_rate:.1%} vs best "
                 f"(threshold > {Config.GATE_WIN_RATE:.1%}) -> "
                 f"{'PROMOTE' if promoted else 'keep best'}"
             )
             if promoted:
-                best_elo = max(best_elo, current_elo)
                 load_model_state_dict(best_model, get_model_state_dict(model))
                 save_checkpoint(model, optimizer, train_step, best_elo, avg_loss, best_path)
                 tqdm.write(f"  --> New Best Model Saved (ELO {best_elo:.0f})")

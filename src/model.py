@@ -37,11 +37,8 @@ class BackgammonTransformer(nn.Module):
         d = cfg.D_MODEL
 
         # Input embeddings
-        self.embedding = nn.Embedding(
-            cfg.EMBED_VOCAB_SIZE,
-            d,
-            padding_idx=0
-        )
+        # Token 0 is 15 opposing checkers, not padding, so it has to stay trainable.
+        self.embedding = nn.Embedding(cfg.EMBED_VOCAB_SIZE, d)
 
         self.ctx_proj = nn.Sequential(
             nn.LayerNorm(cfg.CONTEXT_SIZE),
@@ -171,11 +168,8 @@ class LegacyValueTransformer(nn.Module):
         cfg = config if config is not None else Config
         d = cfg.D_MODEL
 
-        self.embedding = nn.Embedding(
-            cfg.EMBED_VOCAB_SIZE,
-            d,
-            padding_idx=0
-        )
+        # Token 0 is 15 opposing checkers, not padding, so it has to stay trainable.
+        self.embedding = nn.Embedding(cfg.EMBED_VOCAB_SIZE, d)
         self.ctx_proj = nn.Sequential(
             nn.LayerNorm(cfg.CONTEXT_SIZE),
             nn.Linear(cfg.CONTEXT_SIZE, d)
@@ -279,11 +273,8 @@ class BackgammonCNN(nn.Module):
         cfg = config if config is not None else Config
         d = cfg.D_MODEL
 
-        self.embedding = nn.Embedding(
-            cfg.EMBED_VOCAB_SIZE,
-            d,
-            padding_idx=0
-        )
+        # Token 0 is 15 opposing checkers, not padding, so it has to stay trainable.
+        self.embedding = nn.Embedding(cfg.EMBED_VOCAB_SIZE, d)
 
         self.ctx_proj = nn.Sequential(
             nn.LayerNorm(cfg.CONTEXT_SIZE),

@@ -40,17 +40,13 @@ import base64
 import io
 import json
 import os
-import sys
 import torch
 import websockets
 
-# Add src directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
-
-from backgammon.engine import BackgammonGame
-from backgammon.mcts import MCTS
-from backgammon.model import get_model
-from backgammon.config import Config
+from src.engine import BackgammonGame
+from src.search import Searcher as MCTS
+from src.model import get_model
+from src.config import Config
 
 
 # =========================
@@ -67,7 +63,7 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoin
 # =========================
 class BackgammonServer:
     def __init__(self):
-        self.game = BackgammonGame()
+        self.game = BackgammonGame(train_mode=False)
         self.model = None
         self.mcts = None
         self.model_filename = None
@@ -75,6 +71,8 @@ class BackgammonServer:
         self.game_over = False
         self.winner = 0
         self.has_rolled = False  # Track if current player has rolled
+        self.opening_pending = False
+        self.waiting_for_cube_decision = False
         self.match_target = Config.MATCH_TARGET  # Configurable match target
         
         # Try to load default model
@@ -222,9 +220,15 @@ class BackgammonServer:
         legal_moves = []
         if self.game.dice and not self.game_over:
             moves = self.game.get_legal_moves()
+            seen = set()
             for m in moves:
-                src, dst = m
-                legal_moves.append([src, dst])
+                if len(m) == 2 and isinstance(m[0], (tuple, list)):
+                    src, dst = m[0]
+                else:
+                    src, dst = m[0], m[1]
+                if (src, dst) not in seen:
+                    seen.add((src, dst))
+                    legal_moves.append([src, dst])
 
         return {
             "type": "state",
@@ -236,7 +240,11 @@ class BackgammonServer:
                 "dice": list(self.game.dice) if self.game.dice else [],
                 "cube_value": self.game.cube,
                 "cube_owner": self.game.cube_owner,
-                "can_double": self.game.can_double() and not self.has_rolled,
+                "can_double": (
+                    self.game.can_double()
+                    and not self.waiting_for_cube_decision
+                    and (not self.has_rolled or self.opening_pending)
+                ),
                 "legal_moves": legal_moves,
                 "status": status,
                 "game_over": self.game_over,
@@ -265,12 +273,18 @@ class BackgammonServer:
         # Update crawford status based on current match scores
         self._update_crawford_status()
         self.game.reset()
+        dice = self.game.roll_opening()
         self.game_over = False
         self.winner = 0
-        self.has_rolled = False
-        
+        self.has_rolled = True
+        self.opening_pending = True
+        self.waiting_for_cube_decision = False
+
+        who = "White" if self.game.turn == 1 else "Black"
         crawford_msg = " (Crawford Game!)" if self.game.crawford_active else ""
-        return self.serialize(f"New game started!{crawford_msg} Roll dice to begin.")
+        return self.serialize(
+            f"Opening roll {dice[0]}-{dice[1]}. {who} to play.{crawford_msg}"
+        )
     
     def _update_crawford_status(self):
         """Update Crawford status based on match scores"""
@@ -295,30 +309,38 @@ class BackgammonServer:
         self.game.crawford_active = False
         self.game.crawford_used = False
         self.game.reset()
+        dice = self.game.roll_opening()
         self.game_over = False
         self.winner = 0
-        self.has_rolled = False
-        return self.serialize(f"New match started! First to {self.match_target} points.")
+        self.has_rolled = True
+        self.opening_pending = True
+        self.waiting_for_cube_decision = False
+        who = "White" if self.game.turn == 1 else "Black"
+        return self.serialize(
+            f"New match to {self.match_target}. Opening roll {dice[0]}-{dice[1]}. {who} to play."
+        )
     
-    def _handle_game_win(self, winner, mult):
-        """Handle game win - update match scores"""
-        points = mult * self.game.cube
-        self.game.match_scores[winner] = self.game.match_scores.get(winner, 0) + points
-        
-        # Check if match is won
+    def _handle_game_win(self, winner, points):
+        """Report a win. The engine has already added `points` to the match."""
+        borne_off = (
+            self.game.off[0] >= Config.CHECKERS_PER_PLAYER
+            or self.game.off[1] >= Config.CHECKERS_PER_PLAYER
+        )
+        wtype = self.game.win_type(winner) if borne_off else 1
+
         match_winner = None
         if self.game.match_scores[winner] >= self.match_target:
             match_winner = winner
-        
-        # Update crawford status for next game
+
         if self.game.crawford_active:
             self.game.crawford_used = True
-        
+
         self.game_over = True
         self.winner = winner
-        
+
         winner_name = "White" if winner == 1 else "Black"
         mult_text = {1: "", 2: " (Gammon!)", 3: " (Backgammon!)"}
+        mult = wtype
         
         score_w = self.game.match_scores.get(1, 0)
         score_b = self.game.match_scores.get(-1, 0)
@@ -351,23 +373,48 @@ class BackgammonServer:
     def double(self):
         if self.game_over:
             return self.serialize("Game is over")
+        if self.has_rolled and not self.opening_pending:
+            return self.serialize("Cannot double after rolling")
         if not self.game.can_double():
             return self.serialize("Cannot double now")
-        
-        self.game.apply_double()
-        return self.serialize(f"Cube doubled to {self.game.cube}")
+
+        self.waiting_for_cube_decision = True
+        self.game.turn *= -1
+        self.game.cube_offered = True
+        return self.serialize("Double offered. Take or pass?")
+
+    def take_double(self):
+        if not self.waiting_for_cube_decision:
+            return self.serialize("No double offered.")
+        self.game.cube_offered = False
+        self.game.turn *= -1
+        if not self.game.apply_double():
+            self.waiting_for_cube_decision = False
+            return self.serialize("Double could not be applied.")
+        self.waiting_for_cube_decision = False
+        return self.serialize(f"Double accepted. Cube is now {self.game.cube}")
+
+    def refuse_double(self):
+        if not self.waiting_for_cube_decision:
+            return self.serialize("No double offered.")
+        self.game.cube_offered = False
+        self.game.turn *= -1
+        winner, points = self.game.handle_cube_refusal()
+        self.waiting_for_cube_decision = False
+        return self.serialize(self._handle_game_win(winner, points))
 
     def end_turn(self):
         if self.game_over:
             return self.serialize("Game is over")
-        
+
         if not self.has_rolled:
             return self.serialize("Roll dice first!")
-        
-        # Clear remaining dice and switch turn
-        self.game.dice = []
+        if self.game.must_play_dice():
+            return self.serialize("You still have a legal move.")
+
+        self.opening_pending = False
         self.game.switch_turn()
-        self.has_rolled = False  # Reset for next player
+        self.has_rolled = False
         
         turn_name = "White" if self.game.turn == 1 else "Black"
         return self.serialize(f"{turn_name}'s turn")
@@ -391,13 +438,20 @@ class BackgammonServer:
         
         # Check if move is legal
         legal_moves = self.game.get_legal_moves()
-        move = (src, dst)
-        
-        if move not in legal_moves:
+        chosen = None
+        for m in legal_moves:
+            if len(m) == 2 and isinstance(m[0], (tuple, list)):
+                m_src, m_dst = m[0]
+            else:
+                m_src, m_dst = m[0], m[1]
+            if m_src == src and m_dst == dst:
+                chosen = m
+                break
+        if chosen is None:
             return self.serialize(f"Illegal move: {src} -> {dst}")
-        
-        # Apply move
-        winner, mult = self.game.step_atomic(move)
+
+        self.opening_pending = False
+        winner, mult = self.game.step_atomic(chosen)
         
         if winner != 0:
             status = self._handle_game_win(winner, mult)
@@ -456,41 +510,35 @@ class BackgammonServer:
             legal = self.game.get_legal_moves()
             if not legal:
                 break
-            
-            # Use MCTS to find best move
-            root = self.mcts.search(
-                self.game, 
+
+            result = self.mcts.search(
+                self.game,
                 self.game.match_scores.get(self.game.turn, 0),
-                self.game.match_scores.get(-self.game.turn, 0)
+                self.game.match_scores.get(-self.game.turn, 0),
+                stochastic=False,
             )
-            
-            # Select move with most visits (children is a list of MCTSNode objects)
-            if root.children:
-                best_move = max(root.children, key=lambda node: node.visits).action
-            else:
-                best_move = legal[0]
-            
-            # Apply move
-            winner, mult = self.game.step_atomic(best_move)
-            
-            src, dst = best_move
-            await websocket.send(json.dumps(
-                self.serialize(f"AI moved {src} → {dst}")
-            ))
-            
-            if winner != 0:
-                status = self._handle_game_win(winner, mult)
+            best = result.best()
+            if best is None:
+                break
+
+            self.opening_pending = False
+            for action in best.path:
+                winner, points = self.game.step_atomic(action)
+                (src, dst), _die = action
                 await websocket.send(json.dumps(
-                    self.serialize(status)
+                    self.serialize(f"AI moved {src} → {dst}")
                 ))
-                return
-            
-            await asyncio.sleep(0.2)
-        
-        # End AI turn
-        self.game.dice = []
-        self.game.switch_turn()
-        self.has_rolled = False  # Reset for next player
+                if winner != 0:
+                    status = self._handle_game_win(winner, points)
+                    await websocket.send(json.dumps(self.serialize(status)))
+                    return
+                await asyncio.sleep(0.2)
+            break
+
+        if not self.game_over:
+            self.opening_pending = False
+            self.game.switch_turn()
+            self.has_rolled = False
         
         turn_name = "White" if self.game.turn == 1 else "Black"
         await websocket.send(json.dumps(
@@ -525,6 +573,12 @@ class BackgammonServer:
 
         if t == "double":
             return self.double()
+
+        if t == "take_double":
+            return self.take_double()
+
+        if t == "refuse_double":
+            return self.refuse_double()
 
         if t == "end_turn":
             result = self.end_turn()

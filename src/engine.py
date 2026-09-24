@@ -50,6 +50,7 @@ class BackgammonGame:
 
         self.cube = 1
         self.cube_owner = 0
+        self.cube_offered = False
         self.dice = []
 
         self._update_crawford_status()
@@ -101,7 +102,8 @@ class BackgammonGame:
             tuple(sorted(self.dice)),
             self.crawford_active,
             self.crawford_used,
-            tuple(sorted(self.match_scores.items()))
+            tuple(sorted(self.match_scores.items())),
+            self.cube_offered,
         )
 
     def fast_restore(self, snapshot):
@@ -115,6 +117,7 @@ class BackgammonGame:
         self.crawford_active = snapshot[7]
         self.crawford_used = snapshot[8]
         self.match_scores = dict(snapshot[9])
+        self.cube_offered = snapshot[10]
 
     def copy(self):
         g = BackgammonGame(train_mode=self.train_mode)
@@ -133,6 +136,21 @@ class BackgammonGame:
         else:
             self.dice = [d1, d2]
         return list(self.dice)
+
+    def roll_opening(self):
+        """Higher die moves first and plays that roll. Equal dice are re-rolled."""
+        while True:
+            white = random.randint(1, Config.DICE_SIDES)
+            black = random.randint(1, Config.DICE_SIDES)
+            if white != black:
+                break
+        self.turn = 1 if white > black else -1
+        self.dice = [white, black]
+        return list(self.dice)
+
+    def must_play_dice(self):
+        """True when the side to move still has a legal way to use the dice."""
+        return bool(self.dice) and bool(self.get_legal_moves())
 
     def switch_turn(self):
         self.turn *= -1
@@ -575,6 +593,7 @@ class BackgammonGame:
             self.board, self.bar, self.off, self.turn,
             self.cube, self.cube_owner, self.crawford_active,
             my_score, opp_score, canonical=canonical,
+            cube_offered=self.cube_offered,
         )
         t_board = torch.tensor(vec_data, dtype=torch.long, device=device)
         t_ctx = torch.tensor(ctx_data, dtype=torch.float, device=device)
@@ -582,7 +601,7 @@ class BackgammonGame:
 
     @staticmethod
     def encode_state(board, bar, off, turn, cube, cube_owner, crawford_active,
-                     my_score, opp_score, canonical=True):
+                     my_score, opp_score, canonical=True, cube_offered=False):
         """
         Encode an arbitrary position from the perspective of `turn` as plain
         Python lists (board tokens, context features). Used by both get_vector
@@ -607,7 +626,10 @@ class BackgammonGame:
             vec_data[26] = off[1] + offset
             vec_data[27] = -off[0] + offset
 
-        if cube_owner == 0:
+        if cube_offered:
+            # Responder to a double. Distinct from -1/0/+1 so this is not an on-roll double.
+            owner_val = Config.CUBE_OFFERED
+        elif cube_owner == 0:
             owner_val = 0.0
         else:
             owner_val = 1.0 if cube_owner == turn else -1.0

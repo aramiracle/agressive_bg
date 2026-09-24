@@ -3,7 +3,7 @@ import torch
 from src.config import Config
 from src.utils.cube import get_learned_cube_decision
 from src.utils.outcome import (
-    terminal_distribution, race_distribution, race_win_probability,
+    flip, terminal_distribution, race_distribution, race_win_probability,
 )
 from src.search import Searcher, select_candidate
 
@@ -46,6 +46,7 @@ def _play_single_game(
     game.reset()
     game.set_match_scores(scores[1], scores[-1])
     game.crawford_active = crawford_active
+    game.roll_opening()
 
     searcher_p1.reset()
     searcher_p2.reset()
@@ -76,7 +77,7 @@ def _play_single_game(
         # 1. CUBING PHASE
         # ==========================================
         if game.can_double() and not game.crawford_active:
-            double_choice, me_soft_target_d, val_est_doubler = get_learned_cube_decision(
+            double_choice, me_soft_target_d, val_est_doubler, doubler_probs = get_learned_cube_decision(
                 current_model, game, device, my_s, opp_s,
                 equity_table=active_equity,
                 stochastic=not is_eval,
@@ -102,6 +103,9 @@ def _play_single_game(
                 stats['doubles'] += 1
                 stats['sum_val_double'] += val_est_doubler
                 game.switch_turn()
+                # The doubler still rolls. Mark the input so the cube head learns
+                # take/drop here instead of another on-roll double.
+                game.cube_offered = True
 
                 opp_model  = model_p1 if game.turn == 1 else model_p2
                 opp_equity = (
@@ -109,12 +113,13 @@ def _play_single_game(
                     else (equity_table_p2 if equity_table_p2 is not None else equity_table)
                 )
 
-                take_choice, me_soft_target_t, val_est_taker = get_learned_cube_decision(
+                take_choice, me_soft_target_t, val_est_taker, _ = get_learned_cube_decision(
                     opp_model, game, device, opp_s, my_s,
                     equity_table=opp_equity,
                     stochastic=not is_eval,
                     epsilon=cube_epsilon if not is_eval else 0.0,
-                    is_take=True
+                    is_take=True,
+                    equity_probs=flip(doubler_probs),
                 )
 
                 board_opp, ctx_opp = game.get_vector(opp_s, my_s, device='cpu', canonical=True)
@@ -131,6 +136,7 @@ def _play_single_game(
                     'search_probs': None,
                 })
 
+                game.cube_offered = False
                 game.switch_turn()  # Switch back to original player
 
                 if take_choice == 1:
@@ -155,7 +161,8 @@ def _play_single_game(
         # ==========================================
         # 3. MOVEMENT PHASE — one search per turn
         # ==========================================
-        game.roll_dice()
+        if not game.dice:
+            game.roll_dice()
         result = current_searcher.search(
             game, my_s, opp_s, stochastic=(not is_eval)
         )
