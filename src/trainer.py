@@ -14,7 +14,7 @@ from src.utils.checkpoint import (
     load_model_with_config, baseline_artifact_paths,
 )
 from src.utils.elo import (
-    evaluate_combined, update_elo, passes_gate, promoted_elo, plays_against_baseline,
+    evaluate_combined, plays_against_baseline, settle_eval_ratings,
 )
 from src.replay_buffer import get_replay_buffer
 from src.utils.game import play_self_play_match
@@ -253,7 +253,7 @@ def train():
 
         n_g = max(1, stats['games'])
         n_d = max(1, stats['doubles'])
-        pbar.set_postfix({
+        postfix = {
             'L':    f'{avg_loss:.3f}',
             'ELO':  f'{current_elo:.0f}',
             'ε':    f'{cube_epsilon:.2f}',
@@ -262,7 +262,8 @@ def train():
                 f'Tk:{stats["takes"]/n_d:.0%} '
                 f'VD:{stats["sum_val_double"]/n_d:.2f}'
             )
-        })
+        }
+        pbar.set_postfix(postfix)
 
         if train_step % Config.ELO_EVAL_INTERVAL == 0:
             tqdm.write(f"[{train_step}] eval     {Config.GATE_GAMES} matches")
@@ -281,17 +282,15 @@ def train():
                 equity_table  = equity_table,
             )
 
-            old_elo     = current_elo
-            current_elo = update_elo(current_elo, opponent_elo, total_wins, total_games)
-            promoted, gate_rate = passes_gate(wins_vs_best, n_vs_best, total_wins, total_games)
-            if promoted:
-                old_elo = best_elo
-                current_elo = promoted_elo(best_elo, wins_vs_best, n_vs_best)
-                best_elo = current_elo
+            old_latest = current_elo
+            current_elo, best_elo, promoted, gate_rate = settle_eval_ratings(
+                current_elo, best_elo, opponent_elo,
+                total_wins, total_games, wins_vs_best, n_vs_best,
+            )
             decision = "promoted" if promoted else "kept best"
             tqdm.write(
-                f"  rating       {old_elo:.1f} -> {current_elo:.1f} "
-                f"({current_elo - old_elo:+.1f})   opp elo {opponent_elo:.0f}"
+                f"  rating       {old_latest:.1f} -> {current_elo:.1f} "
+                f"({current_elo - old_latest:+.1f})   opp elo {opponent_elo:.0f}"
             )
             tqdm.write(
                 f"  gate         {gate_rate:.1%} vs best   "
@@ -303,6 +302,9 @@ def train():
                 tqdm.write(f"  saved        best  elo {best_elo:.0f}  step {train_step}")
 
             save_checkpoint(model, optimizer, train_step, current_elo, avg_loss, latest_path)
+            tqdm.write(f"  saved        latest  elo {current_elo:.0f}  step {train_step}")
+            postfix['ELO'] = f'{current_elo:.0f}'
+            pbar.set_postfix(postfix)
             equity_table.save(equity_path)
             
             # Optionally print equity table for inspection

@@ -94,10 +94,12 @@ class FastSumTree:
             
             # Standardize indices (unique) to avoid doing math on the same parent twice
             # Note: unique() can be slow, but essential for correctness in batch updates
-            idx = torch.unique(idx)
-            
-            # Root check (index -1 after the floor division if idx was 0)
-            if idx[0] == -1:
+            idx = torch.unique(idx, sorted=True)
+            # (0 - 1) // 2 == -1 once we pass the root. A negative
+            # index_put_ would write the last leaf and give priority to a
+            # slot that has no transition.
+            idx = idx[idx >= 0]
+            if idx.numel() == 0:
                 break
 
             # Calculate children indices
@@ -114,50 +116,64 @@ class FastSumTree:
     def get_batch(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
         """
         Perform vectorized tree traversal entirely on the Tensor.
+
+        Only indices in ``[0, current_count)`` hold transitions. The leaf
+        array is a power of two, so everything past ``current_count`` is
+        zero-priority padding and the data slot is still None. A float32
+        key that rounds past a child sum used to walk into that tail;
+        clamping the index to ``max_size - 1`` then subscripted None.
         """
-        total_p = self.total_priority
-        segment = total_p / batch_size
-        
-        # Generate search values [0, segment, 2*segment, ...] + jitter
-        # entirely on device
-        r = torch.rand(batch_size, device=self.device)
-        s = (torch.arange(batch_size, device=self.device, dtype=torch.float32) + r) * segment
+        total = self.tree[0].clamp(min=Config.MIN_PRIOR)
+
+        # Stratified keys in float64, strictly below the stored mass.
+        # float32 ``(i + u) * (total / n)`` can round above ``total``.
+        n = batch_size
+        slots = torch.arange(n, device=self.device, dtype=torch.float64)
+        u = torch.rand(n, device=self.device, dtype=torch.float64)
+        total64 = total.to(dtype=torch.float64)
+        below_total = torch.nextafter(
+            total64, torch.zeros((), dtype=torch.float64, device=self.device)
+        )
+        s = torch.minimum((slots + u) * total64 / n, below_total).to(dtype=self.tree.dtype)
 
         # Start at root (index 0)
-        idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        
+        idx = torch.zeros(n, dtype=torch.long, device=self.device)
+        zero = torch.zeros((), dtype=self.tree.dtype, device=self.device)
+
         # Traverse the tree
         # This loop runs 'depth' times. Operations inside are fully vectorized.
         for _ in range(self.depth):
             left = 2 * idx + 1
             right = left + 1
-            
-            # Get values of left children
-            # We must mask out indices that might go out of bounds (though typically shouldn't)
+
             left_vals = self.tree[left]
-            
-            # Decide direction
-            # If s <= left_val: Go Left.
-            # If s > left_val:  Subtract left_val, Go Right.
-            
-            go_right = s > left_vals
-            
-            # If we go right, we subtract the left value from our search 's'
-            # We use torch.where to conditionally subtract
-            s = torch.where(go_right, s - left_vals, s)
-            
-            # Update index: Left is 'left', Right is 'left + 1'
+            right_vals = self.tree[right]
+
+            # Never step into a child with no mass. That child is unfilled
+            # buffer (or power-of-two padding) and its data slot is None.
+            go_right = ((s > left_vals) & (right_vals > 0)) | ((left_vals <= 0) & (right_vals > 0))
+
+            stepped = torch.where(go_right, s - left_vals, s)
+            child = torch.where(go_right, right_vals, left_vals)
+            inside = torch.where(child > 0, torch.nextafter(child, zero), child)
+            s = torch.minimum(stepped, inside)
+
             idx = left + go_right.long()
 
-        # Map back to data indices
+        # Map back to data indices. Do not clamp onto max_size - 1: until the
+        # buffer is full that slot is None, and once it is full the clamp
+        # dumps every out-of-range walk onto a single transition.
         data_idxs = idx - (self.tree_capacity - 1)
-        
-        # Safety clamp to ensure we don't crash on float precision errors at boundaries
-        data_idxs = torch.clamp(data_idxs, 0, self.max_size - 1)
-        
-        # Get priorities directly from tree (no need to copy to CPU)
+        valid = (data_idxs >= 0) & (data_idxs < self.current_count)
+        if not bool(valid.all().item()):
+            n_bad = int((~valid).sum().item())
+            repl = torch.randint(0, self.current_count, (n_bad,), device=self.device)
+            data_idxs = data_idxs.clone()
+            data_idxs[~valid] = repl
+
+        idx = data_idxs + (self.tree_capacity - 1)
         priorities = self.tree[idx]
-        
+
         # We return data_idxs as a list only at the very end to fetch objects
         return idx, priorities, data_idxs.cpu().tolist()
 

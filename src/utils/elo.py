@@ -30,20 +30,6 @@ def update_elo(current_elo, opponent_elo, wins, total_games):
     return current_elo + delta * total_games
 
 
-def promoted_elo(champion_elo, wins_vs_champion, games_vs_champion):
-    """
-    Rating to store when a candidate replaces the champion.
-
-    The running rating falls on failed gates and, with K=1, a gate pass
-    (just over 53%) cannot close that gap. max(champion, running) then
-    saves the new weights under the old rating. After promotion both
-    checkpoints are the same weights, and those weights just played
-    `games_vs_champion` against the previous champion, so the published
-    rating is the champion rating updated by that match.
-    """
-    return update_elo(champion_elo, champion_elo, wins_vs_champion, games_vs_champion)
-
-
 def get_cube_action(model, game, device, my_score=0, opp_score=0):
     """Consult the model's learned cube policy."""
     board_t, ctx_t = game.get_vector(my_score, opp_score, device=device, canonical=True)
@@ -326,3 +312,24 @@ def passes_gate(wins_vs_best, n_vs_best, total_wins, total_games):
     else:
         return False, 0.0
     return rate > Config.GATE_WIN_RATE, rate
+
+
+def settle_eval_ratings(latest_elo, best_elo, opponent_elo,
+                        total_wins, total_games, wins_vs_best, n_vs_best):
+    """
+    Apply one evaluation to the live rating and, only on a gate pass, the champion.
+
+    The live rating always moves from the full mix (total wins vs the
+    weighted opponent Elo). That is the only rating update. The champion
+    keeps its previous Elo until the win rate against best_model clears
+    the gate; on a pass it rises to the updated live rating, never below
+    its previous best.
+
+    Returns:
+        (latest_elo, best_elo, promoted, gate_rate)
+    """
+    latest_elo = update_elo(latest_elo, opponent_elo, total_wins, total_games)
+    promoted, gate_rate = passes_gate(wins_vs_best, n_vs_best, total_wins, total_games)
+    if not promoted:
+        return latest_elo, best_elo, False, gate_rate
+    return latest_elo, max(best_elo, latest_elo), True, gate_rate

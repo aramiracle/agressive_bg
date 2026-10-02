@@ -23,7 +23,7 @@ from src.utils.game import _assign_targets, play_self_play_match
 from src.utils.match_equity import MatchEquityTable
 from src.utils.elo import (
     mixed_opponent_elo, passes_gate, play_single_game as eval_play_game,
-    plays_against_baseline, promoted_elo, split_eval_games, update_elo,
+    plays_against_baseline, settle_eval_ratings, split_eval_games, update_elo,
 )
 from src.utils.cube import cube_decision_gain
 from src.utils.outcome import match_equity_from_outcomes
@@ -217,10 +217,6 @@ def run_regression_suite():
     all_ok &= check(round(lagged) == 514 and max(520.7, lagged) == 520.7,
                     "22/40 from a lagged 511 stays under the 521 champion",
                     f"lagged rating {lagged} would have moved the champion")
-    raised = promoted_elo(520.7, 22, 40)
-    all_ok &= check(abs(raised - 522.7) < 1e-9,
-                    "promotion rates the new best from the champion it beat (520.7 -> 522.7)",
-                    f"promoted elo {raised}")
 
     all_ok &= check(not plays_against_baseline(True, 400.0, 600.0, 500.0),
                     "a lagged running elo keeps training on self-play while best is ahead",
@@ -251,6 +247,37 @@ def run_regression_suite():
     all_ok &= check(avg_elo == 300.0,
                     "opponent ELO is the game-weighted average (300)",
                     f"opponent ELO {avg_elo}")
+
+    # 71/100 vs a 300 field, 23/50 vs best: the gate fails, latest still rises.
+    live = update_elo(100.0, 300.0, 71, 100)
+    latest, best, promoted, rate = settle_eval_ratings(
+        100.0, 100.0, 300.0, 71, 100, 23, 50,
+    )
+    all_ok &= check(
+        (not promoted) and best == 100.0 and latest == live and latest > 100.0
+        and abs(rate - 0.46) < 1e-9,
+        "a win that misses the gate raises latest and leaves best at 100",
+        f"latest {latest} best {best} promoted {promoted} rate {rate}",
+    )
+    # 60/100 vs a 300 field clears the gate: both take the mixed-eval rating.
+    published = update_elo(140.0, 300.0, 60, 100)
+    latest, best, promoted, _ = settle_eval_ratings(
+        140.0, 100.0, 300.0, 60, 100, 60, 100,
+    )
+    all_ok &= check(
+        promoted and latest == published and best == published,
+        "a gate pass copies the mixed-eval latest rating onto best",
+        f"latest {latest} best {best} published {published}",
+    )
+    # Gate passes but latest sits below best: best must not regress.
+    latest, best, promoted, _ = settle_eval_ratings(
+        100.0, 500.0, 300.0, 60, 100, 60, 100,
+    )
+    all_ok &= check(
+        promoted and latest == update_elo(100.0, 300.0, 60, 100) and best == 500.0,
+        "a gate pass below best never lowers best",
+        f"latest {latest} best {best}",
+    )
     whites = sum(1 for i in range(20) if i % 2 == 0)
     blacks = 20 - whites
     all_ok &= check(whites == blacks == 10,

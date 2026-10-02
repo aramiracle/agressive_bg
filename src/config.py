@@ -112,7 +112,7 @@ class Config:
     ELO_K = 1
     ELO_SCALE = 400.0
     ELO_EVAL_INTERVAL = 1000
-    GATE_WIN_RATE = _env_float("BG_GATE_WIN_RATE", 0.53)
+    GATE_WIN_RATE = _env_float("BG_GATE_WIN_RATE", 0.54)
     GATE_GAMES = _env_int("BG_GATE_GAMES", 100)
 
     # Runtime
