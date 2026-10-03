@@ -922,19 +922,21 @@ const btnPass = document.getElementById("btnPass");
 const btnDouble = document.getElementById("btnDouble");
 
 btnTake.onclick = () => {
-    send({ type: "take_double" });
+    if (actionPending) return;
+    if (send({ type: "take_double" })) actionPending = true;
 };
 
 btnPass.onclick = () => {
+    if (actionPending) return;
     if (confirm("Are you sure you want to pass? You will lose the current cube value.")) {
-        send({ type: "refuse_double" });
+        if (send({ type: "refuse_double" })) actionPending = true;
     }
 };
 
-// Update the existing btnDouble.onclick to be cleaner
-btnDouble.onclick = () => {  // ← ERROR HERE - btnDouble not declared yet!
+btnDouble.onclick = () => {
+    if (actionPending || awaitingCube) return;
     if (confirm("Offer to double the stakes?")) {
-        send({ type: "double" });
+        if (send({ type: "double" })) actionPending = true;
     }
 };
 /* ============================
@@ -958,6 +960,8 @@ let matchTarget = 7;
 let matchScores = { white: 0, black: 0 };
 let crawford = false;
 let canDouble = false;
+let awaitingCube = false;   // a double is pending and the human must respond
+let actionPending = false;  // an action was sent, awaiting the server's state reply
 
 /* ============================
    UI ELEMENTS
@@ -1059,6 +1063,12 @@ function connectAI() {
     connStatus.textContent = "Disconnected";
     connStatus.className = "connection disconnected";
     status.textContent = "AI Disconnected - Reconnecting...";
+    // Server is gone; any in-flight action or cube prompt is dead. The fresh
+    // session after reconnect will send its own state.
+    actionPending = false;
+    awaitingCube = false;
+    document.getElementById("cubeOverlay").style.display = "none";
+    updateButtons();
     setTimeout(connectAI, 2000);
   };
 
@@ -1072,7 +1082,9 @@ function connectAI() {
 function send(data) {
   if (socket && socket.readyState === 1) {
     socket.send(JSON.stringify(data));
+    return true;
   }
+  return false;
 }
 
 /* ============================
@@ -1285,6 +1297,8 @@ function applyState(s) {
   gameOver = s.game_over || false;
   gameMode = s.mode || gameMode;
   hasRolledThisTurn = s.has_rolled || false;
+  awaitingCube = isWaitingForCube;
+  actionPending = false;  // the server answered; UI actions are unlocked again
   
   // Match info
   matchTarget = s.match_target || 7;
@@ -1306,9 +1320,7 @@ function applyState(s) {
     } else {
       cubeOverlay.style.display = "none";
     }
-    btnRoll.disabled = true;
-    btnDouble.disabled = true;
-    btnEnd.disabled = true;
+    // Roll / Double / End are disabled via updateButtons() (awaitingCube).
   } else {
     cubeOverlay.style.display = "none";
   }
@@ -1370,14 +1382,16 @@ function isHumanTurn() {
 }
 
 function handlePointClick(idx) {
-  if (!isHumanTurn() || dice.length === 0) return;
+  if (!isHumanTurn() || dice.length === 0 || awaitingCube || actionPending) return;
 
   // If clicking on a highlighted target
   if (selectedPoint !== null) {
     const isValidTarget = legalMoves.some(m => m[0] === selectedPoint && m[1] === idx);
     if (isValidTarget) {
-      send({ type: "move", from: selectedPoint, to: idx });
+      const from = selectedPoint;
       selectedPoint = null;
+      if (send({ type: "move", from: from, to: idx })) actionPending = true;
+      renderBoard();
       return;
     }
   }
@@ -1394,7 +1408,7 @@ function handlePointClick(idx) {
 }
 
 function handleBarClick(player) {
-  if (!isHumanTurn() || dice.length === 0) return;
+  if (!isHumanTurn() || dice.length === 0 || awaitingCube || actionPending) return;
   if (player !== turn) return;
 
   const canMoveFromBar = legalMoves.some(m => m[0] === "bar");
@@ -1405,12 +1419,15 @@ function handleBarClick(player) {
 }
 
 function handleBearoffClick(player) {
-  if (!isHumanTurn() || selectedPoint === null) return;
+  if (!isHumanTurn() || selectedPoint === null || awaitingCube || actionPending) return;
+  if (player !== turn) return;
   
   const canBearoff = legalMoves.some(m => m[0] === selectedPoint && m[1] === "off");
   if (canBearoff) {
-    send({ type: "move", from: selectedPoint, to: "off" });
+    const from = selectedPoint;
     selectedPoint = null;
+    if (send({ type: "move", from: from, to: "off" })) actionPending = true;
+    renderBoard();
   }
 }
 
@@ -1419,16 +1436,20 @@ function updateButtons() {
   const hasDice = dice && dice.length > 0;
   const hasLegalMoves = legalMoves && legalMoves.length > 0;
 
+  // While a double is pending (or a reply from the server is in flight) no
+  // other action may be taken, even if the overlay only covers part of the page.
+  const locked = gameOver || awaitingCube || actionPending;
+
   // Roll: enabled when human's turn, no dice yet, haven't rolled this turn
-  btnRoll.disabled = !human || hasRolledThisTurn || gameOver;
+  btnRoll.disabled = locked || !human || hasRolledThisTurn;
   
   // Double: enabled before rolling, when can_double is true (respects Crawford)
-  btnDouble.disabled = !human || !canDouble || gameOver;
+  btnDouble.disabled = locked || !human || !canDouble;
   
   // End turn: enabled after rolling, when either:
   // - No dice left (all used), OR
   // - No legal moves available (blocked)
-  const canEndTurn = human && !gameOver && hasRolledThisTurn && (!hasDice || !hasLegalMoves);
+  const canEndTurn = human && !locked && hasRolledThisTurn && (!hasDice || !hasLegalMoves);
   btnEnd.disabled = !canEndTurn;
   
   // Show AI buttons only for ai_vs_ai mode
@@ -1469,10 +1490,19 @@ matchTargetSelect.onchange = () => {
     matchTargetSelect.value = matchTarget;
   }
 };
-btnRoll.onclick = () => send({ type: "roll" });
-btnEnd.onclick = () => send({ type: "end_turn" });
+btnRoll.onclick = () => {
+  if (actionPending || awaitingCube) return;
+  if (send({ type: "roll" })) actionPending = true;
+};
+btnEnd.onclick = () => {
+  if (actionPending || awaitingCube) return;
+  if (send({ type: "end_turn" })) actionPending = true;
+};
 // btnDouble.onclick is set above with confirmation dialog
-btnAI.onclick = () => send({ type: "ai_play" });
+btnAI.onclick = () => {
+  if (actionPending || awaitingCube) return;
+  if (send({ type: "ai_play" })) actionPending = true;
+};
 
 // Autoplay functions
 function startAutoplay() {

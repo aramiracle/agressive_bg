@@ -63,7 +63,13 @@ class BackgammonServer:
         for path in default_model_paths(REPO_ROOT):
             equity_path = os.path.join(os.path.dirname(path), "match_equity.pt")
             if os.path.exists(equity_path):
-                self.equity_table.load(equity_path)
+                try:
+                    self.equity_table.load(equity_path)
+                except ValueError as e:
+                    # e.g. a stage-2 table while running a 1-point match:
+                    # keep playing with the default table instead of dying.
+                    print(f"⚠️ Skipping {equity_path}: {e}")
+                    return
                 print(f"✅ Match Equity Table loaded: {equity_path}")
                 return
 
@@ -94,7 +100,10 @@ class BackgammonServer:
                 self.model_filename = os.path.basename(path)
                 equity_path = os.path.join(os.path.dirname(path), "match_equity.pt")
                 if os.path.exists(equity_path):
-                    self.equity_table.load(equity_path)
+                    try:
+                        self.equity_table.load(equity_path)
+                    except ValueError as e:
+                        print(f"⚠️ Keeping current match equity table: {e}")
                 print(f"✅ Model loaded: {path}")
                 print(f"   ELO: {elo}, Step: {step}")
                 return
@@ -212,6 +221,7 @@ class BackgammonServer:
         self.winner = 0
         self.has_rolled = True
         self.opening_pending = True
+        self.waiting_for_cube_decision = False
         who = "White" if self.game.turn == 1 else "Black"
         crawford_msg = " (Crawford Game!)" if self.game.crawford_active else ""
         return self.serialize(
@@ -220,7 +230,11 @@ class BackgammonServer:
     
     def new_match(self, target=None):
         if target is not None:
-            self.match_target = max(1, min(21, int(target)))
+            try:
+                target = int(target)
+            except (TypeError, ValueError):
+                target = self.match_target
+            self.match_target = max(1, min(21, target))
             self.game.match_target = self.match_target
             
         self.game.match_scores = {1: 0, -1: 0}
@@ -232,6 +246,7 @@ class BackgammonServer:
         self.winner = 0
         self.has_rolled = True
         self.opening_pending = True
+        self.waiting_for_cube_decision = False
         who = "White" if self.game.turn == 1 else "Black"
         return self.serialize(
             f"New match to {self.match_target}. Opening roll {dice[0]}-{dice[1]}. {who} to play."
@@ -297,6 +312,10 @@ class BackgammonServer:
     def roll(self):
         if self.game_over:
             return self.serialize("Game is over. Start a new game.")
+        if self.waiting_for_cube_decision:
+            return self.serialize("Resolve the double first!")
+        if self.is_ai_turn():
+            return self.serialize("It's the AI's turn.")
         if self.game.dice:
             return self.serialize("Already rolled! Make your moves.")
         if self.has_rolled:
@@ -316,6 +335,10 @@ class BackgammonServer:
     def end_turn(self):
         if self.game_over:
             return self.serialize("Game is over")
+        if self.waiting_for_cube_decision:
+            return self.serialize("Resolve the double first!")
+        if self.is_ai_turn():
+            return self.serialize("It's the AI's turn.")
         if not self.has_rolled:
             return self.serialize("Roll dice first!")
         if self.game.must_play_dice():
@@ -331,6 +354,10 @@ class BackgammonServer:
     def make_move(self, src, dst):
         if self.game_over:
             return self.serialize("Game is over")
+        if self.waiting_for_cube_decision:
+            return self.serialize("Resolve the double first!")
+        if self.is_ai_turn():
+            return self.serialize("It's the AI's turn.")
         if not self.game.dice:
             return self.serialize("Roll dice first!")
         
@@ -391,10 +418,21 @@ class BackgammonServer:
     
     def can_offer_double(self):
         g = self.game
+
+        if self.game_over or self.waiting_for_cube_decision:
+            return False
+
+        if not Config.CUBE_ENABLED:
+            return False
+
+        if g.dice or self.opening_pending:
+            # A double is offered before the roll; the opening roll is played as rolled.
+            return False
+
         player = g.turn
         opponent = -player
 
-        if self.has_rolled and not self.opening_pending:
+        if self.has_rolled:
             return False
 
         if g.crawford_active:
@@ -497,7 +535,7 @@ class BackgammonServer:
 
     async def ai_move(self, websocket):
         """Execute AI move with doubling/refusal and send updates."""
-        if self.game_over or not self.is_ai_turn():
+        if self.game_over or not self.is_ai_turn() or self.waiting_for_cube_decision:
             return
 
         if not self.model or not self.mcts:
@@ -510,7 +548,7 @@ class BackgammonServer:
         opp_score = self.game.match_scores.get(-self.game.turn, 0)
 
         # 1. AI Doubling Logic (Pre-Roll)
-        if self.can_offer_double() and (not self.has_rolled or self.opening_pending):
+        if self.can_offer_double():
             double_action, _, _, _ = get_learned_cube_decision(
                 self.model, self.game, DEVICE, my_score, opp_score,
                 equity_table=self.equity_table, stochastic=False
@@ -623,10 +661,14 @@ class BackgammonServer:
             return None
 
         if t == "double":
+            if self.is_ai_turn():
+                return self.serialize("It's the AI's turn.")
             await self.offer_double(websocket)
             return None
 
         if t == "take_double":
+            if self.waiting_for_cube_decision and self.is_ai_turn():
+                return self.serialize("The AI is responding to the double.")
             result = self.take_double()
             await websocket.send(json.dumps(result))
             # If AI offered and Human took, it's now AI's turn to continue (roll dice)
@@ -636,6 +678,8 @@ class BackgammonServer:
             return None
 
         if t == "refuse_double":
+            if self.waiting_for_cube_decision and self.is_ai_turn():
+                return self.serialize("The AI is responding to the double.")
             return self.refuse_double()
 
         if t == "end_turn":
@@ -652,6 +696,8 @@ class BackgammonServer:
             return self.make_move(src, dst)
 
         if t == "set_mode":
+            if self.waiting_for_cube_decision:
+                return self.serialize("Resolve the double first!")
             mode = msg.get("mode")
             result = self.set_mode(mode)
             await websocket.send(json.dumps(result))

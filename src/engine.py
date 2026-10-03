@@ -252,7 +252,13 @@ class BackgammonGame:
                         moved = True
                 if not moved:
                     prev = finals.get(state)
-                    if prev is None or len(path) > len(prev):
+                    # Same final position can be reached with different dice
+                    # consumed (e.g. bearing off 1 pip with a 3 or a 4). Keep
+                    # the longest, then the most-pips path so the maximality
+                    # filter below sees every distinct dice usage, matching
+                    # the DFS in _find_move_paths.
+                    if prev is None or (len(path), sum(step[1] for step in path)) > \
+                            (len(prev), sum(step[1] for step in prev)):
                         finals[state] = path
             layer = next_layer
 
@@ -391,7 +397,8 @@ class BackgammonGame:
         moves = []
         p_idx = 0 if player == 1 else 1
 
-        # 1. Must enter from bar
+        # 1. Must enter from bar onto the opponent's home board
+        # (white: indices 18-23, black: indices 0-5).
         if bar[p_idx] > 0:
             target = (Config.NUM_POINTS - die) if player == 1 else (die - 1)
             # Fix: Must check if target is valid AND strictly if open
