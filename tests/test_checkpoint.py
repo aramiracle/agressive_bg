@@ -8,8 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src
 
 import torch
 
-INPUT_FILE = "checkpoints/baseline/latest_model.pt"
-OUTPUT_FILE = "checkpoints/baseline/latest_model.pt"
+INPUT_FILE = "checkpoints/stage2/latest_model.pt"
+OUTPUT_FILE = "checkpoints/stage2/latest_model.pt"
 
 
 def test_checkpoint_structure():
@@ -55,7 +55,7 @@ def modify_checkpoint():
 
     # Modify values
     ckpt["step"] = 1000
-    ckpt["elo"] = 450
+    ckpt["elo"] = 480
     ckpt["loss"] = 2.0
 
     # Print new values
