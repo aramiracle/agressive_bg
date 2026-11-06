@@ -11,8 +11,10 @@ import torch
 
 # Pattern -> values to write
 CHECKPOINT_TARGETS = {
-    "checkpoints/*/latest_model.pt": {"elo": 400, "step": 1000},
-    "checkpoints/*/best_model.pt": {"elo": 500, "step": 2000},
+    "checkpoints/stage1/latest_model.pt": {"elo": 100},
+    "checkpoints/stage1/best_model.pt": {"elo": 200},
+    "checkpoints/stage2/latest_model.pt": {"elo": 100},
+    "checkpoints/stage2/best_model.pt": {"elo": 200},
 }
 
 

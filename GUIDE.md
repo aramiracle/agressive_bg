@@ -421,7 +421,7 @@ change = K · (actual win rate − expected win rate) · games
 
 Against an equal opponent, a 60 percent score over 100 games is `+10` Elo. The step is deliberately small.
 
-Promotion happens only when the win rate against the champion is strictly above `GATE_WIN_RATE` (default 54 percent). The live rating is always updated from the whole evaluation mix (total wins vs the weighted opponent Elo). That mixed update is the only rating path. On a gate pass, `best_model.pt` takes that updated live rating when it is higher, and otherwise keeps its own — the champion's Elo never moves backwards. A failed gate leaves the champion's file and Elo untouched, and the live rating still keeps the mix update.
+Promotion happens only when the win rate against the champion is strictly above `GATE_WIN_RATE` (default 54 percent). The live rating is always updated from the whole evaluation mix (total wins vs the weighted opponent Elo). On a gate pass, the champion's Elo is updated from the gate result itself, relative to its own previous rating, so a lagging live rating neither caps nor lowers it. A failed gate leaves the champion's file and Elo untouched, and the live rating still keeps the mix update.
 
 `passes_gate` promotes only when the win rate against `best_model` is strictly greater than `GATE_WIN_RATE`. The default is 0.54; `BG_GATE_WIN_RATE` overrides it. If an evaluation somehow contained no champion games, the gate falls back to the total win rate, but the split always reserves at least half the matches for the champion, so that path is unreachable in practice. A failed comparison leaves the champion weights on disk.
 

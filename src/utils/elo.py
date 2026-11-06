@@ -320,10 +320,10 @@ def settle_eval_ratings(latest_elo, best_elo, opponent_elo,
     Apply one evaluation to the live rating and, only on a gate pass, the champion.
 
     The live rating always moves from the full mix (total wins vs the
-    weighted opponent Elo). That is the only rating update. The champion
-    keeps its previous Elo until the win rate against best_model clears
-    the gate; on a pass it rises to the updated live rating, never below
-    its previous best.
+    weighted opponent Elo). The champion keeps its previous Elo until the
+    win rate against best_model clears the gate; on a pass its Elo is
+    updated from that gate result against its own previous rating. A
+    lagging live rating therefore neither caps nor lowers the champion.
 
     Returns:
         (latest_elo, best_elo, promoted, gate_rate)
@@ -332,4 +332,9 @@ def settle_eval_ratings(latest_elo, best_elo, opponent_elo,
     promoted, gate_rate = passes_gate(wins_vs_best, n_vs_best, total_wins, total_games)
     if not promoted:
         return latest_elo, best_elo, False, gate_rate
-    return latest_elo, max(best_elo, latest_elo), True, gate_rate
+    gate_wins = wins_vs_best if n_vs_best > 0 else total_wins
+    gate_games = n_vs_best if n_vs_best > 0 else total_games
+    # The old champion is both the starting rating and the reference
+    # opponent, so this pass earns its Elo from the gate result itself.
+    best_elo = update_elo(best_elo, best_elo, gate_wins, gate_games)
+    return latest_elo, best_elo, True, gate_rate
