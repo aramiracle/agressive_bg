@@ -481,7 +481,8 @@ class BackgammonServer:
             my_score = self.game.match_scores.get(self.game.turn, 0)
             opp_score = self.game.match_scores.get(-self.game.turn, 0)
             
-            take_choice, _, _, _ = get_learned_cube_decision(
+            take_choice, _, _, _ = await asyncio.to_thread(
+                get_learned_cube_decision,
                 self.model, self.game, DEVICE, my_score, opp_score,
                 equity_table=self.equity_table,
                 stochastic=False,
@@ -549,9 +550,10 @@ class BackgammonServer:
 
         # 1. AI Doubling Logic (Pre-Roll)
         if self.can_offer_double():
-            double_action, _, _, _ = get_learned_cube_decision(
+            double_action, _, _, _ = await asyncio.to_thread(
+                get_learned_cube_decision,
                 self.model, self.game, DEVICE, my_score, opp_score,
-                equity_table=self.equity_table, stochastic=False
+                equity_table=self.equity_table, stochastic=False,
             )
             
             if double_action == 1:
@@ -579,7 +581,10 @@ class BackgammonServer:
             # Search once per roll and replay the chosen turn atomically so
             # the client sees every checker move.
             if not self._planned_turn:
-                result = self.mcts.search(self.game, my_score, opp_score)
+                # Off the event loop so keepalive pings are answered during long searches.
+                result = await asyncio.to_thread(
+                    self.mcts.search, self.game, my_score, opp_score
+                )
                 best = result.best()
                 self._planned_turn = list(best.path) if best is not None else []
 
@@ -742,6 +747,8 @@ async def handler(websocket):
                 response = await server.handle(msg, websocket)
                 if response is not None:
                     await websocket.send(json.dumps(response))
+            except websockets.exceptions.ConnectionClosed:
+                raise
             except Exception as e:
                 print(f"❌ Handler error: {e}")
                 import traceback
