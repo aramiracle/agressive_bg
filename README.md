@@ -69,18 +69,21 @@ required, and its `bg-train` console script is stale (points at a removed
 ## Training
 
 ```bash
-# Pure self-play (stage selected by BG_STAGE, default 1)
+# Stage selected by BG_STAGE (default 1)
 python -m src.trainer
 
-# Self-play + frozen baseline evaluation, explicit stage
+# Same phases, explicit stage
 python -m src.trainer_vs_baseline --stage 1
-python -m src.trainer_vs_baseline --stage 2 --matches 80 --steps 50000
+python -m src.trainer_vs_baseline --stage 2
 ```
 
 Training plays `MATCHES_PER_ITERATION` matches per iteration (CPU workers for
 `src.trainer`), appends labeled transitions to the replay buffer, runs
 optimizer steps, and every `ELO_EVAL_INTERVAL` steps plays a gate of
 `GATE_GAMES` matches, promoting `best_model.pt` only above the win-rate gate.
+Half of every iteration is self-play. While the champion's Elo is at or below
+the baseline's, the other half and half the gate are against the baseline;
+once it is above, both are against the champion (`GUIDE.md` section 11).
 
 ## Playing (Web UI)
 

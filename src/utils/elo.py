@@ -194,33 +194,32 @@ def evaluate_vs_opponent(args):
 
 def plays_against_baseline(has_baseline, _current_elo, best_elo, baseline_elo):
     """
-    Whether this iteration's training games should face the frozen baseline.
+    Whether training and eval are in the baseline phase.
 
-    Eval already splits onto the baseline while best_model is below it.
-    Collection follows that published rating only. The running rating lags
-    on failed gates and, with K=1, does not catch up on a pass, so it must
-    not abandon self-play while the weights are still the champion.
+    Phase 1 (best_elo <= baseline_elo): train vs self + baseline, gate vs
+    best + baseline. Phase 2 (best_elo > baseline_elo): train vs self + best,
+    gate vs best only. The phase follows the champion's rating, not the
+    running one.
 
     Returns:
-        True when a baseline is loaded and best_model is still under it.
+        True when a baseline is loaded and best_model is not above it.
     """
     if not has_baseline:
         return False
-    return best_elo < baseline_elo
+    return best_elo <= baseline_elo
 
 
 def split_eval_games(total_games, best_elo, baseline_elo, has_baseline):
     """
     How many GATE_GAMES go to best vs baseline.
 
-    While best_model is weaker than the frozen baseline, split the eval
-    set in half so the rating is not only vs a weak clone of itself.
-    Once best catches up, every game is vs best_model.
+    In the baseline phase the eval set is split in half between best and
+    baseline. Once best is above the baseline, every game is vs best_model.
 
     Returns:
         (n_vs_best, n_vs_baseline)
     """
-    if has_baseline and best_elo < baseline_elo:
+    if plays_against_baseline(has_baseline, None, best_elo, baseline_elo):
         n_vs_baseline = total_games // 2
         n_vs_best = total_games - n_vs_baseline
         return n_vs_best, n_vs_baseline
@@ -242,11 +241,11 @@ def evaluate_combined(model, best_model, baseline_model,
     """
     Play `total_games` matches (trainers pass GATE_GAMES).
 
-    When best_elo is below baseline_elo, half the matches are vs the
+    When best_elo is at or below baseline_elo, half the matches are vs the
     baseline and half vs best_model; otherwise all matches are vs best.
     Each block alternates color so the candidate plays white and black
     equally against both opponents. Opponent ELO is the game-weighted
-    average. The gate still uses only the games against best_model.
+    average, and the gate uses the total score against that average.
 
     Returns:
         total_wins    (float)  – accumulated wins across all games
@@ -299,42 +298,34 @@ def evaluate_combined(model, best_model, baseline_model,
     return total_wins, played, opponent_elo, wins_vs_best, n_vs_best
 
 
-def passes_gate(wins_vs_best, n_vs_best, total_wins, total_games):
+def passes_gate(total_wins, total_games):
     """
-    E3 gating: promote only if the candidate's win rate against best_model
-    exceeds Config.GATE_WIN_RATE. Falls back to the overall win rate when no
-    games against best_model were played.
+    E3 gating: promote only if the candidate's total win rate exceeds
+    Config.GATE_WIN_RATE. In the baseline phase the total covers best and
+    baseline games; afterwards every game is vs best_model.
     """
-    if n_vs_best > 0:
-        rate = wins_vs_best / n_vs_best
-    elif total_games > 0:
-        rate = total_wins / total_games
-    else:
+    if total_games <= 0:
         return False, 0.0
+    rate = total_wins / total_games
     return rate > Config.GATE_WIN_RATE, rate
 
 
-def settle_eval_ratings(latest_elo, best_elo, opponent_elo,
-                        total_wins, total_games, wins_vs_best, n_vs_best):
+def settle_eval_ratings(latest_elo, best_elo, opponent_elo, total_wins, total_games):
     """
     Apply one evaluation to the live rating and, only on a gate pass, the champion.
 
-    The live rating always moves from the full mix (total wins vs the
-    weighted opponent Elo). The champion keeps its previous Elo until the
-    win rate against best_model clears the gate; on a pass its Elo is
-    updated from that gate result against its own previous rating. A
-    lagging live rating therefore neither caps nor lowers the champion.
+    opponent_elo is the game-weighted average of the opponents faced: the
+    best/baseline mean in the baseline phase, best_elo afterwards. The live
+    rating always moves from that result. On a gate pass the candidate's
+    weights become the champion, so the champion takes the higher of its own
+    rating moved by that result (Config.ELO_K) and the candidate's live rating.
 
     Returns:
         (latest_elo, best_elo, promoted, gate_rate)
     """
     latest_elo = update_elo(latest_elo, opponent_elo, total_wins, total_games)
-    promoted, gate_rate = passes_gate(wins_vs_best, n_vs_best, total_wins, total_games)
+    promoted, gate_rate = passes_gate(total_wins, total_games)
     if not promoted:
         return latest_elo, best_elo, False, gate_rate
-    gate_wins = wins_vs_best if n_vs_best > 0 else total_wins
-    gate_games = n_vs_best if n_vs_best > 0 else total_games
-    # The old champion is both the starting rating and the reference
-    # opponent, so this pass earns its Elo from the gate result itself.
-    best_elo = update_elo(best_elo, best_elo, gate_wins, gate_games)
+    best_elo = max(update_elo(best_elo, opponent_elo, total_wins, total_games), latest_elo)
     return latest_elo, best_elo, True, gate_rate

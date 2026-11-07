@@ -188,34 +188,29 @@ def train():
         play_baseline = plays_against_baseline(
             baseline_model is not None, current_elo, best_elo, baseline_elo,
         )
-        if play_baseline:
-            num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
-            num_base = Config.MATCHES_PER_ITERATION - num_self
-            tqdm.write(
-                f"[{train_step}] collect  {num_self} self-play + {num_base} vs baseline"
+        num_self = int(Config.MATCHES_PER_ITERATION * Config.BASELINE_SELF_PLAY_RATIO)
+        num_opp  = Config.MATCHES_PER_ITERATION - num_self
+        opp_name = "baseline" if play_baseline else "best"
+        tqdm.write(
+            f"[{train_step}] collect  {num_self} self-play + {num_opp} vs {opp_name}"
+        )
+        stats = {'doubles': 0, 'takes': 0, 'drops': 0,
+                 'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
+        if num_self > 0:
+            stats_self = parallel_collect_self_play(
+                model, equity_table, replay_buffer, num_self, device, cube_epsilon
             )
-            stats = {'doubles': 0, 'takes': 0, 'drops': 0,
-                     'sum_val_double': 0.0, 'sum_val_drop': 0.0, 'games': 0}
-            if num_self > 0:
-                stats_self = parallel_collect_self_play(
-                    model, equity_table, replay_buffer, num_self, device, cube_epsilon
-                )
-                for key in stats:
-                    stats[key] += stats_self[key]
-            if num_base > 0:
-                stats_base = parallel_collect(
-                    "baseline", model, baseline_model, equity_table, replay_buffer,
-                    num_base, Config.SELF_PLAY_DEVICE, cube_epsilon,
-                    baseline_config_path=baseline_config_path,
-                    baseline_equity_table=baseline_equity_table,
-                )
-                for key in stats:
-                    stats[key] += stats_base[key]
-        else:
-            tqdm.write(f"[{train_step}] collect  {Config.MATCHES_PER_ITERATION} self-play")
-            stats = parallel_collect_self_play(
-                model, equity_table, replay_buffer, Config.MATCHES_PER_ITERATION, device, cube_epsilon
+            for key in stats:
+                stats[key] += stats_self[key]
+        if num_opp > 0:
+            stats_opp = parallel_collect(
+                "baseline", model, baseline_model if play_baseline else best_model,
+                equity_table, replay_buffer, num_opp, Config.SELF_PLAY_DEVICE, cube_epsilon,
+                baseline_config_path=baseline_config_path if play_baseline else None,
+                baseline_equity_table=baseline_equity_table if play_baseline else None,
             )
+            for key in stats:
+                stats[key] += stats_opp[key]
 
         tqdm.write(
             f"           done  {cube_stats_text(stats)}  buffer {len(replay_buffer)}"
@@ -270,7 +265,7 @@ def train():
             model.eval()
             best_model.eval()
 
-            total_wins, total_games, opponent_elo, wins_vs_best, n_vs_best = evaluate_combined(
+            total_wins, total_games, opponent_elo, _, _ = evaluate_combined(
                 model         = model,
                 best_model    = best_model,
                 baseline_model= baseline_model,
@@ -285,7 +280,7 @@ def train():
             old_latest = current_elo
             current_elo, best_elo, promoted, gate_rate = settle_eval_ratings(
                 current_elo, best_elo, opponent_elo,
-                total_wins, total_games, wins_vs_best, n_vs_best,
+                total_wins, total_games,
             )
             decision = "promoted" if promoted else "kept best"
             tqdm.write(
@@ -293,7 +288,7 @@ def train():
                 f"({current_elo - old_latest:+.1f})   opp elo {opponent_elo:.0f}"
             )
             tqdm.write(
-                f"  gate         {gate_rate:.1%} vs best   "
+                f"  gate         {gate_rate:.1%} vs opp elo {opponent_elo:.0f}   "
                 f"need > {Config.GATE_WIN_RATE:.1%}   {decision}  best {best_elo:.0f}"
             )
             if promoted:

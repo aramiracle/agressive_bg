@@ -336,7 +336,7 @@ def train():
             model.eval()
             best_model.eval()
 
-            total_wins, total_games, opponent_elo, wins_vs_best, n_vs_best = evaluate_combined(
+            total_wins, total_games, opponent_elo, _, _ = evaluate_combined(
                 model                = model,
                 best_model           = best_model,
                 baseline_model       = baseline_model,
@@ -351,7 +351,7 @@ def train():
             old_latest = current_elo
             current_elo, best_elo, promoted, gate_rate = settle_eval_ratings(
                 current_elo, best_elo, opponent_elo,
-                total_wins, total_games, wins_vs_best, n_vs_best,
+                total_wins, total_games,
             )
             decision = "promoted" if promoted else "kept best"
             tqdm.write(
@@ -359,7 +359,7 @@ def train():
                 f"({current_elo - old_latest:+.1f})   opp elo {opponent_elo:.0f}"
             )
             tqdm.write(
-                f"  gate         {gate_rate:.1%} vs best   "
+                f"  gate         {gate_rate:.1%} vs opp elo {opponent_elo:.0f}   "
                 f"need > {Config.GATE_WIN_RATE:.1%}   {decision}  best {best_elo:.0f}"
             )
             if promoted:

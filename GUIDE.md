@@ -386,12 +386,12 @@ The replay buffer holds 50,000 transitions in stage 1 and 300,000 in stage 2. It
 `src/trainer.py` and `src/trainer_vs_baseline.py` use the same five steps. They do not choose the opponent the same way. Section 11 is the exact split.
 
 1. Read the cube schedule at the current step.
-2. Play `MATCHES_PER_ITERATION` matches (default 40), split across worker processes. `src/trainer.py` runs those workers on CPU (`SELF_PLAY_DEVICE`). `src/trainer_vs_baseline.py` runs them on the training device, which is CUDA when it is available. Each worker has a copy of the weights and of the match-equity table. Games are sequential inside a worker; workers share nothing else.
+2. Play `MATCHES_PER_ITERATION` matches (default 80), split across worker processes. `src/trainer.py` runs those workers on CPU (`SELF_PLAY_DEVICE`). `src/trainer_vs_baseline.py` runs them on the training device, which is CUDA when it is available. Each worker has a copy of the weights and of the match-equity table. Games are sequential inside a worker; workers share nothing else.
 3. Append the labeled transitions to the replay buffer and fold the workers' match results into the equity table.
 4. If the buffer holds at least `BATCH_SIZE` rows (512 on CUDA, 256 otherwise), take `TRAIN_UPDATES_PER_ITER` optimizer steps (default 200) on the training device. A shorter buffer goes back to step 2. The step counter, the gate, and the checkpoint stay where they are.
 5. When the step count is a multiple of `ELO_EVAL_INTERVAL` (default 1000), play a gate of matches and maybe promote the champion. Save `latest_model.pt` and the equity table. Save `best_model.pt` only on promotion.
 
-Who the learner plays is described in the next section. The fraction `BASELINE_SELF_PLAY_RATIO` (one half) is self-play — the current weights against themselves — whenever an opponent is also being used.
+Who the learner plays is described in the next section. The fraction `BASELINE_SELF_PLAY_RATIO` (one half) is always self-play — the current weights against themselves. The rest of the matches are against the baseline or the champion.
 
 ## 11. The champion, the baseline, and the rating
 
@@ -401,17 +401,22 @@ Three sets of weights matter during training.
 
 **The champion** (`best_model.pt`) is the last live network that earned promotion. It is the opponent that defines "better".
 
-**The baseline** (`checkpoints/baseline/`) is a frozen network — at the time of writing a stage-1 champion checked in with `elo: 500` at step 1000. The loader reads `best_model.pt`, `config.py`, and `match_equity.pt` from that directory; the stored Elo, not `Config.INITIAL_ELO`, is the number every "below the baseline" test compares against. The config file is what tells the loader which architecture to rebuild: the shipped one declares the current six-way head, and the legacy layout of section 5 is selected only by an older `value_policy` file. A missing or unreadable equity file leaves that opponent with a fresh table (under stage 1 the shipped 7-point table fails the target check and becomes a fresh one, which is harmless because stage-1 ranking never consults the table). A missing or unreadable model file leaves no baseline at all. The baseline exists so that early in a run the learner is measured against a fixed external player, not only against a copy of itself.
+**The baseline** (`checkpoints/baseline/`) is a frozen network — at the time of writing a stage-1 champion checked in with `elo: 500` at step 1000. The loader reads `best_model.pt`, `config.py`, and `match_equity.pt` from that directory; the stored Elo, not `Config.INITIAL_ELO`, is the number the phase test below compares against. The config file is what tells the loader which architecture to rebuild: the shipped one declares the current six-way head, and the legacy layout of section 5 is selected only by an older `value_policy` file. A missing or unreadable equity file leaves that opponent with a fresh table (under stage 1 the shipped 7-point table fails the target check and becomes a fresh one, which is harmless because stage-1 ranking never consults the table). A missing or unreadable model file leaves no baseline at all. The baseline exists so that early in a run the learner is measured against a fixed external player, not only against a copy of itself.
 
-### When the baseline is the opponent
+### The two phases
 
-The live rating lags the champion, on purpose, given the small Elo step size below. The decision to face the baseline follows the champion's published rating only. Training games include the baseline when one is loaded and the champion's Elo is strictly below the baseline's. When the champion reaches the baseline, those games stop. In `src/trainer.py` the iteration then becomes pure self-play. In `src/trainer_vs_baseline.py` the non-self-play half switches from the baseline to the champion, so half the matches remain a test against the best published weights. With no baseline loaded, `src/trainer.py` is pure self-play from the start, and `src/trainer_vs_baseline.py` still plays that other half against the champion.
+Training has two phases, decided by `plays_against_baseline` from the champion's Elo only. The live rating plays no part, so a live rating that drifts above the baseline does not end phase 1 early.
+
+- **Phase 1, champion Elo at or below the baseline's.** Training is half self-play and half against the baseline. The gate is split between the champion and the baseline.
+- **Phase 2, champion Elo strictly above the baseline's.** Training is half self-play and half against the champion. The gate is against the champion only.
+
+`src/trainer.py` and `src/trainer_vs_baseline.py` follow the same phases. With no baseline loaded, both are in phase 2 from the start.
 
 Against either opponent the learner sits white or black at random for the whole match. Both players' decisions are generated, and only the learner's decisions are stored.
 
 ### The gate
 
-Every evaluation interval the live network plays `GATE_GAMES` matches (default 100) on CPU, greedy, no exploration. While the champion is still rated below the baseline, half of those matches are against the baseline and half against the champion. An odd count gives the extra match to the champion. Once the champion's Elo is no longer below the baseline's, every match is against the champion. Even-numbered matches start with the candidate as white and odd-numbered matches as black, and the two sides swap after every game. A game that reaches 1000 turns with no borne-off winner uses the same pip rule as self-play. That cap is the default argument of `play_single_game`, separate from `MAX_GAME_MOVES`.
+Every evaluation interval the live network plays `GATE_GAMES` matches (default 100) on CPU, greedy, no exploration. In phase 1, half of those matches are against the baseline and half against the champion. An odd count gives the extra match to the champion. In phase 2, every match is against the champion. Even-numbered matches start with the candidate as white and odd-numbered matches as black, and the two sides swap after every game. A game that reaches 1000 turns with no borne-off winner uses the same pip rule as self-play. That cap is the default argument of `play_single_game`, separate from `MAX_GAME_MOVES`.
 
 Elo uses scale 400 and `K = 1`. The per-game difference is first clamped to ±`ELO_SCALE` (never binding at these win rates), and the update is multiplied by the number of games:
 
@@ -421,9 +426,18 @@ change = K · (actual win rate − expected win rate) · games
 
 Against an equal opponent, a 60 percent score over 100 games is `+10` Elo. The step is deliberately small.
 
-Promotion happens only when the win rate against the champion is strictly above `GATE_WIN_RATE` (default 54 percent). The live rating is always updated from the whole evaluation mix (total wins vs the weighted opponent Elo). On a gate pass, the champion's Elo is updated from the gate result itself, relative to its own previous rating, so a lagging live rating neither caps nor lowers it. A failed gate leaves the champion's file and Elo untouched, and the live rating still keeps the mix update.
+The opponent Elo of an evaluation is the game-weighted average of the opponents faced. In phase 1, with the champion at 300 and the baseline at 500, that is 400. In phase 2 it is the champion's Elo.
 
-`passes_gate` promotes only when the win rate against `best_model` is strictly greater than `GATE_WIN_RATE`. The default is 0.54; `BG_GATE_WIN_RATE` overrides it. If an evaluation somehow contained no champion games, the gate falls back to the total win rate, but the split always reserves at least half the matches for the champion, so that path is unreachable in practice. A failed comparison leaves the champion weights on disk.
+`passes_gate` promotes only when the total win rate of the evaluation is strictly greater than `GATE_WIN_RATE`. In phase 1 that total covers both the champion and the baseline games. In phase 2 it is the win rate against the champion. The default is 0.54; `BG_GATE_WIN_RATE` overrides it.
+
+The live rating is always updated from the total score against the opponent Elo. On a gate pass the candidate's weights become the champion, and the champion's Elo becomes the higher of two numbers:
+
+- its previous Elo, updated by the same total score against the same opponent Elo, with `ELO_K`;
+- the candidate's live rating after this evaluation.
+
+The first keeps a pass from ever lowering the champion. The second means the new champion and the live network, which now share the same weights, don't keep two different ratings. In phase 1, a champion at 300 that scores 55 percent against the 400 average gains `1 · (0.55 − 0.36) · 100 ≈ +19` from the first rule.
+
+A failed gate leaves the champion's weights and Elo untouched, and the live rating still keeps its update. The live rating can therefore sit above the champion's for a while: that only means the candidate scored better than expected without clearing the threshold.
 
 ## 12. Playing a human
 
@@ -460,8 +474,8 @@ src/utils/checkpoint.py       save, load, warm start, legacy loader
 src/utils/history.py          legacy flat-reward helper; no importer in the pipeline
 src/utils/move.py             legacy index/format helper; no importer in the pipeline
 src/replay_buffer.py          prioritized replay
-src/trainer.py                self-play training loop
-src/trainer_vs_baseline.py    same loop with an explicit stage and opponent
+src/trainer.py                training loop: self-play plus baseline or champion
+src/trainer_vs_baseline.py    same phases, stage set by --stage
 scripts/play_web.py           browser game
 ui/html_ui.html               the board
 ui/ws_server.py               separate browser server; its AI does not cube
@@ -469,13 +483,15 @@ checkpoints/baseline/         frozen opponent and its saved architecture
 checkpoints/stage1/           live stage-1 run
 checkpoints/stage2/           live stage-2 run
 tests/test.py                 regression suite for this document
+tests/test_rules_edge_cases.py  engine rules and AI legality fuzz
+tests/test_ui_protocol.py     web-UI actions and edge cases
 tests/test_checkpoint.py      checkpoint probe; doubles as a manual Elo editor
 tests/write_table.py          print a saved match-equity table
 ```
 
 Everything imports from the repository root (`from src.…`), so the entry points must run in module form with the repo root as the working directory: `python -m src.trainer`, `python -m src.trainer_vs_baseline --stage 1`, `python -m scripts.play_web`, `python -m tests.test`. Running a file path directly (`python src/trainer.py`) puts the wrong directory on `sys.path` and dies with `ModuleNotFoundError: No module named 'src'`. The `bg-train` console script in `pyproject.toml` is stale in the same way: it names `backgammon.trainer:train`, a module path the repository no longer contains.
 
-`python -m tests.test` is the executable version of this document's claims. It checks canonical perspective symmetry, the flip/equity helpers and the race-formula band, complete-turn enumeration and `apply_turn` consistency, that a search restores the game object untouched and visits at most `SEARCH_PRUNE_TOP_K` plays, the same-player backup (`Q` equals the leaf equity), high-temperature exploration, the TD(λ) recursion including the cube row sharing the next move decision's target, a self-play game through a short move cap and through one vectorized training step with a decreasing loss, the prune margin, the stage cube gates, a 52.5-percent promotion arithmetic, the lagged-rating rule that keeps training on self-play, the eval split and weighted opponent Elo, the legacy adapter's output shapes, the opening roll, the cube-offered encoding, the price of a certain backgammon loss, the worker match split, and the evaluation move cap naming a one-point winner. One guard is about repo hygiene rather than theory: it demands a saved AdamW checkpoint stay under 15 MB, the number behind the depth comment in `src/config.py`. At the shipped 10-layer width 128 model the file lands at roughly 15.6 MB, so this check currently reports a failure while every behavioral check passes.
+`python -m tests.test` is the executable version of this document's claims. It checks canonical perspective symmetry, the flip/equity helpers and the race-formula band, complete-turn enumeration and `apply_turn` consistency, that a search restores the game object untouched and visits at most `SEARCH_PRUNE_TOP_K` plays, the same-player backup (`Q` equals the leaf equity), high-temperature exploration, the TD(λ) recursion including the cube row sharing the next move decision's target, a self-play game through a short move cap and through one vectorized training step with a decreasing loss, the prune margin, the stage cube gates, a 52.5-percent promotion arithmetic, the phase boundary (champion equal to the baseline is still phase 1), the eval split and weighted opponent Elo, the phase-1 and phase-2 promotion ratings, the legacy adapter's output shapes, the opening roll, the cube-offered encoding, the price of a certain backgammon loss, the worker match split, and the evaluation move cap naming a one-point winner. One guard is about repo hygiene rather than theory: it demands a saved AdamW checkpoint stay under 15 MB, the number behind the depth comment in `src/config.py`. At the shipped 10-layer width 128 model the file lands at roughly 15.6 MB, so this check currently reports a failure while every behavioral check passes.
 
 A checkpoint file holds the weights, the optimizer, the step, the Elo, the recent loss, and a small record of model type, width, and depth. The equity table is a sibling file, `match_equity.pt`, because it is data about match scores rather than part of the network.
 
@@ -489,7 +505,7 @@ If the position is a gammon-free race, self-play stops. The race formula picks a
 
 At the end of the game the backward pass writes an outcome distribution on every stored position. Those rows wait in the replay buffer until a training step samples them, moves the outcome head toward the backed-up distribution, and, for cube rows, moves the cube head toward the priced soft label.
 
-The champion changes only when the live network wins strictly more than `GATE_WIN_RATE` of a greedy gate, played on CPU, against the current champion.
+The champion changes only when the live network wins strictly more than `GATE_WIN_RATE` of a greedy gate, played on CPU, against the champion and the baseline in phase 1 and against the champion alone in phase 2.
 
 ## 15. Knobs that change the theory
 
@@ -505,8 +521,8 @@ Most fields in `src/config.py` are sizes and rates. These are the ones that chan
 | `TD_LAMBDA` | How far outcome labels lean on the real game result versus the next search. |
 | `CUBE_CURRICULUM_STAGES` | How often self-play doubles at random, and how hard the cube loss is weighted. |
 | `CUBE_ME_TEMPERATURE` | How soft a near-even cube label is. |
-| `GATE_WIN_RATE`, `GATE_GAMES` | How often, and by how much, the live network must beat the champion before it becomes the champion. Defaults 0.54 and 100. |
-| `BASELINE_SELF_PLAY_RATIO` | Share of training matches that are self-play while an external opponent is also in use. |
+| `GATE_WIN_RATE`, `GATE_GAMES` | How many gate matches are played, and the total win rate the live network must exceed to become the champion. Defaults 0.54 and 100. |
+| `BASELINE_SELF_PLAY_RATIO` | Share of training matches that are self-play. The rest are against the baseline in phase 1 and the champion in phase 2. |
 
 Change the stage, the point values, or the ply, and you are changing the game the network is trying to solve. Change the learning rate or the batch size, and you are only changing how fast it walks there.
 

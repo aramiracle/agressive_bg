@@ -207,32 +207,21 @@ def run_regression_suite():
 
     old_rate = Config.GATE_WIN_RATE
     Config.GATE_WIN_RATE = 0.525
-    keep, _ = passes_gate(21, 40, 21, 40)
-    promote, _ = passes_gate(22, 40, 22, 40)
-    all_ok &= check(keep is False, "E3: 21/40 ≤ 52.5% keeps best_model", "promoted at 52.5%")
+    keep, _ = passes_gate(21, 40)
+    promote, _ = passes_gate(22, 40)
+    all_ok &= check(keep is False, "E3: 21/40 <= 52.5% keeps best_model", "promoted at 52.5%")
     all_ok &= check(promote is True, "E3: 22/40 > 52.5% promotes", "did not promote above 52.5%")
     Config.GATE_WIN_RATE = old_rate
 
-    lagged_latest, lagged_best, lagged_promoted, _ = settle_eval_ratings(
-        511.0, 520.7, 520.7, 22, 40, 22, 40,
-    )
-    all_ok &= check(
-        lagged_promoted and round(lagged_latest) == 514
-        and lagged_best == update_elo(520.7, 520.7, 22, 40)
-        and lagged_best > 520.7,
-        "22/40 from a lagged 511 moves the champion up from its own rating",
-        f"lagged latest {lagged_latest} champion {lagged_best} promoted {lagged_promoted}",
-    )
-
     all_ok &= check(not plays_against_baseline(True, 400.0, 600.0, 500.0),
-                    "a lagged running elo keeps training on self-play while best is ahead",
-                    "lagged running elo switched training onto the baseline")
+                    "best above baseline trains vs best",
+                    "best above baseline still trained vs baseline")
     all_ok &= check(plays_against_baseline(True, 600.0, 400.0, 500.0),
-                    "best elo under baseline enables training vs baseline",
-                    "best elo under baseline stayed on self-play")
-    all_ok &= check(not plays_against_baseline(True, 500.0, 500.0, 500.0),
-                    "matching baseline elo collects against best",
-                    "equal elo still played the baseline")
+                    "best elo under baseline trains vs baseline",
+                    "best elo under baseline left the baseline phase")
+    all_ok &= check(plays_against_baseline(True, 500.0, 500.0, 500.0),
+                    "best equal to baseline stays in the baseline phase",
+                    "equal elo left the baseline phase")
     all_ok &= check(not plays_against_baseline(False, 100.0, 100.0, 500.0),
                     "no baseline loaded stays off baseline games",
                     "baseline games enabled without a baseline")
@@ -242,51 +231,53 @@ def run_regression_suite():
                     "eval splits 20/20 vs best/baseline while best is weaker",
                     f"split was {n_best}/{n_base}")
     n_best, n_base = split_eval_games(40, best_elo=500.0, baseline_elo=500.0, has_baseline=True)
+    all_ok &= check((n_best, n_base) == (20, 20),
+                    "eval still splits 20/20 when best equals baseline",
+                    f"split was {n_best}/{n_base}")
+    n_best, n_base = split_eval_games(40, best_elo=501.0, baseline_elo=500.0, has_baseline=True)
     all_ok &= check((n_best, n_base) == (40, 0),
-                    "eval is all vs best once best matches baseline",
+                    "eval is all vs best once best is above baseline",
                     f"split was {n_best}/{n_base}")
     n_best, n_base = split_eval_games(40, best_elo=100.0, baseline_elo=500.0, has_baseline=False)
     all_ok &= check((n_best, n_base) == (40, 0),
                     "eval is all vs best when no baseline is loaded",
                     f"split was {n_best}/{n_base}")
-    avg_elo = mixed_opponent_elo(100.0, 500.0, 20, 20)
-    all_ok &= check(avg_elo == 300.0,
-                    "opponent ELO is the game-weighted average (300)",
+    avg_elo = mixed_opponent_elo(300.0, 500.0, 50, 50)
+    all_ok &= check(avg_elo == 400.0,
+                    "opponent ELO is the game-weighted average (400)",
                     f"opponent ELO {avg_elo}")
 
-    # 71/100 vs a 300 field, 23/50 vs best: the gate fails, latest still rises.
-    live = update_elo(100.0, 300.0, 71, 100)
-    latest, best, promoted, rate = settle_eval_ratings(
-        100.0, 100.0, 300.0, 71, 100, 23, 50,
-    )
+    # Phase 1: best 300, baseline 500, opponent average 400. 53/100 misses
+    # the 54% gate even though it beats expectation: latest rises, best stays.
+    latest, best, promoted, rate = settle_eval_ratings(300.0, 300.0, 400.0, 53, 100)
     all_ok &= check(
-        (not promoted) and best == 100.0 and latest == live and latest > 100.0
-        and abs(rate - 0.46) < 1e-9,
-        "a win that misses the gate raises latest and leaves best at 100",
+        (not promoted) and best == 300.0 and latest == update_elo(300.0, 400.0, 53, 100)
+        and latest > 300.0 and abs(rate - 0.53) < 1e-9,
+        "53/100 vs the 400 average misses the gate and keeps best at 300",
         f"latest {latest} best {best} promoted {promoted} rate {rate}",
     )
-    # 60/100 vs a 300 field clears the gate: latest takes the mixed-eval
-    # rating, best takes only the gate result against its own rating.
-    published = update_elo(140.0, 300.0, 60, 100)
-    latest, best, promoted, _ = settle_eval_ratings(
-        140.0, 100.0, 300.0, 60, 100, 60, 100,
-    )
+    # 55/100 vs the 400 average clears the gate: best moves from 300 by
+    # that result against 400 with Config.ELO_K.
+    latest, best, promoted, _ = settle_eval_ratings(250.0, 300.0, 400.0, 55, 100)
     all_ok &= check(
-        promoted and latest == published
-        and best == update_elo(100.0, 100.0, 60, 100),
-        "a gate pass rates best from the gate result",
-        f"latest {latest} best {best} published {published}",
-    )
-    # Gate passes but latest sits below best: the gate result still moves
-    # the champion up from its own rating instead of keeping max(...).
-    latest, best, promoted, _ = settle_eval_ratings(
-        100.0, 500.0, 300.0, 60, 100, 60, 100,
-    )
-    all_ok &= check(
-        promoted and latest == update_elo(100.0, 300.0, 60, 100)
-        and best == update_elo(500.0, 500.0, 60, 100),
-        "a gate pass below best moves best by the gate result",
+        promoted and latest == update_elo(250.0, 400.0, 55, 100)
+        and best == update_elo(300.0, 400.0, 55, 100) and best > 300.0,
+        "phase 1 pass rates best from the total vs the best/baseline average",
         f"latest {latest} best {best}",
+    )
+    # Live above best: the promoted champion takes the live rating.
+    latest, best, promoted, _ = settle_eval_ratings(360.0, 300.0, 400.0, 55, 100)
+    all_ok &= check(
+        promoted and best == latest and best > update_elo(300.0, 400.0, 55, 100),
+        "a pass with live above best gives the champion the live rating",
+        f"latest {latest} best {best}",
+    )
+    # Phase 2: all games vs best (opponent elo = best elo).
+    latest, best, promoted, _ = settle_eval_ratings(520.0, 520.7, 520.7, 22, 40)
+    all_ok &= check(
+        promoted and best == update_elo(520.7, 520.7, 22, 40) and best > 520.7,
+        "phase 2 pass rates best from the result vs itself",
+        f"latest {latest} best {best} promoted {promoted}",
     )
     whites = sum(1 for i in range(20) if i % 2 == 0)
     blacks = 20 - whites
