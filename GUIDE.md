@@ -477,7 +477,9 @@ src/replay_buffer.py          prioritized replay
 src/trainer.py                training loop: self-play plus baseline or champion
 src/trainer_vs_baseline.py    same phases, stage set by --stage
 scripts/play_web.py           browser game
-ui/html_ui.html               the board
+ui/html_ui.html               the board markup
+ui/styles.css                 the board's styles
+ui/app.js                     the board's client logic
 ui/ws_server.py               separate browser server; its AI does not cube
 checkpoints/baseline/         frozen opponent and its saved architecture
 checkpoints/stage1/           live stage-1 run

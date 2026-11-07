@@ -38,7 +38,9 @@ agressive_bg/
 ├── scripts/
 │   └── play_web.py            # web server: HTML UI over HTTP + WebSocket
 ├── ui/
-│   ├── html_ui.html           # browser board (served by play_web.py)
+│   ├── html_ui.html           # browser board markup (served by play_web.py)
+│   ├── styles.css             # board and panel styles
+│   ├── app.js                 # WebSocket client, rendering, input
 │   └── ws_server.py           # standalone WebSocket server (legacy; its AI never cubes)
 ├── checkpoints/
 │   ├── baseline/              # frozen stage-1 champion (opponent for vs-baseline training)
